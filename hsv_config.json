@@ -1,0 +1,24 @@
+{
+    "regular_court": {
+        "h_min": 30,
+        "h_max": 88,
+        "s_min": 31,
+        "s_max": 255,
+        "v_min": 122,
+        "v_max": 255
+    },
+    "behind_net": {
+        "h_min": 76,
+        "h_max": 91,
+        "s_min": 33,
+        "s_max": 146,
+        "v_min": 62,
+        "v_max": 152
+    },
+    "net_area_y_min": 338,
+    "net_area_y_max": 532,
+    "high_net_y_min": 338,
+    "high_net_y_max": 424,
+    "low_net_y_min": 422,
+    "low_net_y_max": 532
+}
