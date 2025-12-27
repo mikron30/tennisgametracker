@@ -1,0 +1,6 @@
+Player and Ball Tracking Configuration
+==================================================
+
+Player 1 (Blue): (1266, 114)
+Player 2 (Red): (3142, 1036)
+Serve Area: (1164, 10, 1388, 84)

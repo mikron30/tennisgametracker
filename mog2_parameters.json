@@ -1,0 +1,9 @@
+{
+  "var_threshold": 16,
+  "learning_rate": 0.005,
+  "history": 200,
+  "p1_min_area": 5000,
+  "p1_max_area": 150000,
+  "p2_min_area": 10000,
+  "p2_max_area": 300000
+}

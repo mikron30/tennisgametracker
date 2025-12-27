@@ -1,0 +1,16 @@
+Tennis Court Points Coordinates
+========================================
+Image size: 3264x2160
+
+Point  1: ( 467,  214)
+Point  2: (1033,  174)
+Point  3: (1466, 1449)
+Point  4: (2426, 1060)
+Point  5: ( 546,  315)
+Point  6: (1199,  263)
+Point  7: ( 973,  854)
+Point  8: (1914,  696)
+Point  9: ( 465,  421)
+Point 10: (1653,  331)
+Point 11: ( 892,  280)
+Point 12: (1517,  756)

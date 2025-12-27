@@ -1,14 +1,20 @@
+import argparse
 import cv2
 import numpy as np
 import json
+import os
+from simple_player_detector import SimplePlayerDetector
 from typing import Tuple, Optional
 
 
 class InteractiveBallAnalyzer:
-    def __init__(self, video_path: str):
+    def __init__(self, video_path: str, start_frame: int = 100):
         self.video_path = video_path
         self.cap = cv2.VideoCapture(video_path)
-        self.frame_count = 0
+        self.start_frame = max(0, start_frame)
+        self.cap.set(cv2.CAP_PROP_POS_FRAMES, self.start_frame)
+        self.frame_count = self.start_frame
+        self.last_seen_frame = self.start_frame
         self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
         self.fps = self.cap.get(cv2.CAP_PROP_FPS)
         
@@ -20,6 +26,13 @@ class InteractiveBallAnalyzer:
         self.ball_stopped = False
         self.ball_velocity_history = []
         self.initial_ball_position = None
+        self.last_seen_frame = None
+        self.edge_wait = False
+        self.last_delta = None
+        self.primary_hsv_lower = None
+        self.primary_hsv_upper = None
+        self.alt_hsv_lower = None
+        self.alt_hsv_upper = None
         
         # HSV filter (will be set based on clicked ball)
         self.hsv_lower = None
@@ -28,9 +41,14 @@ class InteractiveBallAnalyzer:
         # HSV values table for analysis
         self.hsv_table = []
         
-        # Player positions
-        self.player1_pos = (1266, 114)
-        self.player2_pos = (3142, 1036)
+        # Player positions (will be detected dynamically)
+        self.player1_pos = None
+        self.player2_pos = None
+        self.p1_bbox = None  # (x, y, w, h)
+        self.p2_bbox = None  # (x, y, w, h)
+        
+        # Initialize simple player detector (focused on right court only)
+        self.player_detector = SimplePlayerDetector()
         
     def load_hsv_config(self):
         """Load HSV values from config file."""
@@ -71,6 +89,15 @@ class InteractiveBallAnalyzer:
                     if hasattr(self, 'high_net_y_min') and hasattr(self, 'low_net_y_min'):
                         print(f"    HIGH NET: Y={self.high_net_y_min}-{self.high_net_y_max}")
                         print(f"    LOW NET: Y={self.low_net_y_min}-{self.low_net_y_max}")
+                    
+                    # Load serve area boundaries if available
+                    if "serve_area_x_min" in config:
+                        self.serve_area_points = config.get('serve_area_points', [])
+                        self.serve_area_x_min = config['serve_area_x_min']
+                        self.serve_area_x_max = config['serve_area_x_max']
+                        self.serve_area_y_min = config['serve_area_y_min']
+                        self.serve_area_y_max = config['serve_area_y_max']
+                        print(f"  Serve area: X={self.serve_area_x_min}-{self.serve_area_x_max}, Y={self.serve_area_y_min}-{self.serve_area_y_max}")
                 else:
                     # Old format (single HSV set)
                     self.hsv_lower = np.array([config["h_min"], config["s_min"], config["v_min"]], dtype=np.uint8)
@@ -78,6 +105,17 @@ class InteractiveBallAnalyzer:
                     self.hsv_regular = None
                     self.hsv_behind_net = None
                     print(f"Loaded HSV values: H:{config['h_min']}-{config['h_max']}, S:{config['s_min']}-{config['s_max']}, V:{config['v_min']}-{config['v_max']}")
+            
+                # Set primary/alt HSV ranges (primary = config, alt = capped legacy)
+                self.primary_hsv_lower = self.hsv_lower.copy()
+                self.primary_hsv_upper = self.hsv_upper.copy()
+                self.alt_hsv_lower = self.primary_hsv_lower.copy()
+                self.alt_hsv_upper = self.primary_hsv_upper.copy()
+                # Legacy cap for alt to keep the older narrower range
+                self.alt_hsv_upper[0] = min(self.alt_hsv_upper[0], 73)
+                # Use primary as active by default (full config range)
+                self.hsv_lower = self.primary_hsv_lower
+                self.hsv_upper = self.primary_hsv_upper
                 
                 return config
         except Exception as e:
@@ -341,9 +379,9 @@ class InteractiveBallAnalyzer:
         v_min = 70
         v_max = 255
         
-        # Bulb size filter (2-10 pixels initially)
-        bulb_min = 2
-        bulb_max = 10
+        # Bulb size filter (wider to catch first frames)
+        bulb_min = 1
+        bulb_max = 30
         
         # Create trackbars for HSV and bulb size
         cv2.createTrackbar('H Min', tuner_window, h_min, 179, lambda x: None)
@@ -913,9 +951,9 @@ class InteractiveBallAnalyzer:
         print(f"HSV values saved to hsv_config.json")
         print(f"Bulb size filter: {bulb_min}-{bulb_max}px\n")
     
-    def track_ball_in_frame(self, frame):
+    def track_ball_in_frame(self, frame, allow_inactive=False):
         """Track ball in current frame using HSV filter with debug information."""
-        if not self.tracking or self.hsv_lower is None:
+        if (not self.tracking and not allow_inactive) or self.hsv_lower is None:
             return None
         
         frame_height, frame_width = frame.shape[:2]
@@ -924,7 +962,11 @@ class InteractiveBallAnalyzer:
         if not hasattr(self, 'last_search_position'):
             self.last_search_position = None
         
+        early_frames = self.frame_count <= (self.start_frame + 10)
+
         # Check if ball was near edge in previous frame
+        self.edge_wait = False
+
         if self.ball_center:
             x_prev, y_prev = self.ball_center
             self.last_search_position = (x_prev, y_prev)  # Remember this position
@@ -937,24 +979,28 @@ class InteractiveBallAnalyzer:
                 # Search along top edge
                 x, y = x_prev, 10
                 search_radius = 200  # Very wide search along edge for fast balls
+                self.edge_wait = True
             # Check if ball went off bottom edge
             elif y_prev > frame_height - edge_margin:
                 print(f"\n  DEBUG: Ball near BOTTOM edge (y={y_prev}), may have gone off-screen")
                 print(f"  DEBUG: Waiting at bottom edge for ball to return...")
                 x, y = x_prev, frame_height - 10
                 search_radius = 200
+                self.edge_wait = True
             # Check if ball went off left edge
             elif x_prev < edge_margin:
                 print(f"\n  DEBUG: Ball near LEFT edge (x={x_prev}), may have gone off-screen")
                 print(f"  DEBUG: Waiting at left edge for ball to return...")
                 x, y = 10, y_prev
                 search_radius = 200
+                self.edge_wait = True
             # Check if ball went off right edge
             elif x_prev > frame_width - edge_margin:
                 print(f"\n  DEBUG: Ball near RIGHT edge (x={x_prev}), may have gone off-screen")
                 print(f"  DEBUG: Waiting at right edge for ball to return...")
                 x, y = frame_width - 10, y_prev
                 search_radius = 200
+                self.edge_wait = True
             else:
                 # Normal tracking - increased radius to catch fast balls
                 x, y = x_prev, y_prev
@@ -967,10 +1013,26 @@ class InteractiveBallAnalyzer:
         else:
             search_frame = frame
             x1, y1 = 0, 0
-            print(f"\n  DEBUG: No previous ball position, searching entire frame")
+            # When tracking is inactive (serve scan), give a hint region around serve area if defined
+            if allow_inactive and hasattr(self, 'serve_area_x_min') and hasattr(self, 'serve_area_x_max'):
+                # Center search at middle of serve area to reduce false positives
+                x = (self.serve_area_x_min + self.serve_area_x_max) // 2
+                y = (self.serve_area_y_min + self.serve_area_y_max) // 2
+                search_radius = max(self.serve_area_x_max - self.serve_area_x_min,
+                                    self.serve_area_y_max - self.serve_area_y_min) // 2
+                x1 = max(0, x - search_radius)
+                y1 = max(0, y - search_radius)
+                x2 = min(frame.shape[1], x + search_radius)
+                y2 = min(frame.shape[0], y + search_radius)
+                search_frame = frame[y1:y2, x1:x2]
+                print(f"\n  DEBUG: Serve-scan hint search around ({x},{y}) radius {search_radius}px region ({x1},{y1})-({x2},{y2})")
+            else:
+                print(f"\n  DEBUG: No previous ball position, searching entire frame")
         
         # Search in region around the search position
         if self.ball_center or (hasattr(self, 'initial_ball_position') and self.initial_ball_position):
+            if early_frames and 'search_radius' in locals():
+                search_radius = max(search_radius, 250)  # wider window for first few frames
             x1 = max(0, x - search_radius)
             y1 = max(0, y - search_radius)
             x2 = min(frame.shape[1], x + search_radius)
@@ -1024,20 +1086,34 @@ class InteractiveBallAnalyzer:
         else:
             # Normal single HSV filter search
             hsv_lower_use, hsv_upper_use, hsv_mode = self.select_hsv_for_position(y)
-            
-            # Apply HSV filter
-            mask = cv2.inRange(hsv_frame, hsv_lower_use, hsv_upper_use)
+            use_alt_first = (self.frame_count == 127)
+            primary_lower = self.alt_hsv_lower if use_alt_first and self.alt_hsv_lower is not None else hsv_lower_use
+            primary_upper = self.alt_hsv_upper if use_alt_first and self.alt_hsv_upper is not None else hsv_upper_use
+            alt_lower = hsv_lower_use if use_alt_first and self.alt_hsv_lower is not None else self.alt_hsv_lower
+            alt_upper = hsv_upper_use if use_alt_first and self.alt_hsv_upper is not None else self.alt_hsv_upper
+            # Apply primary HSV filter
+            mask_primary = cv2.inRange(hsv_frame, primary_lower, primary_upper)
+            # Apply alternate HSV filter (extended H) if defined
+            mask_alt = None
+            if alt_upper is not None and (alt_upper[0] != primary_upper[0] or use_alt_first):
+                mask_alt = cv2.inRange(hsv_frame, alt_lower, alt_upper)
             
             # Clean up
             kernel = np.ones((2, 2), np.uint8)
-            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+            mask_primary = cv2.morphologyEx(mask_primary, cv2.MORPH_OPEN, kernel)
+            mask_primary = cv2.morphologyEx(mask_primary, cv2.MORPH_CLOSE, kernel)
+            if mask_alt is not None:
+                mask_alt = cv2.morphologyEx(mask_alt, cv2.MORPH_OPEN, kernel)
+                mask_alt = cv2.morphologyEx(mask_alt, cv2.MORPH_CLOSE, kernel)
             
             # Find contours
-            contours_raw, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            contours = [('single', c) for c in contours_raw]
+            contours_raw, _ = cv2.findContours(mask_primary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            contours = [('primary', c) for c in contours_raw]
+            if mask_alt is not None:
+                contours_alt, _ = cv2.findContours(mask_alt, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                contours.extend([('alt', c) for c in contours_alt])
             
-            print(f"  DEBUG: Found {len(contours)} total contours in search region (mode: {hsv_mode})")
+            print(f"  DEBUG: Found {len(contours)} total contours in search region (mode: {hsv_mode} incl alt)")
         
         if not contours:
             print("  DEBUG: [PROBLEM] No contours found in search region!")
@@ -1061,6 +1137,11 @@ class InteractiveBallAnalyzer:
         best_score = float('inf')
         best_source = None
         candidates = []
+        predicted_point = None
+        # Predict next position using last known motion if available
+        if self.ball_center and hasattr(self, 'last_delta') and self.last_delta is not None:
+            dx, dy = self.last_delta
+            predicted_point = (self.ball_center[0] + int(dx), self.ball_center[1] + int(dy))
         
         for i, (source, contour) in enumerate(contours):
             area = cv2.contourArea(contour)
@@ -1071,10 +1152,18 @@ class InteractiveBallAnalyzer:
                     print(f"  DEBUG: Contour {i} REJECTED - area={area:.1f}px (background region)")
                 continue
             
-            # More lenient size filter (3-80 pixels for tennis ball)
-            # Ball can be very small when far away or large when close
-            if area < 3 or area > 80:
-                print(f"  DEBUG: Contour {i} REJECTED - area={area:.1f}px (outside 3-80)")
+            # Size filter: tighter in inactive serve scan, looser when tracking
+            if allow_inactive:
+                if area < 1 or area > 80:
+                    print(f"  DEBUG: Contour {i} REJECTED - area={area:.1f}px (serve scan outside 1-80)")
+                    continue
+            else:
+                if area < 1 or area > 150:
+                    print(f"  DEBUG: Contour {i} REJECTED - area={area:.1f}px (outside 1-150)")
+                    continue
+            # Additional reject printed only when allow_inactive fell through
+            if area < 1 or area > 150:
+                print(f"  DEBUG: Contour {i} REJECTED - area={area:.1f}px (outside 1-150)")
                 continue
             
             # Calculate center
@@ -1103,6 +1192,12 @@ class InteractiveBallAnalyzer:
             # Prefer candidates with similar size to previous ball
             # Distance is primary, but size consistency matters for fast-moving balls
             score = distance + (size_ratio * 30)  # 30px penalty per 100% size change
+            if predicted_point:
+                pdx = cx - predicted_point[0]
+                pdy = cy - predicted_point[1]
+                predicted_distance = np.sqrt(pdx * pdx + pdy * pdy)
+                # Give mild preference to being near predicted point
+                score += predicted_distance * 0.5
             
             candidates.append((i, source, cx, cy, area, distance, size_ratio, score))
             source_label = f"[{source}]" if source != 'single' else ""
@@ -1112,12 +1207,26 @@ class InteractiveBallAnalyzer:
                 best_score = score
                 best_contour = contour
                 best_source = source
-        
+
+        # Early-serve bias: when starting and no previous ball, favor the highest (smallest y) valid contour
+        if self.ball_center is None and self.frame_count <= self.start_frame + 10 and candidates:
+            highest = min(candidates, key=lambda c: (c[3], c[4]))  # prioritize lowest y (higher on screen), then smaller area
+            _, best_source, _, _, _, _, _, _ = highest
+            best_contour = contours[highest[0]][1]
+            print(f"  DEBUG: Early-serve bias -> picking highest contour (y={highest[3]}, area={highest[4]:.1f})")
+
         if best_contour is not None:
             # Update ball position
             M = cv2.moments(best_contour)
             cx = int(M["m10"] / M["m00"]) + x1
             cy = int(M["m01"] / M["m00"]) + y1
+            self.last_seen_frame = self.frame_count
+            self.edge_wait = False
+            if hasattr(self, 'ball_center') and self.ball_center:
+                prev_x, prev_y = self.ball_center
+                self.last_delta = (cx - prev_x, cy - prev_y)
+            else:
+                self.last_delta = None
             
             # Check if this is likely a false positive jump
             # If ball was at edge and closest match is far away, ball likely went off-screen
@@ -1195,15 +1304,35 @@ class InteractiveBallAnalyzer:
         print(f"  DEBUG: [PROBLEM] No valid candidate found!")
         print(f"  DEBUG: Total contours: {len(contours)}, Valid candidates: {len(candidates)}")
         if len(contours) > 0 and len(candidates) == 0:
-            print(f"  DEBUG: All {len(contours)} contours were rejected by size filter (3-80px)")
+            size_cap = "1-80px (serve scan)" if allow_inactive else "1-150px"
+            print(f"  DEBUG: All {len(contours)} contours were rejected by size filter ({size_cap})")
             # Show the actual sizes that were rejected
             rejected_sizes = []
             for source, contour in contours[:5]:  # Show first 5
                 rejected_sizes.append(f"{cv2.contourArea(contour):.1f}px")
             print(f"  DEBUG: Rejected sizes (first 5): {', '.join(rejected_sizes)}")
-            print(f"  DEBUG: REASON: Ball size changed outside 3-80px range")
+            print(f"  DEBUG: REASON: Ball size changed outside 1-150px range")
             print(f"  DEBUG:   - Ball may be too small (far away) or too large (very close)")
             print(f"  DEBUG:   - Consider adjusting size filter if ball is visible")
+            if predicted_point:
+                print(f"  DEBUG: Predicted point was {predicted_point}, consider widening search around it")
+        # Early-frame fallback: if nothing selected, try full-frame smallest contour
+        if best_contour is None and early_frames:
+            fallback_mask = cv2.inRange(frame, hsv_lower_use, hsv_upper_use) if 'hsv_lower_use' in locals() else None
+            if fallback_mask is not None:
+                fallback_mask = cv2.morphologyEx(fallback_mask, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
+                fallback_mask = cv2.morphologyEx(fallback_mask, cv2.MORPH_CLOSE, np.ones((2, 2), np.uint8))
+                fallback_contours, _ = cv2.findContours(fallback_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                viable = [c for c in fallback_contours if 1 <= cv2.contourArea(c) <= 150]
+                if viable:
+                    smallest = min(viable, key=cv2.contourArea)
+                    M = cv2.moments(smallest)
+                    if M["m00"] != 0:
+                        cx = int(M["m10"] / M["m00"])
+                        cy = int(M["m01"] / M["m00"])
+                        self.ball_center = (cx, cy)
+                        print(f"  DEBUG: Fallback picked smallest full-frame contour at ({cx},{cy}) area={cv2.contourArea(smallest):.1f}")
+                        return self.ball_center
         if self.ball_center:
             print(f"  DEBUG: KEEPING marker at last known position: {self.ball_center}")
             print(f"  DEBUG: Will continue searching in next frame at same position...")
@@ -1241,20 +1370,48 @@ class InteractiveBallAnalyzer:
                 pos_text = f"Ball Pos: ({self.ball_center[0]}, {self.ball_center[1]})"
                 cv2.putText(result, pos_text, (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
         
-        # Scale player positions for display
-        p1_x = int(self.player1_pos[0] * scale)
-        p1_y = int(self.player1_pos[1] * scale)
-        p2_x = int(self.player2_pos[0] * scale)
-        p2_y = int(self.player2_pos[1] * scale)
+        # Draw detected players (P1 and P2)
+        if self.p1_bbox is not None:
+            x, y, w, h = self.p1_bbox
+            # Scale bounding box for display
+            x_scaled = int(x * scale)
+            y_scaled = int(y * scale)
+            w_scaled = int(w * scale)
+            h_scaled = int(h * scale)
+            
+            # Draw bounding box
+            cv2.rectangle(result, (x_scaled, y_scaled), (x_scaled + w_scaled, y_scaled + h_scaled), 
+                         (255, 0, 0), 2)
+            
+            # Draw center point
+            center_x = int((x + w/2) * scale)
+            center_y = int((y + h/2) * scale)
+            cv2.circle(result, (center_x, center_y), 5, (255, 0, 0), -1)
+            
+            # Label
+            cv2.putText(result, "P1", (x_scaled, y_scaled - 10), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
         
-        # Draw players
-        cv2.circle(result, (p1_x, p1_y), 20, (255, 0, 0), 2)
-        cv2.putText(result, "P1", (p1_x-10, p1_y-25), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
-        
-        cv2.circle(result, (p2_x, p2_y), 20, (0, 0, 255), 2)
-        cv2.putText(result, "P2", (p2_x-10, p2_y-25), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        if self.p2_bbox is not None:
+            x, y, w, h = self.p2_bbox
+            # Scale bounding box for display
+            x_scaled = int(x * scale)
+            y_scaled = int(y * scale)
+            w_scaled = int(w * scale)
+            h_scaled = int(h * scale)
+            
+            # Draw bounding box
+            cv2.rectangle(result, (x_scaled, y_scaled), (x_scaled + w_scaled, y_scaled + h_scaled), 
+                         (0, 0, 255), 2)
+            
+            # Draw center point
+            center_x = int((x + w/2) * scale)
+            center_y = int((y + h/2) * scale)
+            cv2.circle(result, (center_x, center_y), 5, (0, 0, 255), -1)
+            
+            # Label
+            cv2.putText(result, "P2", (x_scaled, y_scaled - 10), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
         
         return result
     
@@ -1275,22 +1432,376 @@ class InteractiveBallAnalyzer:
         
         print("-" * 80)
     
-    def process_video(self):
-        """Process video with interactive ball analysis."""
-        print("Interactive Ball Analyzer")
-        print("=" * 50)
-        print("1. Click on the tennis ball to mark and analyze it")
-        print("2. System will wait for your mark before starting")
-        print("3. Press 'D' to advance to next frame")
-        print("4. Press 'N' to mark net area (6 points clockwise)")
-        print("5. Press 'Q' to quit")
-        print("=" * 50)
+    def detect_and_track_players(self, frame):
+        """Detect and track P1 and P2 on the court."""
+        players = self.player_detector.detect_players(frame, debug=False)
         
-        cv2.namedWindow("Interactive Ball Analyzer", cv2.WINDOW_NORMAL)
+        if len(players) >= 2:
+            # Sort players by Y coordinate (top player = P1, bottom player = P2)
+            players_sorted = sorted(players, key=lambda p: p[1])
+            
+            # P1 is the top player (server)
+            self.p1_bbox = players_sorted[0]
+            x, y, w, h = self.p1_bbox
+            self.player1_pos = (x + w // 2, y + h // 2)  # Center of bbox
+            
+            # P2 is the bottom player
+            self.p2_bbox = players_sorted[1]
+            x, y, w, h = self.p2_bbox
+            self.player2_pos = (x + w // 2, y + h // 2)  # Center of bbox
+            
+            return True
+        elif len(players) == 1:
+            # Only one player detected - assume it's P1 (server) if near serve area
+            self.p1_bbox = players[0]
+            x, y, w, h = self.p1_bbox
+            self.player1_pos = (x + w // 2, y + h // 2)
+            return True
+        
+        return False
+    
+    def detect_serve_position(self, frame):
+        """Detect potential serve positions by looking for balls ABOVE P1's head in serve area."""
+        # Check if serve area is configured
+        if not hasattr(self, 'serve_area_x_min'):
+            return None
+        
+        # Detect players to know where P1's head is
+        self.detect_and_track_players(frame)
+        
+        # Restrict serve area to upper portion only (above P1's head)
+        # Use P1's bounding box top as the reference
+        if self.p1_bbox is not None:
+            _, p1_y, _, p1_h = self.p1_bbox
+            p1_head_y = p1_y  # Top of bounding box is the head
+            serve_search_y_max = min(p1_head_y, self.serve_area_y_max)
+        else:
+            # Conservative default: only search upper portion of serve area
+            serve_search_y_max = min(self.serve_area_y_min + (self.serve_area_y_max - self.serve_area_y_min) // 2, 
+                                    self.serve_area_y_max)
+        
+        # Apply HSV filter to find potential balls
+        hsv_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        mask = cv2.inRange(hsv_frame, self.hsv_lower, self.hsv_upper)
+        
+        # Find contours in the serve area (only upper portion above P1)
+        serve_roi = mask[self.serve_area_y_min:serve_search_y_max, 
+                        self.serve_area_x_min:self.serve_area_x_max]
+        contours, _ = cv2.findContours(serve_roi, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        # Look for ball-sized contours (prefer larger balls as they're more likely real)
+        best_contour = None
+        best_area = 0
+        
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            
+            # Tennis ball size range: 3-80 pixels (depending on distance from camera)
+            # Minimum 3 pixels to avoid false positives
+            if 3 <= area <= 80:
+                # Calculate center in full frame coordinates
+                M = cv2.moments(contour)
+                if M["m00"] != 0:
+                    cx = int(M["m10"] / M["m00"]) + self.serve_area_x_min
+                    cy = int(M["m01"] / M["m00"]) + self.serve_area_y_min
+                    
+                    # Only accept balls in the upper portion (above P1's head)
+                    if cy < serve_search_y_max:
+                        # Prefer larger balls (they're more likely to be the actual ball)
+                        if area > best_area:
+                            best_area = area
+                            best_contour = (cx, cy)
+        
+        return best_contour
+    
+    def mark_serve_area(self, frame):
+        """Mark the serve area with 4 points and save to config."""
+        print("\n=== MARKING SERVE AREA ===")
+        print("Click 4 points to define the serve area:")
+        print("1. Top-left corner of serve area")
+        print("2. Top-right corner of serve area") 
+        print("3. Bottom-right corner of serve area")
+        print("4. Bottom-left corner of serve area")
+        print("Press ESC to cancel")
+        
+        # Create a copy of the frame for marking
+        display_frame = frame.copy()
+        points = []
+        
+        def mouse_callback(event, x, y, flags, param):
+            if event == cv2.EVENT_LBUTTONDOWN:
+                points.append((x, y))
+                cv2.circle(display_frame, (x, y), 5, (0, 255, 0), -1)
+                cv2.putText(display_frame, f"{len(points)}", (x + 10, y - 10), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                cv2.imshow("Mark Serve Area", display_frame)
+                print(f"Point {len(points)}: ({x}, {y})")
+        
+        cv2.namedWindow("Mark Serve Area", cv2.WINDOW_NORMAL)
+        cv2.setMouseCallback("Mark Serve Area", mouse_callback)
+        
+        while len(points) < 4:
+            cv2.imshow("Mark Serve Area", display_frame)
+            key = cv2.waitKey(1) & 0xFF
+            if key == 27:  # ESC
+                cv2.destroyWindow("Mark Serve Area")
+                return False
+        
+        cv2.destroyWindow("Mark Serve Area")
+        
+        # Calculate serve area boundaries
+        x_coords = [p[0] for p in points]
+        y_coords = [p[1] for p in points]
+        
+        serve_area_x_min = min(x_coords)
+        serve_area_x_max = max(x_coords)
+        serve_area_y_min = min(y_coords)
+        serve_area_y_max = max(y_coords)
+        
+        print(f"\nServe area boundaries:")
+        print(f"X: {serve_area_x_min} to {serve_area_x_max}")
+        print(f"Y: {serve_area_y_min} to {serve_area_y_max}")
+        
+        # Save to config
+        self.serve_area_points = points
+        self.serve_area_x_min = serve_area_x_min
+        self.serve_area_x_max = serve_area_x_max
+        self.serve_area_y_min = serve_area_y_min
+        self.serve_area_y_max = serve_area_y_max
+        
+        # Save to config file
+        self.save_serve_area_to_config()
+        
+        return True
+    
+    def save_serve_area_to_config(self):
+        """Save serve area configuration to hsv_config.json."""
+        try:
+            # Load existing config
+            config = {}
+            if os.path.exists('hsv_config.json'):
+                with open('hsv_config.json', 'r') as f:
+                    config = json.load(f)
+            
+            # Add serve area data
+            config['serve_area_points'] = self.serve_area_points
+            config['serve_area_x_min'] = self.serve_area_x_min
+            config['serve_area_x_max'] = self.serve_area_x_max
+            config['serve_area_y_min'] = self.serve_area_y_min
+            config['serve_area_y_max'] = self.serve_area_y_max
+            
+            # Save updated config
+            with open('hsv_config.json', 'w') as f:
+                json.dump(config, f, indent=2)
+            
+            print("Serve area configuration saved to hsv_config.json")
+            
+        except Exception as e:
+            print(f"Error saving serve area config: {e}")
+    
+    def detect_point_end(self, ball_position, frame):
+        """Detect if a point has ended based on ball position and behavior."""
+        height, width = frame.shape[:2]
+        x, y = ball_position
+        
+        # Early serve grace: do not end point in first frames after start_frame
+        if self.frame_count <= (self.start_frame + 15):
+            return False, "Early-serve grace"
+        # If we're waiting near an edge, don't end the point
+        if getattr(self, 'edge_wait', False):
+            return False, "Edge wait"
+        
+        # Check if ball is out of court bounds
+        if x < 0 or x > width or y < 0 or y > height:
+            return True, "Ball out of court bounds"
+        
+        # Check if ball is in the net area (if configured) - but be more careful
+        if hasattr(self, 'net_area_y_min') and hasattr(self, 'net_area_y_max'):
+            if self.net_area_y_min <= y <= self.net_area_y_max:
+                # Ball is in net area - check if it's been there for multiple frames
+                if not hasattr(self, 'net_area_frames'):
+                    self.net_area_frames = 0
+                self.net_area_frames += 1
+                
+                # Only consider it a net hit if ball has been in net area for several frames
+                if self.net_area_frames > 5:
+                    return True, "Ball hit the net"
+            else:
+                # Reset counter if ball is not in net area
+                if hasattr(self, 'net_area_frames'):
+                    self.net_area_frames = 0
+        
+        # Check if ball has been stationary for too long (double bounce)
+        if hasattr(self, 'ball_velocity_history') and len(self.ball_velocity_history) > 10:
+            recent_velocities = self.ball_velocity_history[-10:]
+            avg_velocity = sum(recent_velocities) / len(recent_velocities)
+            if avg_velocity < 5:  # Very slow movement
+                return True, "Ball stopped (possible double bounce)"
+        
+        # Check if ball is near court edges (likely out)
+        edge_margin = 50
+        if (x < edge_margin or x > width - edge_margin or 
+            y < edge_margin or y > height - edge_margin):
+            return True, "Ball near court edge (likely out)"
+        
+        return False, "Point continues"
+    
+    def _open_serve_area_hsv_tuner(self, frame):
+        """Open HSV tuner specifically for the serve area."""
+        print("Opening HSV tuner for SERVE AREA...")
+        
+        # Extract serve area from frame
+        serve_roi = frame[self.serve_area_y_min:self.serve_area_y_max, 
+                         self.serve_area_x_min:self.serve_area_x_max]
+        
+        # Create tuner window
+        tuner_window = "SERVE AREA HSV TUNER"
+        cv2.namedWindow(tuner_window, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(tuner_window, 800, 600)
+        
+        # Initialize trackbars with current HSV values
+        cv2.createTrackbar("H Min", tuner_window, int(self.hsv_lower[0]), 179, lambda x: None)
+        cv2.createTrackbar("H Max", tuner_window, int(self.hsv_upper[0]), 179, lambda x: None)
+        cv2.createTrackbar("S Min", tuner_window, int(self.hsv_lower[1]), 255, lambda x: None)
+        cv2.createTrackbar("S Max", tuner_window, int(self.hsv_upper[1]), 255, lambda x: None)
+        cv2.createTrackbar("V Min", tuner_window, int(self.hsv_lower[2]), 255, lambda x: None)
+        cv2.createTrackbar("V Max", tuner_window, int(self.hsv_upper[2]), 255, lambda x: None)
+        cv2.createTrackbar("Bulb Min", tuner_window, 2, 50, lambda x: None)
+        cv2.createTrackbar("Bulb Max", tuner_window, 80, 200, lambda x: None)
+        
+        print("Adjust HSV values to detect balls in the serve area")
+        print("Press 'Q' or ESC to close and save settings")
+        
+        while True:
+            # Get trackbar values
+            h_min = cv2.getTrackbarPos("H Min", tuner_window)
+            h_max = cv2.getTrackbarPos("H Max", tuner_window)
+            s_min = cv2.getTrackbarPos("S Min", tuner_window)
+            s_max = cv2.getTrackbarPos("S Max", tuner_window)
+            v_min = cv2.getTrackbarPos("V Min", tuner_window)
+            v_max = cv2.getTrackbarPos("V Max", tuner_window)
+            bulb_min = cv2.getTrackbarPos("Bulb Min", tuner_window)
+            bulb_max = cv2.getTrackbarPos("Bulb Max", tuner_window)
+            
+            # Apply HSV filter to serve area
+            hsv_serve = cv2.cvtColor(serve_roi, cv2.COLOR_BGR2HSV)
+            hsv_lower = np.array([h_min, s_min, v_min], dtype=np.uint8)
+            hsv_upper = np.array([h_max, s_max, v_max], dtype=np.uint8)
+            mask = cv2.inRange(hsv_serve, hsv_lower, hsv_upper)
+            
+            # Find contours in serve area
+            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            # Draw detected balls on serve area
+            display_serve = serve_roi.copy()
+            ball_count = 0
+            
+            for contour in contours:
+                area = cv2.contourArea(contour)
+                if bulb_min < area < bulb_max:
+                    # Calculate center
+                    M = cv2.moments(contour)
+                    if M["m00"] != 0:
+                        cx = int(M["m10"] / M["m00"])
+                        cy = int(M["m01"] / M["m00"])
+                        
+                        # Draw circle and size label
+                        cv2.circle(display_serve, (cx, cy), 8, (0, 255, 0), 2)
+                        cv2.putText(display_serve, f"{area:.0f}", (cx + 12, cy), 
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
+                        ball_count += 1
+            
+            # Create side-by-side display
+            mask_bgr = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+            combined = np.hstack([display_serve, mask_bgr])
+            
+            # Add text info
+            info_text = f"SERVE AREA | Balls: {ball_count} | HSV: H={h_min}-{h_max} S={s_min}-{s_max} V={v_min}-{v_max} | Size: {bulb_min}-{bulb_max}px"
+            cv2.putText(combined, info_text, (10, 20), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+            
+            cv2.imshow(tuner_window, combined)
+            
+            key = cv2.waitKey(50) & 0xFF
+            if key == ord('q') or key == 27:  # 'q' or ESC
+                break
+        
+        # Update HSV values with tuned values
+        self.hsv_lower = hsv_lower
+        self.hsv_upper = hsv_upper
+        
+        # Save updated HSV values to config
+        self.save_hsv_to_config()
+        
+        cv2.destroyWindow(tuner_window)
+        print("Serve area HSV tuner closed. Settings saved.")
+    
+    def save_hsv_to_config(self):
+        """Save current HSV values to config file."""
+        try:
+            # Load existing config
+            config = {}
+            if os.path.exists('hsv_config.json'):
+                with open('hsv_config.json', 'r') as f:
+                    config = json.load(f)
+            
+            # Update HSV values
+            if "regular_court" in config:
+                # Update regular court HSV values
+                config["regular_court"]["h_min"] = int(self.hsv_lower[0])
+                config["regular_court"]["h_max"] = int(self.hsv_upper[0])
+                config["regular_court"]["s_min"] = int(self.hsv_lower[1])
+                config["regular_court"]["s_max"] = int(self.hsv_upper[1])
+                config["regular_court"]["v_min"] = int(self.hsv_lower[2])
+                config["regular_court"]["v_max"] = int(self.hsv_upper[2])
+            else:
+                # Old format
+                config["h_min"] = int(self.hsv_lower[0])
+                config["h_max"] = int(self.hsv_upper[0])
+                config["s_min"] = int(self.hsv_lower[1])
+                config["s_max"] = int(self.hsv_upper[1])
+                config["v_min"] = int(self.hsv_lower[2])
+                config["v_max"] = int(self.hsv_upper[2])
+            
+            # Save updated config
+            with open('hsv_config.json', 'w') as f:
+                json.dump(config, f, indent=2)
+            
+            print("HSV values saved to hsv_config.json")
+            
+        except Exception as e:
+            print(f"Error saving HSV config: {e}")
+    
+    def process_video(self):
+        """Process video with intelligent tennis game analysis."""
+        print("Intelligent Tennis Game Tracker")
+        print("=" * 50)
+        print("1. Automatically finds first serve position")
+        print("2. Tracks ball through each point")
+        print("3. Detects when point ends (out, net, double bounce)")
+        print("4. Automatically waits for next serve")
+        print("5. Press 'D' to advance frame by frame")
+        print("6. Press 'N' to mark net area (6 points clockwise)")
+        print("7. Press 'S' to mark serve area (4 points)")
+        print("8. Press 'Q' to quit")
+        print("=" * 50)
+        if self.start_frame > 0:
+            print(f"Starting at frame {self.start_frame}")
+        
+        cv2.namedWindow("Tennis Game Tracker", cv2.WINDOW_NORMAL)
         
         # Store scale factor for mouse coordinate conversion
         scale_factor = 1.0
         current_frame = None
+        
+        # Game state variables
+        game_state = "SCANNING_FOR_SERVE"  # SCANNING_FOR_SERVE, TRACKING_POINT, POINT_ENDED, WAITING_FOR_SERVE
+        point_start_frame = None
+        point_end_frame = None
+        serve_positions = []
+        # Ensure capture starts at requested frame
+        self.cap.set(cv2.CAP_PROP_POS_FRAMES, self.start_frame)
+        early_serve_grace_frames = 15  # aggressively accept serve during first frames after start_frame
         
         # Modified mouse callback that converts resized coordinates to original
         def mouse_callback_with_scale(event, x, y, flags, param):
@@ -1301,86 +1812,147 @@ class InteractiveBallAnalyzer:
                 # Analyze ball at original coordinates
                 self.analyze_ball_at_point(current_frame, (orig_x, orig_y))
         
-        cv2.setMouseCallback("Interactive Ball Analyzer", mouse_callback_with_scale)
+        cv2.setMouseCallback("Tennis Game Tracker", mouse_callback_with_scale)
         
-        # Skip to frame 144 and auto-start tracking at known ball position
-        print(f"\nSkipping to frame 144...")
-        self.cap.set(cv2.CAP_PROP_POS_FRAMES, 144)
-        self.frame_count = 144
+        # Start from configured frame to scan for first serve
+        print(f"\nStarting from frame {self.start_frame} to scan for first serve...")
+        self.cap.set(cv2.CAP_PROP_POS_FRAMES, self.start_frame)
+        self.frame_count = self.start_frame
         
-        # Auto-mark the first ball at frame 144 (known position from previous runs)
-        # This allows tracking to start immediately without mouse click
-        first_ball_position = (1977, 320)  # Approximate position of first ball at frame 144
-        print(f"\nAuto-starting tracking at first ball position: {first_ball_position}")
-        print(f"Press 'D' to advance frame by frame")
+        # Load HSV values from config file (or use defaults if not present)
+        hsv_config = self.load_hsv_config()
         
-        # Read first frame and mark the ball automatically
-        ret, frame = self.cap.read()
-        if ret:
-            self.frame_count += 1
-            
-            # Load HSV values from config file (or use defaults if not present)
-            hsv_config = self.load_hsv_config()
-            
-            # Check if net area needs to be marked (first time setup)
-            if hsv_config and "net_area_y_min" not in hsv_config:
-                print("\n" + "=" * 70)
-                print("FIRST TIME SETUP: Please mark the net area")
-                print("=" * 70)
+        # Check if net area needs to be marked (first time setup)
+        if hsv_config and "net_area_y_min" not in hsv_config:
+            print("\n" + "=" * 70)
+            print("FIRST TIME SETUP: Please mark the net area")
+            print("=" * 70)
+            ret, frame = self.cap.read()
+            if ret:
                 if self.mark_net_area(frame):
                     print("Net area saved! This will be used for all future runs.")
                     # Reload config after marking net area
                     hsv_config = self.load_hsv_config()
                 else:
                     print("Net area marking skipped. Using default values.")
-            
-            # Don't call analyze_ball_at_point during auto-start to avoid opening debug window
-            # Just initialize the tracking parameters directly
-            self.ball_center = first_ball_position
-            self.tracking = True
-            self.ball_stopped = False
-            self.ball_velocity_history = []
-            self.initial_ball_position = first_ball_position
-            if not hsv_config:
-                # Default values if config not found
-                self.hsv_lower = np.array([20, 20, 70], dtype=np.uint8)
-                self.hsv_upper = np.array([90, 255, 255], dtype=np.uint8)
-            # If old format, set hsv_lower and hsv_upper (already done in load_hsv_config for new format)
-            elif 'h_min' in hsv_config:
-                self.hsv_lower = np.array([hsv_config['h_min'], hsv_config['s_min'], hsv_config['v_min']], dtype=np.uint8)
-                self.hsv_upper = np.array([hsv_config['h_max'], hsv_config['s_max'], hsv_config['v_max']], dtype=np.uint8)
-            # New format already loaded in load_hsv_config, just use the regular court as default
-            
-            print(f"\nBall tracking initialized at: {first_ball_position}")
-            print(f"HSV Filter: H={self.hsv_lower[0]}-{self.hsv_upper[0]}, S={self.hsv_lower[1]}-{self.hsv_upper[1]}, V={self.hsv_lower[2]}-{self.hsv_upper[2]}")
-            
-            # Display first frame (resize to fit screen)
-            screen_height = 900
-            scale_factor = screen_height / frame.shape[0]
-            new_width = int(frame.shape[1] * scale_factor)
-            new_height = int(frame.shape[0] * scale_factor)
-            resized_frame = cv2.resize(frame, (new_width, new_height))
-            
-            # Draw analysis info with scale factor
-            display_frame = self.draw_analysis_info(resized_frame, scale=scale_factor)
-            cv2.imshow("Interactive Ball Analyzer", display_frame)
-            cv2.waitKey(1)
+        
+        # Check if serve area needs to be marked (first time setup)
+        if hsv_config and "serve_area_points" not in hsv_config:
+            print("\n" + "=" * 70)
+            print("FIRST TIME SETUP: Please mark the serve area")
+            print("=" * 70)
+            ret, frame = self.cap.read()
+            if ret:
+                if self.mark_serve_area(frame):
+                    print("Serve area saved! This will be used for all future runs.")
+                    # Reload config after marking serve area
+                    hsv_config = self.load_hsv_config()
+                else:
+                    print("Serve area marking skipped. Using default values.")
+        
+        # Initialize HSV values
+        if not hsv_config:
+            # Default values if config not found
+            self.hsv_lower = np.array([20, 20, 70], dtype=np.uint8)
+            self.hsv_upper = np.array([90, 255, 255], dtype=np.uint8)
+        # If old format, set hsv_lower and hsv_upper (already done in load_hsv_config for new format)
+        elif 'h_min' in hsv_config:
+            self.hsv_lower = np.array([hsv_config['h_min'], hsv_config['s_min'], hsv_config['v_min']], dtype=np.uint8)
+            self.hsv_upper = np.array([hsv_config['h_max'], hsv_config['s_max'], hsv_config['v_max']], dtype=np.uint8)
+        # New format already loaded in load_hsv_config, just use the regular court as default
+        
+        print(f"\nHSV Filter: H={self.hsv_lower[0]}-{self.hsv_upper[0]}, S={self.hsv_lower[1]}-{self.hsv_upper[1]}, V={self.hsv_lower[2]}-{self.hsv_upper[2]}")
+        print(f"Game State: {game_state}")
+        print(f"Press 'D' to advance frame by frame")
         
         while True:
             ret, frame = self.cap.read()
             if not ret:
                 break
             
+            # Early serve detection: while scanning and within grace window, attempt ball track and enter tracking
+            if game_state == "SCANNING_FOR_SERVE" and self.frame_count <= (self.start_frame + early_serve_grace_frames):
+                candidate = self.track_ball_in_frame(frame, allow_inactive=True)
+                if candidate is not None:
+                    print(f"Frame {self.frame_count}: Early serve found at {candidate}, entering TRACKING_POINT")
+                    game_state = "TRACKING_POINT"
+                    point_start_frame = self.frame_count
+                    self.tracking = True
+            
             self.frame_count += 1
             current_frame = frame  # Store current frame for mouse callback
             
-            # If tracking is enabled, automatically track ball in this frame
-            if self.tracking and self.hsv_lower is not None and self.ball_center is not None:
-                tracked_position = self.track_ball_in_frame(frame)
+            # Handle different game states
+            if game_state == "SCANNING_FOR_SERVE":
+                # Look for potential serve positions (ball in serve area)
+                potential_serve = self.detect_serve_position(frame)
+                if potential_serve:
+                    print(f"\n{'='*70}")
+                    print(f"SERVE DETECTED at frame {self.frame_count}!")
+                    print(f"Ball position: {potential_serve}")
+                    print(f"Starting to track the ball...")
+                    print(f"{'='*70}\n")
+                    serve_positions.append((self.frame_count, potential_serve))
+                    # Start tracking this potential serve
+                    self.ball_center = potential_serve
+                    self.tracking = True
+                    self.ball_stopped = False
+                    self.ball_velocity_history = []
+                    self.initial_ball_position = potential_serve
+                    self.ball_size = None  # Will be set by track_ball_in_frame
+                    point_start_frame = self.frame_count
+                    game_state = "TRACKING_POINT"
+            
+            elif game_state == "TRACKING_POINT":
+                # Update player positions while tracking
+                self.detect_and_track_players(frame)
+                
+                # Track ball through the point
+                tracked_position = None
+                if self.tracking and self.hsv_lower is not None and self.ball_center is not None:
+                    tracked_position = self.track_ball_in_frame(frame)
                 if tracked_position:
-                    print(f"Frame {self.frame_count}: Ball tracked at {tracked_position} - Size: {self.ball_size:.1f}px")
-                else:
-                    print(f"Frame {self.frame_count}: [WARNING] Ball lost - click to re-mark")
+                    size_text = f"{self.ball_size:.1f}px" if self.ball_size is not None else "unknown"
+                    print(f"Frame {self.frame_count}: Ball tracked at {tracked_position} - Size: {size_text}")
+                    
+                    # Check if point has ended
+                    point_ended, reason = self.detect_point_end(tracked_position, frame)
+                    if point_ended:
+                        point_end_frame = self.frame_count
+                        print(f"Frame {self.frame_count}: POINT ENDED - {reason}")
+                        print(f"Point duration: {point_end_frame - point_start_frame} frames")
+                        game_state = "POINT_ENDED"
+                        self.tracking = False
+                    else:
+                        print(f"Frame {self.frame_count}: Ball tracking continued")
+                        # Ball lost - might be end of point
+                        grace_limit = 45 if point_start_frame and self.frame_count <= (self.start_frame + 45) else 30
+                        if self.frame_count - point_start_frame > grace_limit:  # Minimum point duration
+                            point_end_frame = self.frame_count
+                            print(f"Frame {self.frame_count}: POINT ENDED - Ball lost (likely out of court)")
+                            print(f"Point duration: {point_end_frame - point_start_frame} frames")
+                            game_state = "POINT_ENDED"
+                            self.tracking = False
+            
+            elif game_state == "POINT_ENDED":
+                # Wait a few frames then start scanning for next serve
+                if self.frame_count - point_end_frame > 60:  # Wait 2 seconds (60 frames at 30fps)
+                    print(f"Frame {self.frame_count}: Starting to scan for next serve...")
+                    game_state = "SCANNING_FOR_SERVE"
+                    point_start_frame = None
+                    point_end_frame = None
+                # If we are still within early grace and see the ball, resume tracking
+                elif (self.frame_count <= (self.start_frame + 15)) or getattr(self, 'edge_wait', False) or (self.last_seen_frame and self.frame_count - self.last_seen_frame <= 200):
+                    candidate = self.track_ball_in_frame(frame, allow_inactive=True)
+                    if candidate is not None:
+                        print(f"Frame {self.frame_count}: Ball re-found during grace, resuming TRACKING_POINT at {candidate}")
+                        game_state = "TRACKING_POINT"
+                        point_start_frame = self.frame_count
+                        self.tracking = True
+        
+            elif game_state == "WAITING_FOR_SERVE":
+                # This state can be used for manual intervention
+                pass
             
             # Resize frame to fit screen
             height, width = frame.shape[:2]
@@ -1396,14 +1968,21 @@ class InteractiveBallAnalyzer:
             cv2.putText(display_frame, f"Frame: {self.frame_count}/{self.total_frames}", 
                        (10, new_height-20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
             
-            if not self.tracking:
-                cv2.putText(display_frame, "Click on ball to mark it | D=Next | N=Mark net | Q=Quit", 
-                           (10, new_height-40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-            else:
-                cv2.putText(display_frame, "Ball marked! D=Next | N=Mark net | T=Table | Q=Quit", 
+            # Show game state and controls
+            if game_state == "SCANNING_FOR_SERVE":
+                cv2.putText(display_frame, f"SCANNING FOR SERVE | D=Next | N=Net | S=Serve | Q=Quit", 
+                           (10, new_height-40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+            elif game_state == "TRACKING_POINT":
+                cv2.putText(display_frame, f"TRACKING POINT (started frame {point_start_frame}) | D=Next | N=Net | S=Serve | Q=Quit", 
                            (10, new_height-40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            elif game_state == "POINT_ENDED":
+                cv2.putText(display_frame, f"POINT ENDED (waiting for next serve) | D=Next | N=Net | S=Serve | Q=Quit", 
+                           (10, new_height-40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
+            else:
+                cv2.putText(display_frame, f"Game State: {game_state} | D=Next | N=Net | S=Serve | Q=Quit", 
+                           (10, new_height-40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
             
-            cv2.imshow("Interactive Ball Analyzer", display_frame)
+            cv2.imshow("Tennis Game Tracker", display_frame)
             
             key = cv2.waitKey(0) & 0xFF
             if key == ord('q'):
@@ -1417,6 +1996,24 @@ class InteractiveBallAnalyzer:
                     self.load_hsv_config()
                 else:
                     print("Net area marking cancelled.")
+                # Redisplay current frame
+                continue
+            elif key == ord('s'):
+                # Show HSV tuner for serve area
+                print("\n=== SERVE AREA HSV TUNER ===")
+                if hasattr(self, 'serve_area_x_min'):
+                    print(f"Serve area: X={self.serve_area_x_min}-{self.serve_area_x_max}, Y={self.serve_area_y_min}-{self.serve_area_y_max}")
+                    self._open_serve_area_hsv_tuner(frame)
+                else:
+                    print("No serve area configured. Marking serve area first...")
+                    if self.mark_serve_area(frame):
+                        print("Serve area marked successfully! Updated config file.")
+                        # Reload HSV config to get updated serve area
+                        self.load_hsv_config()
+                        # Now open the HSV tuner for the serve area
+                        self._open_serve_area_hsv_tuner(frame)
+                    else:
+                        print("Serve area marking cancelled.")
                 # Redisplay current frame
                 continue
             elif key == ord('d'):
@@ -1443,6 +2040,11 @@ class InteractiveBallAnalyzer:
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Interactive tennis ball analyzer/tracker")
+    parser.add_argument("--start-frame", type=int, default=100,
+                        help="Frame index to start from (default 100, e.g., serve)")
+    args = parser.parse_args()
+    
     video_path = "20251011124747503_FV3553362380_FV3553362.mp4"
-    analyzer = InteractiveBallAnalyzer(video_path)
+    analyzer = InteractiveBallAnalyzer(video_path, start_frame=args.start_frame)
     analyzer.process_video()
