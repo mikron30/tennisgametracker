@@ -1,7 +1,7 @@
 {
   "regular_court": {
     "h_min": 32,
-    "h_max": 73,
+    "h_max": 90,
     "s_min": 31,
     "s_max": 255,
     "v_min": 70,

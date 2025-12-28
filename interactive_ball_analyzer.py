@@ -3,6 +3,7 @@ import cv2
 import numpy as np
 import json
 import os
+import math
 from simple_player_detector import SimplePlayerDetector
 from typing import Tuple, Optional
 
@@ -46,9 +47,236 @@ class InteractiveBallAnalyzer:
         self.player2_pos = None
         self.p1_bbox = None  # (x, y, w, h)
         self.p2_bbox = None  # (x, y, w, h)
+        self.motion_history = []
+        self.focus_loss_frame = None
+        self.focus_loss_active = False
+        self.alt_focus_hsv_lower = None
+        self.alt_focus_hsv_upper = None
+        self.last_motion = None
+        self.pre_focus_hsv_regular = None
+        self.pre_focus_hsv_behind_net = None
+        self.using_alt_hsv = False
+        self.using_alt2_hsv = False
+        self.alt2_hsv_lower = None
+        self.alt2_hsv_upper = None
+        # Flag when per-frame movement jumps well beyond recent median
+        self.focus_loss_distance_threshold = 60.0
         
         # Initialize simple player detector (focused on right court only)
         self.player_detector = SimplePlayerDetector()
+
+    def log_motion_metrics(self, dx, dy, distance, direction_deg):
+        """Log per-frame motion and raise a focus-loss flag when movement spikes."""
+        direction_text = f"{direction_deg:+.1f} deg" if direction_deg is not None else "N/A"
+        print(f"Frame {self.frame_count}: Movement {distance:.1f}px (dx={dx}, dy={dy}) Direction: {direction_text}")
+
+        self.last_motion = {
+            'distance': distance,
+            'dx': dx,
+            'dy': dy,
+            'direction_deg': direction_deg
+        }
+        self.motion_history.append({
+            'frame': self.frame_count,
+            'distance': distance,
+            'direction_deg': direction_deg
+        })
+        if len(self.motion_history) > 200:
+            self.motion_history.pop(0)
+
+        # Compare to recent median distance (starting from start_frame)
+        if self.focus_loss_frame is None and self.frame_count >= self.start_frame:
+            baseline_distances = [
+                entry['distance']
+                for entry in self.motion_history
+                if self.start_frame <= entry['frame'] < self.frame_count
+            ]
+            median_distance = float(np.median(baseline_distances[-10:])) if baseline_distances else 0.0
+            spike_threshold = max(self.focus_loss_distance_threshold, median_distance * 2.5)
+            if distance > spike_threshold:
+                self.focus_loss_frame = self.frame_count
+                self.focus_loss_active = True
+                self.using_alt_hsv = True
+                if self.alt_focus_hsv_lower is not None and self.alt_focus_hsv_upper is not None:
+                    self.hsv_lower = self.alt_focus_hsv_lower
+                    self.hsv_upper = self.alt_focus_hsv_upper
+                print(f"Frame {self.frame_count}: [FOCUS LOSS FLAG] movement spike detected "
+                      f"(distance {distance:.1f}px vs median {median_distance:.1f}px) "
+                      f"starting from frame {self.start_frame}")
+                return True
+        return False
+
+    def retrack_with_alt_hsv(self, search_frame, x1, y1, prev_pos, predicted_point, prev_ball_size, allow_inactive):
+        """Re-run detection with alternative HSV only after focus loss."""
+        if self.alt_focus_hsv_lower is None or self.alt_focus_hsv_upper is None:
+            return None
+
+        hsv_frame = cv2.cvtColor(search_frame, cv2.COLOR_BGR2HSV)
+        mask_alt = cv2.inRange(hsv_frame, self.alt_focus_hsv_lower, self.alt_focus_hsv_upper)
+        kernel = np.ones((2, 2), np.uint8)
+        mask_alt = cv2.morphologyEx(mask_alt, cv2.MORPH_OPEN, kernel)
+        mask_alt = cv2.morphologyEx(mask_alt, cv2.MORPH_CLOSE, kernel)
+        contours_alt, _ = cv2.findContours(mask_alt, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        if not contours_alt:
+            print(f"  DEBUG: Focus-loss retrack found no contours with alt HSV")
+            return None
+
+        best_score = float('inf')
+        best = None
+        for i, contour in enumerate(contours_alt):
+            area = cv2.contourArea(contour)
+            if allow_inactive:
+                if area < 1 or area > 80:
+                    continue
+            else:
+                if area < 1 or area > 150:
+                    continue
+
+            M = cv2.moments(contour)
+            if M["m00"] == 0:
+                continue
+            cx = int(M["m10"] / M["m00"]) + x1
+            cy = int(M["m01"] / M["m00"]) + y1
+
+            if prev_pos:
+                distance = math.hypot(cx - prev_pos[0], cy - prev_pos[1])
+            else:
+                distance = 0
+
+            if prev_ball_size and prev_ball_size > 0:
+                size_diff = abs(area - prev_ball_size)
+                size_ratio = size_diff / prev_ball_size
+            else:
+                size_ratio = 0
+
+            score = distance + (size_ratio * 30)
+            if self.last_motion and distance > 0 and prev_pos:
+                lm_dx = self.last_motion['dx']
+                lm_dy = self.last_motion['dy']
+                lm_dist = self.last_motion['distance']
+                mv_dx = cx - prev_pos[0]
+                mv_dy = cy - prev_pos[1]
+                dot = lm_dx * mv_dx + lm_dy * mv_dy
+                if dot < 0:
+                    score += 80  # stronger penalty for opposite direction
+                if lm_dist and lm_dist > 0:
+                    speed_diff = abs(distance - lm_dist)
+                    score += speed_diff * 1.5
+                    align_bonus = dot / (lm_dist * distance)
+                    score -= max(0.0, align_bonus) * 40
+            if predicted_point:
+                pdx = cx - predicted_point[0]
+                pdy = cy - predicted_point[1]
+                predicted_distance = math.hypot(pdx, pdy)
+                score += predicted_distance * 0.5
+
+            if score < best_score:
+                best_score = score
+                best = (cx, cy, area, distance)
+
+        if best is None:
+            print(f"  DEBUG: Focus-loss retrack found no valid candidate with alt HSV")
+            return None
+
+        cx, cy, area, distance = best
+        hsv_values = cv2.cvtColor(search_frame, cv2.COLOR_BGR2HSV)
+        local_x = max(0, min(search_frame.shape[1] - 1, cx - x1))
+        local_y = max(0, min(search_frame.shape[0] - 1, cy - y1))
+        hsv_at_point = hsv_values[local_y, local_x]
+
+        print(f"  DEBUG: Focus-loss retrack selected contour at ({cx},{cy}) distance={distance:.1f}px")
+        return {
+            'pos': (cx, cy),
+            'area': area,
+            'hsv': hsv_at_point
+        }
+
+    def retrack_with_alt2_hsv(self, search_frame, x1, y1, prev_pos, predicted_point, prev_ball_size, allow_inactive):
+        """Re-run detection with alternative 2 HSV (H 46-72) when stuck."""
+        if self.alt2_hsv_lower is None or self.alt2_hsv_upper is None:
+            return None
+
+        hsv_frame = cv2.cvtColor(search_frame, cv2.COLOR_BGR2HSV)
+        mask_alt2 = cv2.inRange(hsv_frame, self.alt2_hsv_lower, self.alt2_hsv_upper)
+        kernel = np.ones((2, 2), np.uint8)
+        mask_alt2 = cv2.morphologyEx(mask_alt2, cv2.MORPH_OPEN, kernel)
+        mask_alt2 = cv2.morphologyEx(mask_alt2, cv2.MORPH_CLOSE, kernel)
+        contours_alt2, _ = cv2.findContours(mask_alt2, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        if not contours_alt2:
+            print(f"  DEBUG: Alt2 retrack found no contours")
+            return None
+
+        best_score = float('inf')
+        best = None
+        for contour in contours_alt2:
+            area = cv2.contourArea(contour)
+            if allow_inactive:
+                if area < 1 or area > 80:
+                    continue
+            else:
+                if area < 1 or area > 150:
+                    continue
+
+            M = cv2.moments(contour)
+            if M["m00"] == 0:
+                continue
+            cx = int(M["m10"] / M["m00"]) + x1
+            cy = int(M["m01"] / M["m00"]) + y1
+
+            if prev_pos:
+                distance = math.hypot(cx - prev_pos[0], cy - prev_pos[1])
+            else:
+                distance = 0
+
+            if prev_ball_size and prev_ball_size > 0:
+                size_diff = abs(area - prev_ball_size)
+                size_ratio = size_diff / prev_ball_size
+            else:
+                size_ratio = 0
+
+            score = distance + (size_ratio * 30)
+            if self.last_motion and distance > 0 and prev_pos:
+                lm_dx = self.last_motion['dx']
+                lm_dy = self.last_motion['dy']
+                lm_dist = self.last_motion['distance']
+                mv_dx = cx - prev_pos[0]
+                mv_dy = cy - prev_pos[1]
+                dot = lm_dx * mv_dx + lm_dy * mv_dy
+                if dot < 0:
+                    score += 80  # stronger penalty for opposite direction
+                if lm_dist and lm_dist > 0:
+                    speed_diff = abs(distance - lm_dist)
+                    score += speed_diff * 1.5
+                    align_bonus = dot / (lm_dist * distance)
+                    score -= max(0.0, align_bonus) * 40
+            if predicted_point:
+                pdx = cx - predicted_point[0]
+                pdy = cy - predicted_point[1]
+                predicted_distance = math.hypot(pdx, pdy)
+                score += predicted_distance * 0.5
+
+            if score < best_score:
+                best_score = score
+                best = (cx, cy, area, distance)
+
+        if best is None:
+            print(f"  DEBUG: Alt2 retrack found no valid candidate")
+            return None
+
+        cx, cy, area, distance = best
+        hsv_values = cv2.cvtColor(search_frame, cv2.COLOR_BGR2HSV)
+        local_x = max(0, min(search_frame.shape[1] - 1, cx - x1))
+        local_y = max(0, min(search_frame.shape[0] - 1, cy - y1))
+        hsv_at_point = hsv_values[local_y, local_x]
+
+        print(f"  DEBUG: Alt2 retrack selected contour at ({cx},{cy}) distance={distance:.1f}px")
+        return {
+            'pos': (cx, cy),
+            'area': area,
+            'hsv': hsv_at_point
+        }
         
     def load_hsv_config(self):
         """Load HSV values from config file."""
@@ -67,6 +295,16 @@ class InteractiveBallAnalyzer:
                         'lower': np.array([config["behind_net"]["h_min"], config["behind_net"]["s_min"], config["behind_net"]["v_min"]], dtype=np.uint8),
                         'upper': np.array([config["behind_net"]["h_max"], config["behind_net"]["s_max"], config["behind_net"]["v_max"]], dtype=np.uint8)
                     }
+                    self.pre_focus_hsv_regular = {
+                        'lower': self.hsv_regular['lower'].copy(),
+                        'upper': self.hsv_regular['upper'].copy()
+                    }
+                    self.pre_focus_hsv_regular['upper'][0] = min(self.pre_focus_hsv_regular['upper'][0], 73)
+                    self.pre_focus_hsv_behind_net = {
+                        'lower': self.hsv_behind_net['lower'].copy(),
+                        'upper': self.hsv_behind_net['upper'].copy()
+                    }
+                    self.pre_focus_hsv_behind_net['upper'][0] = min(self.pre_focus_hsv_behind_net['upper'][0], 73)
                     self.net_area_y_min = config.get("net_area_y_min", 250)
                     self.net_area_y_max = config.get("net_area_y_max", 350)
                     
@@ -104,6 +342,8 @@ class InteractiveBallAnalyzer:
                     self.hsv_upper = np.array([config["h_max"], config["s_max"], config["v_max"]], dtype=np.uint8)
                     self.hsv_regular = None
                     self.hsv_behind_net = None
+                    self.pre_focus_hsv_regular = None
+                    self.pre_focus_hsv_behind_net = None
                     print(f"Loaded HSV values: H:{config['h_min']}-{config['h_max']}, S:{config['s_min']}-{config['s_max']}, V:{config['v_min']}-{config['v_max']}")
             
                 # Set primary/alt HSV ranges (primary = config, alt = capped legacy)
@@ -113,6 +353,14 @@ class InteractiveBallAnalyzer:
                 self.alt_hsv_upper = self.primary_hsv_upper.copy()
                 # Legacy cap for alt to keep the older narrower range
                 self.alt_hsv_upper[0] = min(self.alt_hsv_upper[0], 73)
+                # Alternative for focus-loss recovery: raise H max to 90
+                self.alt_focus_hsv_lower = self.primary_hsv_lower.copy()
+                self.alt_focus_hsv_upper = self.primary_hsv_upper.copy()
+                self.alt_focus_hsv_upper[0] = min(179, max(self.alt_focus_hsv_upper[0], 90))
+                self.alt2_hsv_lower = self.primary_hsv_lower.copy()
+                self.alt2_hsv_upper = self.primary_hsv_upper.copy()
+                self.alt2_hsv_lower[0] = 38
+                self.alt2_hsv_upper[0] = 75
                 # Use primary as active by default (full config range)
                 self.hsv_lower = self.primary_hsv_lower
                 self.hsv_upper = self.primary_hsv_upper
@@ -125,6 +373,10 @@ class InteractiveBallAnalyzer:
     
     def select_hsv_for_position(self, y_position, at_edge=False):
         """Select appropriate HSV config based on ball Y position."""
+        if self.using_alt2_hsv and self.alt2_hsv_lower is not None and self.alt2_hsv_upper is not None:
+            return self.alt2_hsv_lower, self.alt2_hsv_upper, "alternative_2"
+        if self.using_alt_hsv and self.alt_focus_hsv_lower is not None and self.alt_focus_hsv_upper is not None:
+            return self.alt_focus_hsv_lower, self.alt_focus_hsv_upper, "alternative"
         if self.hsv_regular is None or self.hsv_behind_net is None:
             # Single HSV mode
             if at_edge:
@@ -132,15 +384,23 @@ class InteractiveBallAnalyzer:
                 hsv_lower_edge = self.hsv_lower.copy()
                 hsv_lower_edge[2] = max(70, self.hsv_lower[2] - 50)  # Lower V_min by 50
                 return hsv_lower_edge, self.hsv_upper, "single_edge"
+            if self.alt_hsv_lower is not None and self.alt_hsv_upper is not None:
+                return self.alt_hsv_lower, self.alt_hsv_upper, "single_prefocus"
             return self.hsv_lower, self.hsv_upper, "single"
         
         # Check if ball is in net area
         if self.net_area_y_min <= y_position <= self.net_area_y_max:
+            if not self.focus_loss_active and self.pre_focus_hsv_behind_net is not None:
+                return self.pre_focus_hsv_behind_net['lower'], self.pre_focus_hsv_behind_net['upper'], "behind_net_prefocus"
             return self.hsv_behind_net['lower'], self.hsv_behind_net['upper'], "behind_net"
         elif at_edge:
             # Use behind_net HSV (more relaxed) at edges
+            if not self.focus_loss_active and self.pre_focus_hsv_behind_net is not None:
+                return self.pre_focus_hsv_behind_net['lower'], self.pre_focus_hsv_behind_net['upper'], "at_edge_prefocus"
             return self.hsv_behind_net['lower'], self.hsv_behind_net['upper'], "at_edge"
         else:
+            if not self.focus_loss_active and self.pre_focus_hsv_regular is not None:
+                return self.pre_focus_hsv_regular['lower'], self.pre_focus_hsv_regular['upper'], "regular_court_prefocus"
             return self.hsv_regular['lower'], self.hsv_regular['upper'], "regular_court"
     
     def mark_net_area(self, frame):
@@ -318,8 +578,8 @@ class InteractiveBallAnalyzer:
         """Open HSV filter tuner with 100x100 region around the ball."""
         x, y = point
         
-        # Extract 100x100 region around the ball - MUST BE FRESH COPY
-        region_size = 50  # 50 pixels radius = 100x100 total
+        # Extract larger region around the ball for debugging - MUST BE FRESH COPY
+        region_size = 150  # 150 pixels radius = 300x300 total
         x1 = max(0, x - region_size)
         y1 = max(0, y - region_size)
         x2 = min(frame.shape[1], x + region_size)
@@ -337,9 +597,9 @@ class InteractiveBallAnalyzer:
         
         print(f"Extracted region shape: {region.shape}")
         
-        # Resize to exactly 100x100 if needed
-        if region.shape[0] != 100 or region.shape[1] != 100:
-            region = cv2.resize(region, (100, 100))
+        # Resize to exactly 300x300 if needed
+        if region.shape[0] != 300 or region.shape[1] != 300:
+            region = cv2.resize(region, (300, 300))
             print(f"Resized region to: {region.shape}")
         
         # Get initial HSV values at the clicked point (relative to region)
@@ -347,14 +607,14 @@ class InteractiveBallAnalyzer:
         rel_y = y - y1
         
         # Adjust relative coordinates if resizing happened
-        if x2 - x1 != 100:
-            rel_x = int((rel_x / (x2 - x1)) * 100)
-        if y2 - y1 != 100:
-            rel_y = int((rel_y / (y2 - y1)) * 100)
+        if x2 - x1 != 300:
+            rel_x = int((rel_x / (x2 - x1)) * 300)
+        if y2 - y1 != 300:
+            rel_y = int((rel_y / (y2 - y1)) * 300)
         
         # Ensure relative coordinates are within bounds
-        rel_x = max(0, min(99, rel_x))
-        rel_y = max(0, min(99, rel_y))
+        rel_x = max(0, min(299, rel_x))
+        rel_y = max(0, min(299, rel_y))
         
         print(f"Relative coordinates: ({rel_x}, {rel_y}) in 100x100 region")
         
@@ -366,18 +626,18 @@ class InteractiveBallAnalyzer:
         print("Adjust sliders until ball appears WHITE, then press 'S' to save")
         
         # Create HSV tuner window
-        tuner_window = "HSV Filter Tuner - 100x100"
+        tuner_window = "HSV Filter Tuner - 300x300"
         cv2.namedWindow(tuner_window, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(tuner_window, 800, 600)
         cv2.waitKey(1)  # Allow window to be created
         
-        # Use good starting HSV values from user's findings
-        h_min = 20
-        h_max = 90
-        s_min = 20
-        s_max = 255
-        v_min = 70
-        v_max = 255
+        # Use current active HSV values as starting point
+        h_min = int(self.hsv_lower[0]) if self.hsv_lower is not None else 20
+        h_max = int(self.hsv_upper[0]) if self.hsv_upper is not None else 90
+        s_min = int(self.hsv_lower[1]) if self.hsv_lower is not None else 20
+        s_max = int(self.hsv_upper[1]) if self.hsv_upper is not None else 255
+        v_min = int(self.hsv_lower[2]) if self.hsv_lower is not None else 70
+        v_max = int(self.hsv_upper[2]) if self.hsv_upper is not None else 255
         
         # Bulb size filter (wider to catch first frames)
         bulb_min = 1
@@ -415,44 +675,42 @@ class InteractiveBallAnalyzer:
             mask_region = cv2.morphologyEx(mask_region, cv2.MORPH_OPEN, kernel)
             mask_region = cv2.morphologyEx(mask_region, cv2.MORPH_CLOSE, kernel)
             
-            # Apply HSV filter to FULL FRAME and find all bulbs
-            hsv_full = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-            mask_full = cv2.inRange(hsv_full, hsv_lower, hsv_upper)
-            mask_full = cv2.morphologyEx(mask_full, cv2.MORPH_OPEN, kernel)
-            mask_full = cv2.morphologyEx(mask_full, cv2.MORPH_CLOSE, kernel)
+            # Apply HSV filter to the local region only and find bulbs
+            mask_local = cv2.inRange(hsv_region, hsv_lower, hsv_upper)
+            mask_local = cv2.morphologyEx(mask_local, cv2.MORPH_OPEN, kernel)
+            mask_local = cv2.morphologyEx(mask_local, cv2.MORPH_CLOSE, kernel)
+            contours, _ = cv2.findContours(mask_local, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             
-            # Find contours in full frame
-            contours, _ = cv2.findContours(mask_full, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            
-            # Draw detected bulbs on full frame
-            full_frame_display = frame.copy()
+            # Draw detected bulbs on the local region
+            local_display = region.copy()
             detected_bulbs = 0
             for contour in contours:
                 area = cv2.contourArea(contour)
                 if bulb_min <= area <= bulb_max:
-                    # Draw green circle around detected bulb
                     M = cv2.moments(contour)
                     if M["m00"] != 0:
                         cx = int(M["m10"] / M["m00"])
                         cy = int(M["m01"] / M["m00"])
-                        cv2.circle(full_frame_display, (cx, cy), 5, (0, 255, 0), 1)
-                        cv2.putText(full_frame_display, f"{int(area)}", (cx+7, cy), 
+                        cv2.circle(local_display, (cx, cy), 5, (0, 255, 0), 1)
+                        cv2.putText(local_display, f"{int(area)}", (cx+7, cy), 
                                    cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0, 255, 0), 1)
                         detected_bulbs += 1
             
-            # Show full frame with detected bulbs
+            # Show local region with detected bulbs
             cv2.namedWindow("Detected Bulbs", cv2.WINDOW_NORMAL)
-            cv2.resizeWindow("Detected Bulbs", 800, 450)
-            cv2.imshow("Detected Bulbs", full_frame_display)
+            cv2.resizeWindow("Detected Bulbs", 800, 600)
+            cv2.putText(local_display, f"H={h_min}-{h_max} S={s_min}-{s_max} V={v_min}-{v_max}",
+                        (5, 12), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
+            cv2.imshow("Detected Bulbs", local_display)
             
             # Create side-by-side display for 100x100 region
-            display = np.zeros((120, 220, 3), dtype=np.uint8)
-            display[10:110, 10:110] = region  # Original on left
-            display[10:110, 120:220] = cv2.cvtColor(mask_region, cv2.COLOR_GRAY2BGR)  # Filter on right
+            display = np.zeros((320, 620, 3), dtype=np.uint8)
+            display[10:310, 10:310] = region  # Original on left
+            display[10:310, 320:620] = cv2.cvtColor(mask_region, cv2.COLOR_GRAY2BGR)  # Filter on right
             
             # Draw borders
-            cv2.rectangle(display, (10, 10), (109, 109), (255, 255, 255), 1)
-            cv2.rectangle(display, (120, 10), (219, 109), (255, 255, 255), 1)
+            cv2.rectangle(display, (10, 10), (309, 309), (255, 255, 255), 1)
+            cv2.rectangle(display, (320, 10), (619, 309), (255, 255, 255), 1)
             
             # Show coordinates with small + marker
             cv2.line(display, (rel_x + 8, rel_y + 10), (rel_x + 12, rel_y + 10), (0, 255, 0), 1)
@@ -460,8 +718,8 @@ class InteractiveBallAnalyzer:
             
             # Show info
             bulb_size_region = np.sum(mask_region > 0)
-            cv2.putText(display, f"Size: {bulb_size_region}px", (10, 115), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
-            cv2.putText(display, f"Found: {detected_bulbs}", (120, 115), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
+            cv2.putText(display, f"Size: {bulb_size_region}px", (10, 315), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+            cv2.putText(display, f"Found: {detected_bulbs}", (320, 315), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
             
             cv2.imshow(tuner_window, display)
             return hsv_lower, hsv_upper, bulb_size_region
@@ -1089,6 +1347,7 @@ class InteractiveBallAnalyzer:
             use_alt_first = (self.frame_count == 127)
             primary_lower = self.alt_hsv_lower if use_alt_first and self.alt_hsv_lower is not None else hsv_lower_use
             primary_upper = self.alt_hsv_upper if use_alt_first and self.alt_hsv_upper is not None else hsv_upper_use
+            # Use the narrower alt filter (capped H max) alongside primary to preserve pre-focus behavior
             alt_lower = hsv_lower_use if use_alt_first and self.alt_hsv_lower is not None else self.alt_hsv_lower
             alt_upper = hsv_upper_use if use_alt_first and self.alt_hsv_upper is not None else self.alt_hsv_upper
             # Apply primary HSV filter
@@ -1192,6 +1451,20 @@ class InteractiveBallAnalyzer:
             # Prefer candidates with similar size to previous ball
             # Distance is primary, but size consistency matters for fast-moving balls
             score = distance + (size_ratio * 30)  # 30px penalty per 100% size change
+            if self.last_motion and distance > 0:
+                lm_dx = self.last_motion['dx']
+                lm_dy = self.last_motion['dy']
+                lm_dist = self.last_motion['distance']
+                mv_dx = cx - self.ball_center[0]
+                mv_dy = cy - self.ball_center[1]
+                dot = lm_dx * mv_dx + lm_dy * mv_dy
+                if dot < 0:
+                    score += 80  # stronger penalty for opposite direction
+                if lm_dist and lm_dist > 0:
+                    speed_diff = abs(distance - lm_dist)
+                    score += speed_diff * 1.5
+                    align_bonus = dot / (lm_dist * distance)
+                    score -= max(0.0, align_bonus) * 40
             if predicted_point:
                 pdx = cx - predicted_point[0]
                 pdy = cy - predicted_point[1]
@@ -1256,9 +1529,15 @@ class InteractiveBallAnalyzer:
             bulb_size = cv2.contourArea(best_contour)
             
             # Calculate velocity (distance moved)
-            if hasattr(self, 'ball_center') and self.ball_center:
-                prev_x, prev_y = self.ball_center
-                velocity = np.sqrt((cx - prev_x)**2 + (cy - prev_y)**2)
+            prev_pos = self.ball_center if self.ball_center else None
+            prev_ball_size = self.ball_size
+            dx = dy = 0
+            direction_deg = None
+            if prev_pos:
+                dx = cx - prev_pos[0]
+                dy = cy - prev_pos[1]
+                velocity = math.hypot(dx, dy)
+                direction_deg = math.degrees(math.atan2(dy, dx))
             else:
                 velocity = 0
             
@@ -1267,12 +1546,81 @@ class InteractiveBallAnalyzer:
             self.ball_hsv = hsv_values
             self.ball_size = bulb_size
             
+            # Log motion metrics and detect focus loss spikes
+            focus_loss_triggered = self.log_motion_metrics(dx, dy, velocity, direction_deg)
+            
             # Track velocity history (last 5 frames)
             if not hasattr(self, 'ball_velocity_history'):
                 self.ball_velocity_history = []
             self.ball_velocity_history.append(velocity)
             if len(self.ball_velocity_history) > 5:
                 self.ball_velocity_history.pop(0)
+
+            # If focus loss triggered, re-run detection using alternative HSV only
+            if focus_loss_triggered:
+                print(f"Frame {self.frame_count}: Re-running detection with alt HSV after focus loss")
+                retrack = self.retrack_with_alt_hsv(
+                    search_frame, x1, y1, prev_pos, predicted_point, prev_ball_size, allow_inactive
+                )
+                if retrack is not None:
+                    new_pos = retrack['pos']
+                    new_area = retrack['area']
+                    new_hsv = retrack['hsv']
+                    self.ball_center = new_pos
+                    self.ball_hsv = new_hsv
+                    self.ball_size = new_area
+                    if prev_pos:
+                        new_dx = new_pos[0] - prev_pos[0]
+                        new_dy = new_pos[1] - prev_pos[1]
+                        new_velocity = math.hypot(new_dx, new_dy)
+                        new_direction = math.degrees(math.atan2(new_dy, new_dx))
+                        self.last_delta = (new_dx, new_dy)
+                        self.last_motion = {
+                            'distance': new_velocity,
+                            'dx': new_dx,
+                            'dy': new_dy,
+                            'direction_deg': new_direction
+                        }
+                        if self.ball_velocity_history:
+                            self.ball_velocity_history[-1] = new_velocity
+                        print(f"Frame {self.frame_count}: [RETRACK ALT] Ball at ({new_pos[0]}, {new_pos[1]}) "
+                              f"- Size: {new_area:.1f}px - Movement: {new_velocity:.1f}px Dir: {new_direction:+.1f} deg")
+                # Clear focus lost indicator after switching to alternative HSV
+                self.focus_loss_active = False
+
+            # If ball did not move while on alternative HSV, switch to alternative 2
+            if self.using_alt_hsv and not self.using_alt2_hsv and self.last_motion and self.last_motion['distance'] == 0:
+                print(f"Frame {self.frame_count}: No movement detected, switching to alternative 2 HSV")
+                self.using_alt2_hsv = True
+                if self.alt2_hsv_lower is not None and self.alt2_hsv_upper is not None:
+                    self.hsv_lower = self.alt2_hsv_lower
+                    self.hsv_upper = self.alt2_hsv_upper
+                retrack2 = self.retrack_with_alt2_hsv(
+                    search_frame, x1, y1, prev_pos, predicted_point, prev_ball_size, allow_inactive
+                )
+                if retrack2 is not None:
+                    new_pos = retrack2['pos']
+                    new_area = retrack2['area']
+                    new_hsv = retrack2['hsv']
+                    self.ball_center = new_pos
+                    self.ball_hsv = new_hsv
+                    self.ball_size = new_area
+                    if prev_pos:
+                        new_dx = new_pos[0] - prev_pos[0]
+                        new_dy = new_pos[1] - prev_pos[1]
+                        new_velocity = math.hypot(new_dx, new_dy)
+                        new_direction = math.degrees(math.atan2(new_dy, new_dx))
+                        self.last_delta = (new_dx, new_dy)
+                        self.last_motion = {
+                            'distance': new_velocity,
+                            'dx': new_dx,
+                            'dy': new_dy,
+                            'direction_deg': new_direction
+                        }
+                        if self.ball_velocity_history:
+                            self.ball_velocity_history[-1] = new_velocity
+                        print(f"Frame {self.frame_count}: [RETRACK ALT2] Ball at ({new_pos[0]}, {new_pos[1]}) "
+                              f"- Size: {new_area:.1f}px - Movement: {new_velocity:.1f}px Dir: {new_direction:+.1f} deg")
             
             # Detect if ball stopped (average velocity < 2 pixels/frame for 5 frames)
             if len(self.ball_velocity_history) >= 5:
@@ -1285,21 +1633,26 @@ class InteractiveBallAnalyzer:
                 else:
                     self.ball_stopped = False
             
-            # Add to HSV table
+            # Add to HSV table using the final (possibly retracked) values
+            final_pos = self.ball_center
+            final_hsv = self.ball_hsv
+            final_size = self.ball_size
+            final_velocity = self.last_motion['distance'] if self.last_motion else velocity
             self.hsv_table.append({
                 'frame': self.frame_count,
-                'position': (cx, cy),
-                'hsv': hsv_values.tolist(),
-                'bulb_size': bulb_size,
-                'velocity': velocity,
+                'position': final_pos,
+                'hsv': final_hsv.tolist() if final_hsv is not None else hsv_values.tolist(),
+                'bulb_size': final_size,
+                'velocity': final_velocity,
                 'hsv_range': [self.hsv_lower[0], self.hsv_upper[0], 
                              self.hsv_lower[1], self.hsv_upper[1], 
                              self.hsv_lower[2], self.hsv_upper[2]]
             })
             
-            print(f"Frame {self.frame_count}: Ball at ({cx}, {cy}) - HSV: H={hsv_values[0]}, S={hsv_values[1]}, V={hsv_values[2]} - Size: {bulb_size:.1f}px - Velocity: {velocity:.1f}px/frame")
+            if final_pos == (cx, cy):
+                print(f"Frame {self.frame_count}: Ball at ({cx}, {cy}) - HSV: H={hsv_values[0]}, S={hsv_values[1]}, V={hsv_values[2]} - Size: {bulb_size:.1f}px - Velocity: {velocity:.1f}px/frame")
             
-            return (cx, cy)
+            return self.ball_center
         
         print(f"  DEBUG: [PROBLEM] No valid candidate found!")
         print(f"  DEBUG: Total contours: {len(contours)}, Valid candidates: {len(candidates)}")
@@ -1369,6 +1722,20 @@ class InteractiveBallAnalyzer:
                 # Show ball position
                 pos_text = f"Ball Pos: ({self.ball_center[0]}, {self.ball_center[1]})"
                 cv2.putText(result, pos_text, (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        
+        # Show motion metrics and focus-loss status
+        if self.last_motion is not None:
+            distance = self.last_motion['distance']
+            direction_deg = self.last_motion['direction_deg']
+            direction_text = f"{direction_deg:+.1f} deg" if direction_deg is not None else "N/A"
+            motion_text = f"Ball Move: {distance:.1f}px | Dir: {direction_text}"
+            cv2.putText(result, motion_text, (10, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+        if self.focus_loss_active:
+            cv2.putText(result, "FOCUS LOST", (10, 180), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        elif self.using_alt2_hsv:
+            cv2.putText(result, "USING ALTERNATIVE 2 HSV", (10, 180), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        elif self.using_alt_hsv:
+            cv2.putText(result, "USING ALTERNATIVE HSV", (10, 180), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
         
         # Draw detected players (P1 and P2)
         if self.p1_bbox is not None:
@@ -1783,7 +2150,8 @@ class InteractiveBallAnalyzer:
         print("5. Press 'D' to advance frame by frame")
         print("6. Press 'N' to mark net area (6 points clockwise)")
         print("7. Press 'S' to mark serve area (4 points)")
-        print("8. Press 'Q' to quit")
+        print("8. Press 'B' to open ball HSV debug window")
+        print("9. Press 'Q' to quit")
         print("=" * 50)
         if self.start_frame > 0:
             print(f"Starting at frame {self.start_frame}")
@@ -2015,6 +2383,14 @@ class InteractiveBallAnalyzer:
                     else:
                         print("Serve area marking cancelled.")
                 # Redisplay current frame
+                continue
+            elif key == ord('b'):
+                # Show HSV tuner for current ball position
+                if self.ball_center is None:
+                    print("No ball position available yet.")
+                    continue
+                print("\n=== BALL HSV DEBUG ===")
+                self.open_hsv_tuner(frame, self.ball_center)
                 continue
             elif key == ord('d'):
                 # Advance to next frame and automatically track
