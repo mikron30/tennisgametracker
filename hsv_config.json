@@ -1,46 +1,70 @@
 {
-  "regular_court": {
-    "h_min": 32,
-    "h_max": 90,
-    "s_min": 31,
-    "s_max": 255,
-    "v_min": 70,
-    "v_max": 255
-  },
-  "behind_net": {
-    "h_min": 76,
-    "h_max": 91,
-    "s_min": 33,
-    "s_max": 146,
-    "v_min": 62,
-    "v_max": 152
-  },
-  "net_area_y_min": 340,
-  "net_area_y_max": 530,
-  "high_net_y_min": 340,
-  "high_net_y_max": 415,
-  "low_net_y_min": 415,
-  "low_net_y_max": 530,
-  "serve_area_points": [
-    [
-      1138,
-      4
+    "regular_court": {
+        "h_min": 40,
+        "h_max": 91,
+        "s_min": 42,
+        "s_max": 255,
+        "v_min": 106,
+        "v_max": 255
+    },
+    "alt1": {
+        "h_min": 40,
+        "h_max": 91,
+        "s_min": 42,
+        "s_max": 255,
+        "v_min": 106,
+        "v_max": 255
+    },
+    "alt2": {
+        "h_min": 30,
+        "h_max": 75,
+        "s_min": 42,
+        "s_max": 255,
+        "v_min": 106,
+        "v_max": 255
+    },
+    "alt3": {
+        "h_min": 40,
+        "h_max": 89,
+        "s_min": 55,
+        "s_max": 255,
+        "v_min": 106,
+        "v_max": 255
+    },
+    "behind_net": {
+        "h_min": 76,
+        "h_max": 91,
+        "s_min": 33,
+        "s_max": 146,
+        "v_min": 62,
+        "v_max": 152
+    },
+    "net_area_y_min": 336,
+    "net_area_y_max": 542,
+    "high_net_y_min": 336,
+    "high_net_y_max": 542,
+    "low_net_y_min": 436,
+    "low_net_y_max": 470,
+    "serve_area_points": [
+        [
+            1138,
+            4
+        ],
+        [
+            1534,
+            6
+        ],
+        [
+            1536,
+            75
+        ],
+        [
+            1140,
+            94
+        ]
     ],
-    [
-      1534,
-      6
-    ],
-    [
-      1536,
-      75
-    ],
-    [
-      1140,
-      94
-    ]
-  ],
-  "serve_area_x_min": 1138,
-  "serve_area_x_max": 1536,
-  "serve_area_y_min": 4,
-  "serve_area_y_max": 94
+    "serve_area_x_min": 1138,
+    "serve_area_x_max": 1536,
+    "serve_area_y_min": 4,
+    "serve_area_y_max": 94
 }

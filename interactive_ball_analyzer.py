@@ -9,7 +9,7 @@ from typing import Tuple, Optional
 
 
 class InteractiveBallAnalyzer:
-    def __init__(self, video_path: str, start_frame: int = 100):
+    def __init__(self, video_path: str, start_frame: int = 0):
         self.video_path = video_path
         self.cap = cv2.VideoCapture(video_path)
         self.start_frame = max(0, start_frame)
@@ -34,6 +34,8 @@ class InteractiveBallAnalyzer:
         self.primary_hsv_upper = None
         self.alt_hsv_lower = None
         self.alt_hsv_upper = None
+        self.hsv_regular = None
+        self.hsv_behind_net = None
         
         # HSV filter (will be set based on clicked ball)
         self.hsv_lower = None
@@ -59,8 +61,19 @@ class InteractiveBallAnalyzer:
         self.using_alt2_hsv = False
         self.alt2_hsv_lower = None
         self.alt2_hsv_upper = None
+        self.using_alt3_hsv = False
+        self.alt3_hsv_lower = None
+        self.alt3_hsv_upper = None
+        self.direction_change_points = []
+        self.last_direction = None
+        self.near_edge = False
+        self.net_contact_points = []
+        self.prev_motion = None
+        self.max_ball_speed = 70
+        self.direction_change_streak = 0
         # Flag when per-frame movement jumps well beyond recent median
         self.focus_loss_distance_threshold = 60.0
+        self.pause_requested = False
         
         # Initialize simple player detector (focused on right court only)
         self.player_detector = SimplePlayerDetector()
@@ -70,12 +83,24 @@ class InteractiveBallAnalyzer:
         direction_text = f"{direction_deg:+.1f} deg" if direction_deg is not None else "N/A"
         print(f"Frame {self.frame_count}: Movement {distance:.1f}px (dx={dx}, dy={dy}) Direction: {direction_text}")
 
+        self.prev_motion = self.last_motion
         self.last_motion = {
             'distance': distance,
             'dx': dx,
             'dy': dy,
             'direction_deg': direction_deg
         }
+        if direction_deg is not None and distance > 5:
+            if self.near_edge or getattr(self, 'edge_wait', False):
+                self.last_direction = direction_deg
+                return False
+            if self.last_direction is not None:
+                delta = abs(direction_deg - self.last_direction) % 360
+                angle_diff = min(delta, 360 - delta)
+                if angle_diff >= 110:
+                    self.direction_change_points.append((self.ball_center[0], self.ball_center[1]))
+                    print(f"Frame {self.frame_count}: Direction change detected ({angle_diff:.1f} deg)")
+            self.last_direction = direction_deg
         self.motion_history.append({
             'frame': self.frame_count,
             'distance': distance,
@@ -192,13 +217,16 @@ class InteractiveBallAnalyzer:
             'hsv': hsv_at_point
         }
 
-    def retrack_with_alt2_hsv(self, search_frame, x1, y1, prev_pos, predicted_point, prev_ball_size, allow_inactive):
+    def retrack_with_alt2_hsv(self, search_frame, x1, y1, prev_pos, predicted_point, prev_ball_size, allow_inactive,
+                              lower=None, upper=None):
         """Re-run detection with alternative 2 HSV (H 46-72) when stuck."""
-        if self.alt2_hsv_lower is None or self.alt2_hsv_upper is None:
+        hsv_lower = lower if lower is not None else self.alt2_hsv_lower
+        hsv_upper = upper if upper is not None else self.alt2_hsv_upper
+        if hsv_lower is None or hsv_upper is None:
             return None
-
+        
         hsv_frame = cv2.cvtColor(search_frame, cv2.COLOR_BGR2HSV)
-        mask_alt2 = cv2.inRange(hsv_frame, self.alt2_hsv_lower, self.alt2_hsv_upper)
+        mask_alt2 = cv2.inRange(hsv_frame, hsv_lower, hsv_upper)
         kernel = np.ones((2, 2), np.uint8)
         mask_alt2 = cv2.morphologyEx(mask_alt2, cv2.MORPH_OPEN, kernel)
         mask_alt2 = cv2.morphologyEx(mask_alt2, cv2.MORPH_CLOSE, kernel)
@@ -277,6 +305,150 @@ class InteractiveBallAnalyzer:
             'area': area,
             'hsv': hsv_at_point
         }
+
+    def verify_ball_with_hsvs(self, frame, predicted_point):
+        """Try multiple HSV ranges around predicted point to recover the ball."""
+        if predicted_point is None:
+            return None
+        x, y = predicted_point
+        radius = self.max_ball_speed
+        x1 = max(0, x - radius)
+        y1 = max(0, y - radius)
+        x2 = min(frame.shape[1], x + radius)
+        y2 = min(frame.shape[0], y + radius)
+        search_frame = frame[y1:y2, x1:x2]
+
+        hsv_candidates = [
+            ("basic", self.hsv_lower, self.hsv_upper),
+            ("alt1", self.alt_focus_hsv_lower, self.alt_focus_hsv_upper),
+            ("alt2", self.alt2_hsv_lower, self.alt2_hsv_upper),
+            ("alt3", self.alt3_hsv_lower, self.alt3_hsv_upper),
+        ]
+        best = None
+        best_distance = None
+        for label, lower, upper in hsv_candidates:
+            if lower is None or upper is None:
+                continue
+            retrack = self.retrack_with_alt2_hsv(
+                search_frame, x1, y1, self.ball_center, predicted_point, self.ball_size, False,
+                lower=lower, upper=upper
+            )
+            if retrack is None:
+                continue
+            pos = retrack['pos']
+            distance = math.hypot(pos[0] - x, pos[1] - y)
+            if best is None or distance < best_distance:
+                best = (label, retrack)
+                best_distance = distance
+        return best
+
+    def show_alternative_debug(self, frame, point, lower, upper, title):
+        """Show debug windows for a specific HSV range around a point."""
+        if point is None or lower is None or upper is None:
+            print("No debug point or HSV range available.")
+            return
+        x, y = point
+        region_size = 150
+        x1 = max(0, x - region_size)
+        y1 = max(0, y - region_size)
+        x2 = min(frame.shape[1], x + region_size)
+        y2 = min(frame.shape[0], y + region_size)
+        region = frame[y1:y2, x1:x2].copy()
+        if region.size == 0:
+            print("Error: Cannot extract debug region")
+            return
+        if region.shape[0] != 300 or region.shape[1] != 300:
+            region = cv2.resize(region, (300, 300))
+        hsv_region = cv2.cvtColor(region, cv2.COLOR_BGR2HSV)
+        kernel = np.ones((2, 2), np.uint8)
+        mask = cv2.inRange(hsv_region, lower, upper)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        local_display = region.copy()
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            if area < 1 or area > 150:
+                continue
+            M = cv2.moments(contour)
+            if M["m00"] == 0:
+                continue
+            cx = int(M["m10"] / M["m00"])
+            cy = int(M["m01"] / M["m00"])
+            cv2.circle(local_display, (cx, cy), 6, (0, 255, 0), 1)
+            cv2.putText(local_display, f"{int(area)}", (cx+7, cy),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0, 255, 0), 1)
+
+        window_title = f"Detected Bulbs - {title}"
+        cv2.namedWindow(window_title, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(window_title, 800, 600)
+        cv2.putText(local_display,
+                    f"H={lower[0]}-{upper[0]} S={lower[1]}-{upper[1]} V={lower[2]}-{upper[2]}",
+                    (5, 12), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
+        cv2.imshow(window_title, local_display)
+
+    def get_standard_hsv_for_position(self, y_position):
+        """Get the primary HSV range for a position, ignoring alt/focus-loss modes."""
+        if self.hsv_regular is not None and self.hsv_behind_net is not None:
+            if hasattr(self, 'net_area_y_min') and hasattr(self, 'net_area_y_max'):
+                if self.net_area_y_min <= y_position <= self.net_area_y_max:
+                    return self.hsv_behind_net['lower'], self.hsv_behind_net['upper'], "behind_net"
+            return self.hsv_regular['lower'], self.hsv_regular['upper'], "regular_court"
+        if self.primary_hsv_lower is not None and self.primary_hsv_upper is not None:
+            return self.primary_hsv_lower, self.primary_hsv_upper, "primary"
+        return self.hsv_lower, self.hsv_upper, "current"
+
+    def get_predicted_point(self):
+        """Predict next ball position using last known motion."""
+        if self.ball_center and self.last_motion:
+            dx = int(self.last_motion.get('dx', 0))
+            dy = int(self.last_motion.get('dy', 0))
+            return (self.ball_center[0] + dx, self.ball_center[1] + dy)
+        if self.ball_center and hasattr(self, 'last_delta') and self.last_delta is not None:
+            dx, dy = self.last_delta
+            return (self.ball_center[0] + int(dx), self.ball_center[1] + int(dy))
+        return None
+
+    def open_predicted_hsv_debug_all(self, frame, point, frame_index):
+        """Open all HSV debug windows around a predicted point."""
+        if frame is None or point is None:
+            print("No predicted point available for HSV debug.")
+            return
+        lower, upper, label = self.get_standard_hsv_for_position(point[1])
+        if lower is not None and upper is not None:
+            self.show_alternative_debug(frame, point, lower, upper, f"Predicted {frame_index} ({label})")
+        if self.alt_focus_hsv_lower is not None and self.alt_focus_hsv_upper is not None:
+            self.show_alternative_debug(frame, point, self.alt_focus_hsv_lower, self.alt_focus_hsv_upper,
+                                        f"Predicted {frame_index} (alt1)")
+        if self.alt2_hsv_lower is not None and self.alt2_hsv_upper is not None:
+            self.show_alternative_debug(frame, point, self.alt2_hsv_lower, self.alt2_hsv_upper,
+                                        f"Predicted {frame_index} (alt2)")
+        if self.alt3_hsv_lower is not None and self.alt3_hsv_upper is not None:
+            self.show_alternative_debug(frame, point, self.alt3_hsv_lower, self.alt3_hsv_upper,
+                                        f"Predicted {frame_index} (alt3)")
+
+    def open_prev_frame_hsv_debug(self, frame, point, frame_index, hsv_slot):
+        """Open HSV debug windows around the last ball in the previous frame."""
+        if frame is None or point is None:
+            print("No previous frame/ball position available for HSV debug.")
+            return
+        if hsv_slot == 0:
+            lower, upper, label = self.get_standard_hsv_for_position(point[1])
+        elif hsv_slot == 1:
+            lower, upper, label = self.alt_focus_hsv_lower, self.alt_focus_hsv_upper, "alt1"
+        elif hsv_slot == 2:
+            lower, upper, label = self.alt2_hsv_lower, self.alt2_hsv_upper, "alt2"
+        elif hsv_slot == 3:
+            lower, upper, label = self.alt3_hsv_lower, self.alt3_hsv_upper, "alt3"
+        else:
+            print(f"Unknown HSV slot: {hsv_slot}")
+            return
+        if lower is None or upper is None:
+            print(f"HSV range not available for slot {hsv_slot} ({label}).")
+            return
+        title = f"Prev frame {frame_index} ({label})"
+        self.show_alternative_debug(frame, point, lower, upper, title)
         
     def load_hsv_config(self):
         """Load HSV values from config file."""
@@ -357,10 +529,37 @@ class InteractiveBallAnalyzer:
                 self.alt_focus_hsv_lower = self.primary_hsv_lower.copy()
                 self.alt_focus_hsv_upper = self.primary_hsv_upper.copy()
                 self.alt_focus_hsv_upper[0] = min(179, max(self.alt_focus_hsv_upper[0], 90))
+                # Alternative 2: narrower H range tuned for recovery
                 self.alt2_hsv_lower = self.primary_hsv_lower.copy()
                 self.alt2_hsv_upper = self.primary_hsv_upper.copy()
-                self.alt2_hsv_lower[0] = 38
+                self.alt2_hsv_lower[0] = 30
                 self.alt2_hsv_upper[0] = 75
+                # Alternative 3: higher S min to reduce false positives
+                self.alt3_hsv_lower = self.primary_hsv_lower.copy()
+                self.alt3_hsv_upper = self.primary_hsv_upper.copy()
+                self.alt3_hsv_lower[1] = 55
+                # Load overrides if present in config
+                if "alt1" in config:
+                    self.alt_focus_hsv_lower = np.array([
+                        config["alt1"]["h_min"], config["alt1"]["s_min"], config["alt1"]["v_min"]
+                    ], dtype=np.uint8)
+                    self.alt_focus_hsv_upper = np.array([
+                        config["alt1"]["h_max"], config["alt1"]["s_max"], config["alt1"]["v_max"]
+                    ], dtype=np.uint8)
+                if "alt2" in config:
+                    self.alt2_hsv_lower = np.array([
+                        config["alt2"]["h_min"], config["alt2"]["s_min"], config["alt2"]["v_min"]
+                    ], dtype=np.uint8)
+                    self.alt2_hsv_upper = np.array([
+                        config["alt2"]["h_max"], config["alt2"]["s_max"], config["alt2"]["v_max"]
+                    ], dtype=np.uint8)
+                if "alt3" in config:
+                    self.alt3_hsv_lower = np.array([
+                        config["alt3"]["h_min"], config["alt3"]["s_min"], config["alt3"]["v_min"]
+                    ], dtype=np.uint8)
+                    self.alt3_hsv_upper = np.array([
+                        config["alt3"]["h_max"], config["alt3"]["s_max"], config["alt3"]["v_max"]
+                    ], dtype=np.uint8)
                 # Use primary as active by default (full config range)
                 self.hsv_lower = self.primary_hsv_lower
                 self.hsv_upper = self.primary_hsv_upper
@@ -373,6 +572,8 @@ class InteractiveBallAnalyzer:
     
     def select_hsv_for_position(self, y_position, at_edge=False):
         """Select appropriate HSV config based on ball Y position."""
+        if self.using_alt3_hsv and self.alt3_hsv_lower is not None and self.alt3_hsv_upper is not None:
+            return self.alt3_hsv_lower, self.alt3_hsv_upper, "alternative_3"
         if self.using_alt2_hsv and self.alt2_hsv_lower is not None and self.alt2_hsv_upper is not None:
             return self.alt2_hsv_lower, self.alt2_hsv_upper, "alternative_2"
         if self.using_alt_hsv and self.alt_focus_hsv_lower is not None and self.alt_focus_hsv_upper is not None:
@@ -1287,10 +1488,18 @@ class InteractiveBallAnalyzer:
             else:
                 print(f"\n  DEBUG: No previous ball position, searching entire frame")
         
+        predicted_point = None
+        # Predict next position using last known motion if available
+        if self.ball_center and hasattr(self, 'last_delta') and self.last_delta is not None:
+            dx, dy = self.last_delta
+            predicted_point = (self.ball_center[0] + int(dx), self.ball_center[1] + int(dy))
+
         # Search in region around the search position
         if self.ball_center or (hasattr(self, 'initial_ball_position') and self.initial_ball_position):
             if early_frames and 'search_radius' in locals():
                 search_radius = max(search_radius, 250)  # wider window for first few frames
+            if not allow_inactive and not getattr(self, 'edge_wait', False):
+                search_radius = min(search_radius, self.max_ball_speed)
             x1 = max(0, x - search_radius)
             y1 = max(0, y - search_radius)
             x2 = min(frame.shape[1], x + search_radius)
@@ -1344,6 +1553,11 @@ class InteractiveBallAnalyzer:
         else:
             # Normal single HSV filter search
             hsv_lower_use, hsv_upper_use, hsv_mode = self.select_hsv_for_position(y)
+            if allow_inactive and hasattr(self, 'serve_area_x_min'):
+                # Use full configured HSV for serve scan (do not cap H max)
+                hsv_lower_use = self.hsv_lower
+                hsv_upper_use = self.hsv_upper
+                hsv_mode = "serve_area"
             use_alt_first = (self.frame_count == 127)
             primary_lower = self.alt_hsv_lower if use_alt_first and self.alt_hsv_lower is not None else hsv_lower_use
             primary_upper = self.alt_hsv_upper if use_alt_first and self.alt_hsv_upper is not None else hsv_upper_use
@@ -1387,6 +1601,102 @@ class InteractiveBallAnalyzer:
             print(f"  DEBUG:   - Moved faster than {search_radius}px/frame")
             print(f"  DEBUG:   - Be occluded by player/net")
             print(f"  DEBUG: Will continue searching in next frame at same position...")
+
+            # Fallback: try alternative HSV if primary found nothing
+            if self.alt_focus_hsv_lower is not None and self.alt_focus_hsv_upper is not None:
+                if getattr(self, 'edge_wait', False) and self.last_motion:
+                    lm_dx = self.last_motion['dx']
+                    lm_dy = self.last_motion['dy']
+                    # Only suppress alt recovery if motion is pointing out of frame
+                    if (self.ball_center and
+                        ((lm_dx < 0 and self.ball_center[0] < 10) or
+                         (lm_dx > 0 and self.ball_center[0] > frame.shape[1] - 10) or
+                         (lm_dy < 0 and self.ball_center[1] < 10) or
+                         (lm_dy > 0 and self.ball_center[1] > frame.shape[0] - 10))):
+                        return self.ball_center
+                retrack = self.retrack_with_alt_hsv(
+                    search_frame, x1, y1, self.ball_center, predicted_point, self.ball_size, allow_inactive
+                )
+                if retrack is not None:
+                    new_pos = retrack['pos']
+                    self.ball_center = new_pos
+                    self.ball_hsv = retrack['hsv']
+                    self.ball_size = retrack['area']
+                    self.using_alt_hsv = True
+                    self.using_alt2_hsv = False
+                    if self.alt_focus_hsv_lower is not None and self.alt_focus_hsv_upper is not None:
+                        self.hsv_lower = self.alt_focus_hsv_lower
+                        self.hsv_upper = self.alt_focus_hsv_upper
+                    print(f"Frame {self.frame_count}: [ALT HSV RECOVER] Ball at {new_pos}")
+                    return self.ball_center
+            # Fallback: try alternative 2 HSV if alt1 failed
+            if self.alt2_hsv_lower is not None and self.alt2_hsv_upper is not None:
+                retrack2 = self.retrack_with_alt2_hsv(
+                    search_frame, x1, y1, self.ball_center, predicted_point, self.ball_size, allow_inactive
+                )
+                if retrack2 is not None:
+                    new_pos = retrack2['pos']
+                    prev_pos = self.ball_center
+                    self.ball_center = new_pos
+                    self.ball_hsv = retrack2['hsv']
+                    self.ball_size = retrack2['area']
+                    self.using_alt_hsv = False
+                    self.using_alt2_hsv = True
+                    self.using_alt3_hsv = False
+                    self.hsv_lower = self.alt2_hsv_lower
+                    self.hsv_upper = self.alt2_hsv_upper
+                    print(f"Frame {self.frame_count}: [ALT2 HSV RECOVER] Ball at {new_pos}")
+                    if self.last_motion and prev_pos and self.alt3_hsv_lower is not None and self.alt3_hsv_upper is not None:
+                        lm_dist = self.last_motion['distance']
+                        mv_dx = new_pos[0] - prev_pos[0]
+                        mv_dy = new_pos[1] - prev_pos[1]
+                        mv_dist = math.hypot(mv_dx, mv_dy)
+                        speed_ratio = (mv_dist / lm_dist) if lm_dist else 1.0
+                        angle_jump = 0.0
+                        if self.last_direction is not None:
+                            direction_deg = math.degrees(math.atan2(mv_dy, mv_dx))
+                            delta = abs(direction_deg - self.last_direction) % 360
+                            angle_jump = min(delta, 360 - delta)
+                        if angle_jump > 45 or speed_ratio > 1.8 or speed_ratio < 0.6:
+                            retrack3 = self.retrack_with_alt2_hsv(
+                                search_frame, x1, y1, prev_pos, predicted_point, self.ball_size, allow_inactive,
+                                lower=self.alt3_hsv_lower, upper=self.alt3_hsv_upper
+                            )
+                            if retrack3 is not None:
+                                new_pos = retrack3['pos']
+                                self.ball_center = new_pos
+                                self.ball_hsv = retrack3['hsv']
+                                self.ball_size = retrack3['area']
+                                self.using_alt2_hsv = False
+                                self.using_alt3_hsv = True
+                                self.hsv_lower = self.alt3_hsv_lower
+                                self.hsv_upper = self.alt3_hsv_upper
+                                print(f"Frame {self.frame_count}: [ALT3 HSV RECOVER] Ball at {new_pos}")
+                    return self.ball_center
+            if self.alt3_hsv_lower is not None and self.alt3_hsv_upper is not None:
+                retrack3 = self.retrack_with_alt2_hsv(
+                    search_frame, x1, y1, self.ball_center, predicted_point, self.ball_size, allow_inactive,
+                    lower=self.alt3_hsv_lower, upper=self.alt3_hsv_upper
+                )
+                if retrack3 is not None:
+                    new_pos = retrack3['pos']
+                    self.ball_center = new_pos
+                    self.ball_hsv = retrack3['hsv']
+                    self.ball_size = retrack3['area']
+                    self.using_alt_hsv = False
+                    self.using_alt2_hsv = False
+                    self.using_alt3_hsv = True
+                    self.hsv_lower = self.alt3_hsv_lower
+                    self.hsv_upper = self.alt3_hsv_upper
+                    print(f"Frame {self.frame_count}: [ALT3 HSV RECOVER] Ball at {new_pos}")
+                    return self.ball_center
+
+            if (not allow_inactive and self.ball_center and self.last_seen_frame == (self.frame_count - 1)):
+                predicted_point = predicted_point or self.get_predicted_point()
+                if predicted_point is not None:
+                    print("  DEBUG: Ball lost. Opening HSV debug windows at predicted position...")
+                    self.open_predicted_hsv_debug_all(frame, predicted_point, self.frame_count)
+                    self.pause_requested = True
             
             # Keep the ball_center at last position instead of losing it
             return self.ball_center
@@ -1396,12 +1706,6 @@ class InteractiveBallAnalyzer:
         best_score = float('inf')
         best_source = None
         candidates = []
-        predicted_point = None
-        # Predict next position using last known motion if available
-        if self.ball_center and hasattr(self, 'last_delta') and self.last_delta is not None:
-            dx, dy = self.last_delta
-            predicted_point = (self.ball_center[0] + int(dx), self.ball_center[1] + int(dy))
-        
         for i, (source, contour) in enumerate(contours):
             area = cv2.contourArea(contour)
             
@@ -1434,6 +1738,13 @@ class InteractiveBallAnalyzer:
             cx = int(M["m10"] / M["m00"]) + x1
             cy = int(M["m01"] / M["m00"]) + y1
             
+            # Reject candidates outside serve area when inactive
+            if allow_inactive and hasattr(self, 'serve_area_x_min'):
+                if not (self.serve_area_x_min <= cx <= self.serve_area_x_max and
+                        self.serve_area_y_min <= cy <= self.serve_area_y_max):
+                    print(f"  DEBUG: Contour {i} REJECTED - pos=({cx},{cy}) outside serve area")
+                    continue
+
             # Calculate distance from previous position
             if self.ball_center:
                 distance = np.sqrt((cx - self.ball_center[0])**2 + (cy - self.ball_center[1])**2)
@@ -1523,7 +1834,7 @@ class InteractiveBallAnalyzer:
             
             source_label = f" from [{best_source}] filter" if best_source and best_source != 'single' else ""
             print(f"  DEBUG: [SELECTED] contour at ({cx},{cy}), score={best_score:.1f}{source_label}")
-            
+
             # Get HSV values at new position
             hsv_values = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)[cy, cx]
             bulb_size = cv2.contourArea(best_contour)
@@ -1541,13 +1852,122 @@ class InteractiveBallAnalyzer:
             else:
                 velocity = 0
             
+            # If direction/speed look wrong, try alternative HSV before committing
+            if self.last_motion and self.ball_center:
+                lm_dx = self.last_motion['dx']
+                lm_dy = self.last_motion['dy']
+                lm_dist = self.last_motion['distance']
+                mv_dx = cx - self.ball_center[0]
+                mv_dy = cy - self.ball_center[1]
+                dot = lm_dx * mv_dx + lm_dy * mv_dy
+                speed_diff = abs(velocity - lm_dist) if lm_dist else 0
+                angle_jump = 0.0
+                if self.last_direction is not None and direction_deg is not None:
+                    delta = abs(direction_deg - self.last_direction) % 360
+                    angle_jump = min(delta, 360 - delta)
+                speed_ratio = (velocity / lm_dist) if lm_dist else 1.0
+                if (dot < 0 or angle_jump > 45 or speed_ratio > 1.8 or speed_ratio < 0.6 or
+                        (lm_dist and speed_diff > lm_dist * 0.6)):
+                    retrack = self.retrack_with_alt_hsv(
+                        search_frame, x1, y1, self.ball_center, predicted_point, self.ball_size, allow_inactive
+                    )
+                    if retrack is not None:
+                        cx, cy = retrack['pos']
+                        hsv_values = retrack['hsv']
+                        bulb_size = retrack['area']
+                        self.using_alt_hsv = True
+                        self.using_alt2_hsv = False
+                        if self.alt_focus_hsv_lower is not None and self.alt_focus_hsv_upper is not None:
+                            self.hsv_lower = self.alt_focus_hsv_lower
+                            self.hsv_upper = self.alt_focus_hsv_upper
+                        print(f"Frame {self.frame_count}: [ALT HSV OVERRIDE] Ball at ({cx}, {cy})")
+                    elif self.alt2_hsv_lower is not None and self.alt2_hsv_upper is not None:
+                        retrack2 = self.retrack_with_alt2_hsv(
+                            search_frame, x1, y1, self.ball_center, predicted_point, self.ball_size, allow_inactive
+                        )
+                        if retrack2 is not None:
+                            cx, cy = retrack2['pos']
+                            hsv_values = retrack2['hsv']
+                            bulb_size = retrack2['area']
+                            self.using_alt_hsv = False
+                            self.using_alt2_hsv = True
+                            self.using_alt3_hsv = False
+                            self.hsv_lower = self.alt2_hsv_lower
+                            self.hsv_upper = self.alt2_hsv_upper
+                            print(f"Frame {self.frame_count}: [ALT2 HSV OVERRIDE] Ball at ({cx}, {cy})")
+                            if self.last_motion and self.alt3_hsv_lower is not None and self.alt3_hsv_upper is not None:
+                                lm_dist = self.last_motion['distance']
+                                mv_dx = cx - self.ball_center[0]
+                                mv_dy = cy - self.ball_center[1]
+                                mv_dist = math.hypot(mv_dx, mv_dy)
+                                speed_ratio = (mv_dist / lm_dist) if lm_dist else 1.0
+                                angle_jump = 0.0
+                                if self.last_direction is not None:
+                                    direction_deg = math.degrees(math.atan2(mv_dy, mv_dx))
+                                    delta = abs(direction_deg - self.last_direction) % 360
+                                    angle_jump = min(delta, 360 - delta)
+                                if angle_jump > 45 or speed_ratio > 1.8 or speed_ratio < 0.6:
+                                    retrack3 = self.retrack_with_alt2_hsv(
+                                        search_frame, x1, y1, self.ball_center, predicted_point, self.ball_size, allow_inactive,
+                                        lower=self.alt3_hsv_lower, upper=self.alt3_hsv_upper
+                                    )
+                                    if retrack3 is not None:
+                                        cx, cy = retrack3['pos']
+                                        hsv_values = retrack3['hsv']
+                                        bulb_size = retrack3['area']
+                                        self.using_alt2_hsv = False
+                                        self.using_alt3_hsv = True
+                                        self.hsv_lower = self.alt3_hsv_lower
+                                        self.hsv_upper = self.alt3_hsv_upper
+                                        print(f"Frame {self.frame_count}: [ALT3 HSV OVERRIDE] Ball at ({cx}, {cy})")
+                    elif self.alt3_hsv_lower is not None and self.alt3_hsv_upper is not None:
+                        retrack3 = self.retrack_with_alt2_hsv(
+                            search_frame, x1, y1, self.ball_center, predicted_point, self.ball_size, allow_inactive,
+                            lower=self.alt3_hsv_lower, upper=self.alt3_hsv_upper
+                        )
+                        if retrack3 is not None:
+                            cx, cy = retrack3['pos']
+                            hsv_values = retrack3['hsv']
+                            bulb_size = retrack3['area']
+                            self.using_alt_hsv = False
+                            self.using_alt2_hsv = False
+                            self.using_alt3_hsv = True
+                            self.hsv_lower = self.alt3_hsv_lower
+                            self.hsv_upper = self.alt3_hsv_upper
+                            print(f"Frame {self.frame_count}: [ALT3 HSV OVERRIDE] Ball at ({cx}, {cy})")
+
+            # Gate large direction/velocity changes for a few frames
+            if self.last_motion and self.ball_center:
+                lm_dist = self.last_motion['distance']
+                angle_jump = 0.0
+                if self.last_direction is not None and direction_deg is not None:
+                    delta = abs(direction_deg - self.last_direction) % 360
+                    angle_jump = min(delta, 360 - delta)
+                speed_ratio = (velocity / lm_dist) if lm_dist else 1.0
+                change_detected = angle_jump > 45 or speed_ratio > 1.8 or speed_ratio < 0.6
+                if change_detected:
+                    self.direction_change_streak += 1
+                    if self.direction_change_streak < 3:
+                        print(f"Frame {self.frame_count}: Direction change candidate (holding {self.direction_change_streak}/3)")
+                        return self.ball_center
+                else:
+                    self.direction_change_streak = 0
+
             # Update tracking data
             self.ball_center = (cx, cy)
             self.ball_hsv = hsv_values
             self.ball_size = bulb_size
-            
+            frame_height, frame_width = frame.shape[:2]
+            edge_margin = 50
+            self.near_edge = (
+                self.ball_center[0] < edge_margin or self.ball_center[0] > frame_width - edge_margin or
+                self.ball_center[1] < edge_margin or self.ball_center[1] > frame_height - edge_margin
+            )
+
             # Log motion metrics and detect focus loss spikes
-            focus_loss_triggered = self.log_motion_metrics(dx, dy, velocity, direction_deg)
+            focus_loss_triggered = False
+            if not allow_inactive:
+                focus_loss_triggered = self.log_motion_metrics(dx, dy, velocity, direction_deg)
             
             # Track velocity history (last 5 frames)
             if not hasattr(self, 'ball_velocity_history'):
@@ -1722,6 +2142,17 @@ class InteractiveBallAnalyzer:
                 # Show ball position
                 pos_text = f"Ball Pos: ({self.ball_center[0]}, {self.ball_center[1]})"
                 cv2.putText(result, pos_text, (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
+        # Draw direction change points
+        for point in self.direction_change_points:
+            px = int(point[0] * scale)
+            py = int(point[1] * scale)
+            cv2.circle(result, (px, py), 10, (0, 0, 255), 2)
+        # Draw net contact points
+        for point in self.net_contact_points:
+            px = int(point[0] * scale)
+            py = int(point[1] * scale)
+            cv2.circle(result, (px, py), 12, (0, 0, 255), 3)
         
         # Show motion metrics and focus-loss status
         if self.last_motion is not None:
@@ -1989,10 +2420,21 @@ class InteractiveBallAnalyzer:
                 if not hasattr(self, 'net_area_frames'):
                     self.net_area_frames = 0
                 self.net_area_frames += 1
-                
-                # Only consider it a net hit if ball has been in net area for several frames
-                if self.net_area_frames > 5:
+                # Consider it a net hit if it lingers or nearly stops
+                if self.net_area_frames > 3:
                     return True, "Ball hit the net"
+                if self.last_motion and self.last_motion['distance'] < 2.5:
+                    return True, "Ball hit the net"
+                if self.prev_motion and self.last_motion:
+                    prev_dir = self.prev_motion.get('direction_deg')
+                    curr_dir = self.last_motion.get('direction_deg')
+                    prev_dist = self.prev_motion.get('distance')
+                    curr_dist = self.last_motion.get('distance')
+                    if prev_dir is not None and curr_dir is not None and prev_dist is not None and curr_dist is not None:
+                        delta = abs(curr_dir - prev_dir) % 360
+                        angle_diff = min(delta, 360 - delta)
+                        if angle_diff >= 90 and prev_dist > 0 and curr_dist / prev_dist < 0.6:
+                            return True, "Ball hit the net"
             else:
                 # Reset counter if ball is not in net area
                 if hasattr(self, 'net_area_frames'):
@@ -2009,7 +2451,10 @@ class InteractiveBallAnalyzer:
         edge_margin = 50
         if (x < edge_margin or x > width - edge_margin or 
             y < edge_margin or y > height - edge_margin):
-            return True, "Ball near court edge (likely out)"
+            if getattr(self, 'edge_wait', False) or getattr(self, 'near_edge', False):
+                return False, "Edge return grace"
+            self.edge_wait = True
+            return False, "Edge return grace"
         
         return False, "Point continues"
     
@@ -2143,7 +2588,7 @@ class InteractiveBallAnalyzer:
         """Process video with intelligent tennis game analysis."""
         print("Intelligent Tennis Game Tracker")
         print("=" * 50)
-        print("1. Automatically finds first serve position")
+        print("1. Waits for first serve position")
         print("2. Tracks ball through each point")
         print("3. Detects when point ends (out, net, double bounce)")
         print("4. Automatically waits for next serve")
@@ -2151,7 +2596,10 @@ class InteractiveBallAnalyzer:
         print("6. Press 'N' to mark net area (6 points clockwise)")
         print("7. Press 'S' to mark serve area (4 points)")
         print("8. Press 'B' to open ball HSV debug window")
-        print("9. Press 'Q' to quit")
+        print("9. Press SPACE to play/pause")
+        print("10. Press BACKSPACE to step back one frame")
+        print("11. Press 0/1/2/3 for HSV debug on previous frame (standard/alt1/alt2/alt3)")
+        print("12. Press 'Q' to quit")
         print("=" * 50)
         if self.start_frame > 0:
             print(f"Starting at frame {self.start_frame}")
@@ -2162,11 +2610,33 @@ class InteractiveBallAnalyzer:
         scale_factor = 1.0
         current_frame = None
         
+        def reset_tracking_state():
+            self.tracking = False
+            self.ball_center = None
+            self.ball_size = None
+            self.ball_hsv = None
+            self.ball_velocity_history = []
+            self.last_motion = None
+            self.prev_motion = None
+            self.last_direction = None
+            self.direction_change_streak = 0
+            self.edge_wait = False
+            self.near_edge = False
+            self.using_alt_hsv = False
+            self.using_alt2_hsv = False
+            self.focus_loss_active = False
+
         # Game state variables
-        game_state = "SCANNING_FOR_SERVE"  # SCANNING_FOR_SERVE, TRACKING_POINT, POINT_ENDED, WAITING_FOR_SERVE
+        game_state = "WAITING_FOR_SERVE"  # SCANNING_FOR_SERVE, TRACKING_POINT, POINT_ENDED, WAITING_FOR_SERVE
         point_start_frame = None
         point_end_frame = None
         serve_positions = []
+        serve_tracking_frames = 0
+        last_serve_candidate = None
+        play_mode = False
+        last_frame_for_debug = None
+        last_ball_center_for_debug = None
+        last_frame_index_for_debug = None
         # Ensure capture starts at requested frame
         self.cap.set(cv2.CAP_PROP_POS_FRAMES, self.start_frame)
         early_serve_grace_frames = 15  # aggressively accept serve during first frames after start_frame
@@ -2182,8 +2652,8 @@ class InteractiveBallAnalyzer:
         
         cv2.setMouseCallback("Tennis Game Tracker", mouse_callback_with_scale)
         
-        # Start from configured frame to scan for first serve
-        print(f"\nStarting from frame {self.start_frame} to scan for first serve...")
+        # Start from configured frame to wait for first serve
+        print(f"\nStarting from frame {self.start_frame} to wait for first serve...")
         self.cap.set(cv2.CAP_PROP_POS_FRAMES, self.start_frame)
         self.frame_count = self.start_frame
         
@@ -2238,14 +2708,31 @@ class InteractiveBallAnalyzer:
             if not ret:
                 break
             
-            # Early serve detection: while scanning and within grace window, attempt ball track and enter tracking
-            if game_state == "SCANNING_FOR_SERVE" and self.frame_count <= (self.start_frame + early_serve_grace_frames):
+            # Early serve detection: while waiting and within grace window, attempt ball track and enter tracking
+            if game_state == "WAITING_FOR_SERVE" and self.frame_count <= (self.start_frame + early_serve_grace_frames):
+                self.using_alt_hsv = False
+                self.using_alt2_hsv = False
                 candidate = self.track_ball_in_frame(frame, allow_inactive=True)
                 if candidate is not None:
-                    print(f"Frame {self.frame_count}: Early serve found at {candidate}, entering TRACKING_POINT")
-                    game_state = "TRACKING_POINT"
-                    point_start_frame = self.frame_count
-                    self.tracking = True
+                    if hasattr(self, 'serve_area_x_min'):
+                        if not (self.serve_area_x_min <= candidate[0] <= self.serve_area_x_max and
+                                self.serve_area_y_min <= candidate[1] <= self.serve_area_y_max):
+                            print(f"Frame {self.frame_count}: Early serve candidate outside serve area, ignoring")
+                            candidate = None
+                    if candidate is not None:
+                        serve_tracking_frames += 1
+                        last_serve_candidate = candidate
+                        print(f"Frame {self.frame_count}: Serve candidate {candidate} (holding for confirmation)")
+                else:
+                    if serve_tracking_frames >= 5 and last_serve_candidate is not None:
+                        print(f"Frame {self.frame_count}: Serve exited area, entering TRACKING_POINT from {last_serve_candidate}")
+                        game_state = "TRACKING_POINT"
+                        point_start_frame = self.frame_count
+                        self.tracking = True
+                        self.ball_center = last_serve_candidate
+                    else:
+                        serve_tracking_frames = 0
+                        last_serve_candidate = None
             
             self.frame_count += 1
             current_frame = frame  # Store current frame for mouse callback
@@ -2289,18 +2776,29 @@ class InteractiveBallAnalyzer:
                         point_end_frame = self.frame_count
                         print(f"Frame {self.frame_count}: POINT ENDED - {reason}")
                         print(f"Point duration: {point_end_frame - point_start_frame} frames")
-                        game_state = "POINT_ENDED"
-                        self.tracking = False
+                        if "net" in reason.lower():
+                            self.net_contact_points.append(tracked_position)
+                            reset_tracking_state()
+                            game_state = "WAITING_FOR_SERVE"
+                        else:
+                            game_state = "POINT_ENDED"
+                        reset_tracking_state()
                     else:
                         print(f"Frame {self.frame_count}: Ball tracking continued")
-                        # Ball lost - might be end of point
-                        grace_limit = 45 if point_start_frame and self.frame_count <= (self.start_frame + 45) else 30
-                        if self.frame_count - point_start_frame > grace_limit:  # Minimum point duration
-                            point_end_frame = self.frame_count
-                            print(f"Frame {self.frame_count}: POINT ENDED - Ball lost (likely out of court)")
-                            print(f"Point duration: {point_end_frame - point_start_frame} frames")
-                            game_state = "POINT_ENDED"
-                            self.tracking = False
+                else:
+                    # Ball lost - might be end of point
+                    grace_limit = 45 if point_start_frame and self.frame_count <= (self.start_frame + 45) else 30
+                    if point_start_frame and (self.frame_count - point_start_frame > grace_limit):
+                        point_end_frame = self.frame_count
+                        print(f"Frame {self.frame_count}: POINT ENDED - Ball lost (likely out of court)")
+                        print(f"Point duration: {point_end_frame - point_start_frame} frames")
+                        predicted_point = self.get_predicted_point() or self.ball_center
+                        if predicted_point is not None:
+                            print("  DEBUG: Point ended. Opening HSV debug windows at predicted position...")
+                            self.open_predicted_hsv_debug_all(frame, predicted_point, self.frame_count)
+                            self.pause_requested = True
+                        game_state = "POINT_ENDED"
+                        reset_tracking_state()
             
             elif game_state == "POINT_ENDED":
                 # Wait a few frames then start scanning for next serve
@@ -2319,8 +2817,22 @@ class InteractiveBallAnalyzer:
                         self.tracking = True
         
             elif game_state == "WAITING_FOR_SERVE":
-                # This state can be used for manual intervention
-                pass
+                # Wait for next serve motion
+                potential_serve = self.detect_serve_position(frame)
+                if potential_serve:
+                    print(f"\n{'='*70}")
+                    print(f"NEXT SERVE DETECTED at frame {self.frame_count}!")
+                    print(f"Ball position: {potential_serve}")
+                    print(f"Starting to track the ball...")
+                    print(f"{'='*70}\n")
+                    self.ball_center = potential_serve
+                    self.tracking = True
+                    self.ball_stopped = False
+                    self.ball_velocity_history = []
+                    self.initial_ball_position = potential_serve
+                    self.ball_size = None
+                    point_start_frame = self.frame_count
+                    game_state = "TRACKING_POINT"
             
             # Resize frame to fit screen
             height, width = frame.shape[:2]
@@ -2351,10 +2863,30 @@ class InteractiveBallAnalyzer:
                            (10, new_height-40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
             
             cv2.imshow("Tennis Game Tracker", display_frame)
-            
-            key = cv2.waitKey(0) & 0xFF
+
+            prev_frame_for_debug = last_frame_for_debug
+            prev_ball_center_for_debug = last_ball_center_for_debug
+            prev_frame_index_for_debug = last_frame_index_for_debug
+            last_frame_for_debug = frame.copy()
+            last_ball_center_for_debug = self.ball_center
+            last_frame_index_for_debug = self.frame_count
+
+            if self.pause_requested:
+                play_mode = False
+            key = cv2.waitKey(30 if play_mode else 0) & 0xFF
             if key == ord('q'):
                 break
+            elif key in (ord('0'), ord('1'), ord('2'), ord('3')):
+                self.open_prev_frame_hsv_debug(
+                    prev_frame_for_debug,
+                    prev_ball_center_for_debug,
+                    prev_frame_index_for_debug,
+                    int(chr(key))
+                )
+                continue
+            elif key == ord(' '):
+                play_mode = not play_mode
+                continue
             elif key == ord('n'):
                 # Mark net area
                 print("\n=== MARKING NET AREA ===")
@@ -2405,9 +2937,18 @@ class InteractiveBallAnalyzer:
                     print("No ball marked yet - click on ball first to enable tracking")
                     # Just continue to next frame without tracking
                     continue
+            elif key == 8:  # BACKSPACE
+                target_frame = max(self.start_frame, self.frame_count - 2)
+                self.cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
+                self.frame_count = target_frame
+                print(f"\n--- STEPPED BACK TO FRAME {self.frame_count} ---")
+                continue
             elif key == ord('t'):
                 # Show HSV table
                 self.print_hsv_table()
+
+            if self.pause_requested:
+                self.pause_requested = False
         
         self.cap.release()
         cv2.destroyAllWindows()
@@ -2417,8 +2958,8 @@ class InteractiveBallAnalyzer:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Interactive tennis ball analyzer/tracker")
-    parser.add_argument("--start-frame", type=int, default=100,
-                        help="Frame index to start from (default 100, e.g., serve)")
+    parser.add_argument("--start-frame", type=int, default=0,
+                        help="Frame index to start from (default 0)")
     args = parser.parse_args()
     
     video_path = "20251011124747503_FV3553362380_FV3553362.mp4"
