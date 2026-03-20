@@ -1411,11 +1411,131 @@ class InteractiveBallAnalyzer:
         print(f"HSV values saved to hsv_config.json")
         print(f"Bulb size filter: {bulb_min}-{bulb_max}px\n")
     
+    def _reacquire_ball_by_motion(self, frame):
+        """Re-acquire ball after occlusion using frame differencing + HSV.
+
+        Returns (x, y) of the best ball candidate, or None if not found.
+        Uses frame differencing between current frame and the previous frame
+        to detect moving objects. Then filters by HSV color to confirm ball candidates.
+        """
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        diff = cv2.absdiff(self._prev_frame_gray, gray)
+        # Update stored frame for next call (consecutive frame comparison)
+        self._prev_frame_gray = gray
+        _, thresh = cv2.threshold(diff, 20, 255, cv2.THRESH_BINARY)
+
+        # Morphological cleanup — minimal dilation to not merge nearby blobs
+        kernel = np.ones((3, 3), np.uint8)
+        thresh = cv2.dilate(thresh, kernel, iterations=1)
+
+        # Find motion regions
+        motion_contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        hsv_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        frame_height, frame_width = frame.shape[:2]
+
+        # Build list of HSV filters
+        hsv_filters = []
+        if hasattr(self, 'hsv_regular') and self.hsv_regular is not None:
+            hsv_filters.append(self.hsv_regular['lower'])
+            hsv_filters.append(self.hsv_regular['upper'])
+        if hasattr(self, 'alt2_hsv_lower') and self.alt2_hsv_lower is not None:
+            hsv_filters.append(self.alt2_hsv_lower)
+            hsv_filters.append(self.alt2_hsv_upper)
+
+        stuck_x, stuck_y = self.ball_center if self.ball_center else (0, 0)
+
+        # Track static positions across re-acquisition attempts
+        # If a candidate appears at the same spot as previous attempt, it's static noise
+        prev_reacq = getattr(self, '_prev_reacq_candidates', [])
+
+        best_candidate = None
+        best_score = float('inf')
+        candidate_count = 0
+
+        for mc in motion_contours:
+            motion_area = cv2.contourArea(mc)
+            # The ball creates a moderate motion blob (typically 50-300px in diff image)
+            # Very small blobs (< 30) are compression artifacts
+            # Very large blobs (> 500) are player movement
+            if motion_area < 30 or motion_area > 300:
+                continue
+
+            M = cv2.moments(mc)
+            if M["m00"] == 0:
+                continue
+            mx = int(M["m10"] / M["m00"])
+            my = int(M["m01"] / M["m00"])
+
+            # Skip motion near the stuck position (likely player/noise at same spot)
+            dist_from_stuck = np.sqrt((mx - stuck_x)**2 + (my - stuck_y)**2)
+            if dist_from_stuck < 100:
+                continue
+
+            # Skip motion in bottom half (ball in play is in upper portion)
+            if my > frame_height * 0.5:
+                continue
+
+            # Check ball color at the motion centroid
+            h, s, v = hsv_frame[min(my, frame_height - 1), min(mx, frame_width - 1)]
+            is_ball_color = False
+            for i in range(0, len(hsv_filters), 2):
+                lower = hsv_filters[i]
+                upper = hsv_filters[i + 1]
+                if lower[0] <= h <= upper[0] and lower[1] <= s <= upper[1] and lower[2] <= v <= upper[2]:
+                    is_ball_color = True
+                    break
+
+            if not is_ball_color:
+                continue
+
+            # Skip candidates that appeared at the same position in previous re-acquisition
+            # (static noise that persists across frames)
+            is_static = False
+            for prev_x, prev_y in prev_reacq:
+                if abs(mx - prev_x) < 30 and abs(my - prev_y) < 30:
+                    is_static = True
+                    break
+            if is_static:
+                print(f"  DEBUG: [REACQ] SKIPPED static blob at ({mx},{my})")
+                continue
+
+            candidate_count += 1
+
+            # Score: favor small motion blobs (closer to ball size) in the playing area
+            # Penalize edges heavily
+            edge_penalty = 0
+            if my < 20 or mx < 20 or mx > frame_width - 20:
+                edge_penalty = 200
+
+            # Prefer motion in the playing area (Y=100-800 for ball trajectory)
+            y_score = 0
+            if 100 < my < 800:
+                y_score = -30  # bonus
+
+            score = motion_area * 0.3 + edge_penalty + y_score
+
+            print(f"  DEBUG: [REACQ] Motion+HSV at ({mx},{my}) area={motion_area:.0f}, "
+                  f"H={h} S={s} V={v}, dist_stuck={dist_from_stuck:.0f}, score={score:.1f}")
+
+            if score < best_score:
+                best_score = score
+                best_candidate = (mx, my)
+
+        print(f"  DEBUG: [REACQ] Total candidates after filtering: {candidate_count}")
+        # Store all candidates as potential static positions for next attempt
+        self._prev_reacq_candidates = [(mx, my) for mc in motion_contours
+                                        if cv2.contourArea(mc) >= 30 and cv2.contourArea(mc) <= 300
+                                        for M in [cv2.moments(mc)]
+                                        if M["m00"] > 0
+                                        for mx, my in [(int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"]))]]
+        return best_candidate
+
     def track_ball_in_frame(self, frame, allow_inactive=False):
         """Track ball in current frame using HSV filter with debug information."""
         if (not self.tracking and not allow_inactive) or self.hsv_lower is None:
             return None
-        
+
         frame_height, frame_width = frame.shape[:2]
         
         # Store the last search position for when ball is lost
@@ -1465,6 +1585,26 @@ class InteractiveBallAnalyzer:
                 # Normal tracking - increased radius to catch fast balls
                 x, y = x_prev, y_prev
                 search_radius = 120  # Increased from 80 to catch balls moving >80px/frame
+                # When ball is lost for several frames (e.g. player occlusion),
+                # try motion-based re-acquisition using frame differencing
+                if self.stuck_frame_count >= 5 and hasattr(self, '_prev_frame_gray') and self._prev_frame_gray is not None:
+                    reacq_pos = self._reacquire_ball_by_motion(frame)
+                    if reacq_pos is not None:
+                        print(f"Frame {self.frame_count}: [RE-ACQUIRED] Ball found at {reacq_pos} after {self.stuck_frame_count} stuck frames (motion-based)")
+                        self.ball_velocity_history = []
+                        self.last_motion = None
+                        self.last_direction = None
+                        self.direction_change_streak = 0
+                        self.stuck_frame_count = 0
+                        self._recent_max_ball_size = 0
+                        self.ball_center = reacq_pos
+                        self._prev_frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                        return self.ball_center
+                    else:
+                        # Update prev frame for next attempt (consecutive comparison)
+                        self._prev_frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                elif self.stuck_frame_count >= 3:
+                    search_radius = 300
         # First, check if ball stopped - if so, search from initial position
         elif hasattr(self, 'ball_stopped') and self.ball_stopped and hasattr(self, 'initial_ball_position'):
             print(f"\n  DEBUG: Ball stopped! Searching from initial position {self.initial_ball_position}")
@@ -1499,7 +1639,7 @@ class InteractiveBallAnalyzer:
         if self.ball_center or (hasattr(self, 'initial_ball_position') and self.initial_ball_position):
             if early_frames and 'search_radius' in locals():
                 search_radius = max(search_radius, 250)  # wider window for first few frames
-            if not allow_inactive and not getattr(self, 'edge_wait', False):
+            if not allow_inactive and not getattr(self, 'edge_wait', False) and self.stuck_frame_count < 3:
                 search_radius = min(search_radius, self.max_ball_speed)
             x1 = max(0, x - search_radius)
             y1 = max(0, y - search_radius)
@@ -1778,8 +1918,27 @@ class InteractiveBallAnalyzer:
             # Weighted score: distance + size penalty
             # Prefer candidates with similar size to previous ball
             # Distance is primary, but size consistency matters for fast-moving balls
-            score = distance + (size_ratio * 30)  # 30px penalty per 100% size change
-            if self.last_motion and distance > 0:
+            full_frame_scan = self.stuck_frame_count >= 5
+            if full_frame_scan:
+                # In full-frame scan mode: prioritize size match over distance
+                # Ball bounced off player so direction is unknown
+                # Reject tiny 1px noise when we know ball was bigger
+                # Reject tiny noise when ball was recently large
+                if self.ball_size and self.ball_size >= 10 and area < 3:
+                    continue
+                # Reject contours near stuck position (noise at old location)
+                if self.ball_center:
+                    dist_from_stuck = np.sqrt((cx - self.ball_center[0])**2 + (cy - self.ball_center[1])**2)
+                    if dist_from_stuck < 500:
+                        continue
+                # Reject contours at frame edges
+                if cy < 20 or cx < 20 or cx > frame.shape[1] - 20:
+                    continue
+                score = size_ratio * 100  # size match is primary
+                score += distance * 0.1   # very mild distance preference
+            else:
+                score = distance + (size_ratio * 30)  # 30px penalty per 100% size change
+            if not full_frame_scan and self.last_motion and distance > 0:
                 lm_dx = self.last_motion['dx']
                 lm_dy = self.last_motion['dy']
                 lm_dist = self.last_motion['distance']
@@ -1793,7 +1952,7 @@ class InteractiveBallAnalyzer:
                     score += speed_diff * 1.5
                     align_bonus = dot / (lm_dist * distance)
                     score -= max(0.0, align_bonus) * 40
-            if predicted_point:
+            if not full_frame_scan and predicted_point:
                 pdx = cx - predicted_point[0]
                 pdy = cy - predicted_point[1]
                 predicted_distance = np.sqrt(pdx * pdx + pdy * pdy)
@@ -1831,7 +1990,8 @@ class InteractiveBallAnalyzer:
             
             # Check if this is likely a false positive jump
             # If ball was at edge and closest match is far away, ball likely went off-screen
-            if self.ball_center:
+            # Skip this check during full-frame scan (re-acquisition after occlusion)
+            if self.ball_center and self.stuck_frame_count < 5:
                 x_prev, y_prev = self.ball_center
                 actual_distance = np.sqrt((cx - x_prev)**2 + (cy - y_prev)**2)
                 edge_threshold = 5  # pixels from edge
@@ -1870,7 +2030,8 @@ class InteractiveBallAnalyzer:
                 velocity = 0
             
             # If direction/speed look wrong, try alternative HSV before committing
-            if self.last_motion and self.ball_center:
+            # Skip this during full-frame scan recovery - ball direction changed after player hit
+            if self.last_motion and self.ball_center and self.stuck_frame_count < 5:
                 lm_dx = self.last_motion['dx']
                 lm_dy = self.last_motion['dy']
                 lm_dist = self.last_motion['distance']
@@ -1953,8 +2114,16 @@ class InteractiveBallAnalyzer:
                             self.hsv_upper = self.alt3_hsv_upper
                             print(f"Frame {self.frame_count}: [ALT3 HSV OVERRIDE] Ball at ({cx}, {cy})")
 
+            # Detect sudden ball size drop (occlusion by player)
+            # If ball was > 30px and now < 5px, it's being occluded — don't trust this detection
+            if prev_ball_size and prev_ball_size > 30 and bulb_size < 5:
+                print(f"Frame {self.frame_count}: Ball size dropped {prev_ball_size:.0f}->{bulb_size:.0f}px - likely occluded by player")
+                self.stuck_frame_count += 2  # accelerate stuck detection
+                return self.ball_center
+
             # Gate large direction/velocity changes for a few frames
-            if self.last_motion and self.ball_center:
+            # Skip this gate during full-frame scan recovery (ball changed direction after player hit)
+            if self.last_motion and self.ball_center and self.stuck_frame_count < 5:
                 lm_dist = self.last_motion['distance']
                 angle_jump = 0.0
                 if self.last_direction is not None and direction_deg is not None:
@@ -1966,14 +2135,36 @@ class InteractiveBallAnalyzer:
                     self.direction_change_streak += 1
                     if self.direction_change_streak < 3:
                         print(f"Frame {self.frame_count}: Direction change candidate (holding {self.direction_change_streak}/3)")
+                        self.stuck_frame_count += 1
                         return self.ball_center
                 else:
                     self.direction_change_streak = 0
 
             # Update tracking data
+            # If re-acquiring after full-frame scan, reset velocity/direction state
+            if self.stuck_frame_count >= 5:
+                print(f"Frame {self.frame_count}: [RE-ACQUIRED] Ball found at ({cx},{cy}) after {self.stuck_frame_count} stuck frames")
+                self.ball_velocity_history = []
+                self.last_motion = None
+                self.last_direction = None
+                self.direction_change_streak = 0
+                self.stuck_frame_count = 0
+                self._recent_max_ball_size = 0
+                self.ball_center = (cx, cy)
+                self.ball_hsv = hsv_values
+                self.ball_size = bulb_size
+                self._prev_frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                # Skip all correction mechanisms (focus loss, alt HSV) on re-acquisition
+                return self.ball_center
             self.ball_center = (cx, cy)
             self.ball_hsv = hsv_values
             self.ball_size = bulb_size
+            # Track max ball size over recent frames for occlusion detection
+            if bulb_size > 5:
+                self._recent_max_ball_size = max(getattr(self, '_recent_max_ball_size', 0), bulb_size)
+            # Store frame for motion-based re-acquisition (every 3rd frame to save CPU)
+            if self.frame_count % 3 == 0:
+                self._prev_frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             frame_height, frame_width = frame.shape[:2]
             edge_margin = 50
             self.near_edge = (
