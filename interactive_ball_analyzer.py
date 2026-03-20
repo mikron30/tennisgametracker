@@ -25,6 +25,7 @@ class InteractiveBallAnalyzer:
         self.ball_size = None
         self.tracking = False
         self.ball_stopped = False
+        self.stuck_frame_count = 0
         self.ball_velocity_history = []
         self.initial_ball_position = None
         self.last_seen_frame = None
@@ -1526,6 +1527,7 @@ class InteractiveBallAnalyzer:
         
         if should_check_both:
             # Search with BOTH filters and combine results
+            hsv_mode = "dual_net"
             print(f"  DEBUG: Ball near net area (Y={y}, net Y={self.net_area_y_min}-{self.net_area_y_max})")
             print(f"  DEBUG: Checking BOTH HSV filters to find best match")
             
@@ -1590,7 +1592,10 @@ class InteractiveBallAnalyzer:
         
         if not contours:
             print("  DEBUG: [PROBLEM] No contours found in search region!")
-            print(f"  DEBUG: HSV filter range ({hsv_mode}): H={hsv_lower_use[0]}-{hsv_upper_use[0]}, S={hsv_lower_use[1]}-{hsv_upper_use[1]}, V={hsv_lower_use[2]}-{hsv_upper_use[2]}")
+            if 'hsv_lower_use' in dir() and 'hsv_upper_use' in dir():
+                print(f"  DEBUG: HSV filter range ({hsv_mode}): H={hsv_lower_use[0]}-{hsv_upper_use[0]}, S={hsv_lower_use[1]}-{hsv_upper_use[1]}, V={hsv_lower_use[2]}-{hsv_upper_use[2]}")
+            else:
+                print(f"  DEBUG: HSV filter mode: {hsv_mode}")
             print(f"  DEBUG: Search region: ({x1},{y1})-({x2},{y2}), size: {x2-x1}x{y2-y1}px")
             if self.ball_center:
                 print(f"  DEBUG: Previous ball position: {self.ball_center}")
@@ -1699,6 +1704,8 @@ class InteractiveBallAnalyzer:
                     self.pause_requested = True
             
             # Keep the ball_center at last position instead of losing it
+            # Increment stuck counter since no contour was found
+            self.stuck_frame_count += 1
             return self.ball_center
         
         # Find the best ball candidate using weighted score (distance + size similarity)
@@ -2050,8 +2057,16 @@ class InteractiveBallAnalyzer:
                         print(f"  DEBUG: [BALL STOPPED] Avg velocity: {avg_velocity:.1f}px/frame")
                         print(f"  DEBUG: Will search from initial position {self.initial_ball_position} for next ball")
                         self.ball_stopped = True
+                    self.stuck_frame_count += 1
                 else:
                     self.ball_stopped = False
+                    self.stuck_frame_count = 0
+
+            # Also count stuck frames when position hasn't moved
+            if self.last_motion and self.last_motion['distance'] < 1.5:
+                self.stuck_frame_count += 1
+            elif self.last_motion and self.last_motion['distance'] >= 3.0:
+                self.stuck_frame_count = 0
             
             # Add to HSV table using the final (possibly retracked) values
             final_pos = self.ball_center
@@ -2414,27 +2429,40 @@ class InteractiveBallAnalyzer:
             return True, "Ball out of court bounds"
         
         # Check if ball is in the net area (if configured) - but be more careful
+        # Only check net hit if ball is near the net X position (first 55% of frame)
+        net_x_limit = int(width * 0.55)
         if hasattr(self, 'net_area_y_min') and hasattr(self, 'net_area_y_max'):
-            if self.net_area_y_min <= y <= self.net_area_y_max:
+            if self.net_area_y_min <= y <= self.net_area_y_max and x < net_x_limit:
                 # Ball is in net area - check if it's been there for multiple frames
                 if not hasattr(self, 'net_area_frames'):
                     self.net_area_frames = 0
                 self.net_area_frames += 1
-                # Consider it a net hit if it lingers or nearly stops
-                if self.net_area_frames > 3:
+                # Consider it a net hit if it lingers - use longer threshold for fast balls
+                ball_is_fast = self.last_motion and self.last_motion['distance'] > 15
+                net_linger_limit = 6 if ball_is_fast else 3
+                if self.net_area_frames > net_linger_limit:
                     return True, "Ball hit the net"
+                # Immediate stop near net
                 if self.last_motion and self.last_motion['distance'] < 2.5:
-                    return True, "Ball hit the net"
+                    # Only if previous frame was also slow (not a tracking glitch)
+                    prev_was_slow = self.prev_motion and self.prev_motion['distance'] < 10
+                    if prev_was_slow:
+                        return True, "Ball hit the net"
+                # Direction change with deceleration — classic net hit signature
                 if self.prev_motion and self.last_motion:
                     prev_dir = self.prev_motion.get('direction_deg')
                     curr_dir = self.last_motion.get('direction_deg')
-                    prev_dist = self.prev_motion.get('distance')
-                    curr_dist = self.last_motion.get('distance')
-                    if prev_dir is not None and curr_dir is not None and prev_dist is not None and curr_dist is not None:
+                    prev_dist = self.prev_motion.get('distance', 0)
+                    curr_dist = self.last_motion.get('distance', 0)
+                    if prev_dir is not None and curr_dir is not None and prev_dist > 0:
                         delta = abs(curr_dir - prev_dir) % 360
                         angle_diff = min(delta, 360 - delta)
-                        if angle_diff >= 90 and prev_dist > 0 and curr_dist / prev_dist < 0.6:
-                            return True, "Ball hit the net"
+                        # Only trigger if decelerating significantly AND direction changed
+                        if angle_diff >= 90 and curr_dist / prev_dist < 0.6:
+                            # Extra check: only if prev_motion was also not super-fast
+                            # (if prev was fast and curr is fast, ball is just passing through)
+                            if prev_dist < 30:
+                                return True, "Ball hit the net"
             else:
                 # Reset counter if ball is not in net area
                 if hasattr(self, 'net_area_frames'):
@@ -2625,6 +2653,7 @@ class InteractiveBallAnalyzer:
             self.using_alt_hsv = False
             self.using_alt2_hsv = False
             self.focus_loss_active = False
+            self.stuck_frame_count = 0
 
         # Game state variables
         game_state = "WAITING_FOR_SERVE"  # SCANNING_FOR_SERVE, TRACKING_POINT, POINT_ENDED, WAITING_FOR_SERVE
@@ -2633,6 +2662,7 @@ class InteractiveBallAnalyzer:
         serve_positions = []
         serve_tracking_frames = 0
         last_serve_candidate = None
+        serve_position_history = []
         play_mode = False
         last_frame_for_debug = None
         last_ball_center_for_debug = None
@@ -2769,22 +2799,30 @@ class InteractiveBallAnalyzer:
                 if tracked_position:
                     size_text = f"{self.ball_size:.1f}px" if self.ball_size is not None else "unknown"
                     print(f"Frame {self.frame_count}: Ball tracked at {tracked_position} - Size: {size_text}")
-                    
-                    # Check if point has ended
-                    point_ended, reason = self.detect_point_end(tracked_position, frame)
-                    if point_ended:
+
+                    # Stuck-ball timeout: if ball hasn't moved for 15+ frames, end point
+                    if self.stuck_frame_count >= 15:
                         point_end_frame = self.frame_count
-                        print(f"Frame {self.frame_count}: POINT ENDED - {reason}")
+                        print(f"Frame {self.frame_count}: POINT ENDED - Ball stuck for {self.stuck_frame_count} frames")
                         print(f"Point duration: {point_end_frame - point_start_frame} frames")
-                        if "net" in reason.lower():
-                            self.net_contact_points.append(tracked_position)
-                            reset_tracking_state()
-                            game_state = "WAITING_FOR_SERVE"
-                        else:
-                            game_state = "POINT_ENDED"
+                        game_state = "WAITING_FOR_SERVE"
                         reset_tracking_state()
                     else:
-                        print(f"Frame {self.frame_count}: Ball tracking continued")
+                        # Check if point has ended
+                        point_ended, reason = self.detect_point_end(tracked_position, frame)
+                        if point_ended:
+                            point_end_frame = self.frame_count
+                            print(f"Frame {self.frame_count}: POINT ENDED - {reason}")
+                            print(f"Point duration: {point_end_frame - point_start_frame} frames")
+                            if "net" in reason.lower():
+                                self.net_contact_points.append(tracked_position)
+                                reset_tracking_state()
+                                game_state = "WAITING_FOR_SERVE"
+                            else:
+                                game_state = "POINT_ENDED"
+                            reset_tracking_state()
+                        else:
+                            print(f"Frame {self.frame_count}: Ball tracking continued")
                 else:
                     # Ball lost - might be end of point
                     grace_limit = 45 if point_start_frame and self.frame_count <= (self.start_frame + 45) else 30
@@ -2817,22 +2855,60 @@ class InteractiveBallAnalyzer:
                         self.tracking = True
         
             elif game_state == "WAITING_FOR_SERVE":
-                # Wait for next serve motion
+                # Detect ball in serve area, accumulate position history,
+                # start tracking only when ball exits serve area with rightward motion
+                import math as _math
                 potential_serve = self.detect_serve_position(frame)
                 if potential_serve:
-                    print(f"\n{'='*70}")
-                    print(f"NEXT SERVE DETECTED at frame {self.frame_count}!")
-                    print(f"Ball position: {potential_serve}")
-                    print(f"Starting to track the ball...")
-                    print(f"{'='*70}\n")
-                    self.ball_center = potential_serve
-                    self.tracking = True
-                    self.ball_stopped = False
-                    self.ball_velocity_history = []
-                    self.initial_ball_position = potential_serve
-                    self.ball_size = None
-                    point_start_frame = self.frame_count
-                    game_state = "TRACKING_POINT"
+                    serve_tracking_frames += 1
+                    last_serve_candidate = potential_serve
+                    serve_position_history.append(potential_serve)
+                    if len(serve_position_history) > 10:
+                        serve_position_history = serve_position_history[-10:]
+                else:
+                    # Ball not in serve area - check if it was a real serve
+                    if serve_tracking_frames >= 3 and last_serve_candidate is not None:
+                        # Check if ball was moving rightward (serve direction)
+                        is_rightward = True
+                        if len(serve_position_history) >= 2:
+                            last_pos = serve_position_history[-1]
+                            first_pos = serve_position_history[-min(3, len(serve_position_history))]
+                            dx = last_pos[0] - first_pos[0]
+                            is_rightward = dx > 10
+                        if is_rightward:
+                            # Predict where ball is now based on serve velocity
+                            predicted_pos = last_serve_candidate
+                            if len(serve_position_history) >= 2:
+                                p1 = serve_position_history[-2]
+                                p2 = serve_position_history[-1]
+                                _dx = p2[0] - p1[0]
+                                _dy = p2[1] - p1[1]
+                                _dist = _math.hypot(_dx, _dy)
+                                _dir = _math.degrees(_math.atan2(_dy, _dx))
+                                # Extrapolate 1 frame ahead
+                                predicted_pos = (int(p2[0] + _dx), int(p2[1] + _dy))
+                                self.last_motion = {
+                                    'distance': _dist, 'dx': _dx, 'dy': _dy, 'direction_deg': _dir
+                                }
+                                self.last_delta = (_dx, _dy)
+                                self.ball_velocity_history = [_dist]
+                            print(f"\n{'='*70}")
+                            print(f"NEXT SERVE DETECTED at frame {self.frame_count}!")
+                            print(f"Last serve pos: {last_serve_candidate}, predicted: {predicted_pos}")
+                            print(f"Starting to track the ball...")
+                            print(f"{'='*70}\n")
+                            self.ball_center = predicted_pos
+                            self.tracking = True
+                            self.ball_stopped = False
+                            self.initial_ball_position = last_serve_candidate
+                            self.ball_size = None
+                            self.stuck_frame_count = 0
+                            point_start_frame = self.frame_count
+                            self.point_start_frame_internal = self.frame_count
+                            game_state = "TRACKING_POINT"
+                    serve_tracking_frames = 0
+                    last_serve_candidate = None
+                    serve_position_history = []
             
             # Resize frame to fit screen
             height, width = frame.shape[:2]
