@@ -1544,14 +1544,24 @@ class InteractiveBallAnalyzer:
             mask_net = cv2.morphologyEx(mask_net, cv2.MORPH_CLOSE, kernel)
             contours_net, _ = cv2.findContours(mask_net, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             
+            # Also check alt2 HSV filter (H=30-75) for balls with low Hue near net
+            contours_alt2 = []
+            if hasattr(self, 'alt2_hsv_lower') and self.alt2_hsv_lower is not None:
+                mask_alt2 = cv2.inRange(hsv_frame, self.alt2_hsv_lower, self.alt2_hsv_upper)
+                mask_alt2 = cv2.morphologyEx(mask_alt2, cv2.MORPH_OPEN, kernel)
+                mask_alt2 = cv2.morphologyEx(mask_alt2, cv2.MORPH_CLOSE, kernel)
+                contours_alt2, _ = cv2.findContours(mask_alt2, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
             # Tag each contour with its source
             contours = []
             for c in contours_reg:
                 contours.append(('regular', c))
             for c in contours_net:
                 contours.append(('behind_net', c))
-            
-            print(f"  DEBUG: Found {len(contours_reg)} regular court + {len(contours_net)} behind net = {len(contours)} total contours")
+            for c in contours_alt2:
+                contours.append(('alt2', c))
+
+            print(f"  DEBUG: Found {len(contours_reg)} regular + {len(contours_net)} behind_net + {len(contours_alt2)} alt2 = {len(contours)} total contours")
         else:
             # Normal single HSV filter search
             hsv_lower_use, hsv_upper_use, hsv_mode = self.select_hsv_for_position(y)
@@ -2865,6 +2875,50 @@ class InteractiveBallAnalyzer:
                     serve_position_history.append(potential_serve)
                     if len(serve_position_history) > 10:
                         serve_position_history = serve_position_history[-10:]
+                    # Early serve start: if ball is moving fast rightward within serve area,
+                    # start tracking immediately (don't wait for serve area exit)
+                    # Require ALL consecutive pairs to move rightward (not just first-to-last)
+                    if len(serve_position_history) >= 4:
+                        # Check last 3 consecutive pairs all move rightward with dx > 15
+                        all_rightward = True
+                        min_dx = float('inf')
+                        for i in range(-3, 0):
+                            pair_dx = serve_position_history[i][0] - serve_position_history[i-1][0]
+                            if pair_dx < 15:
+                                all_rightward = False
+                                break
+                            min_dx = min(min_dx, pair_dx)
+                        avg_dx = min_dx  # Use minimum dx as the threshold
+                        if all_rightward and avg_dx > 25:  # Consistent fast rightward = serve
+                            predicted_pos = potential_serve
+                            if len(serve_position_history) >= 2:
+                                p1 = serve_position_history[-2]
+                                p2 = serve_position_history[-1]
+                                _dx = p2[0] - p1[0]
+                                _dy = p2[1] - p1[1]
+                                _dist = _math.hypot(_dx, _dy)
+                                _dir = _math.degrees(_math.atan2(_dy, _dx))
+                                self.last_motion = {
+                                    'distance': _dist, 'dx': _dx, 'dy': _dy, 'direction_deg': _dir
+                                }
+                                self.last_delta = (_dx, _dy)
+                                self.ball_velocity_history = [_dist]
+                            print(f"\n{'='*70}")
+                            print(f"SERVE IN PROGRESS at frame {self.frame_count}!")
+                            print(f"Ball position: {potential_serve}, avg dx={avg_dx:.1f}px/frame")
+                            print(f"{'='*70}\n")
+                            self.ball_center = potential_serve
+                            self.tracking = True
+                            self.ball_stopped = False
+                            self.initial_ball_position = serve_position_history[0]
+                            self.ball_size = None
+                            self.stuck_frame_count = 0
+                            point_start_frame = self.frame_count
+                            self.point_start_frame_internal = self.frame_count
+                            game_state = "TRACKING_POINT"
+                            serve_tracking_frames = 0
+                            last_serve_candidate = None
+                            serve_position_history = []
                 else:
                     # Ball not in serve area - check if it was a real serve
                     if serve_tracking_frames >= 3 and last_serve_candidate is not None:

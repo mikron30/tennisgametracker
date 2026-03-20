@@ -174,6 +174,51 @@ def run_diagnostic(video_path, start_frame=0, max_frames=500, save_every=5, outp
                 if len(serve_position_history) > 10:
                     serve_position_history = serve_position_history[-10:]
                 ball_pos = potential_serve
+                # Early serve start: fast rightward motion within serve area
+                # Require ALL consecutive pairs to move rightward with dx > 15
+                if len(serve_position_history) >= 4:
+                    all_rightward = True
+                    min_dx = float('inf')
+                    for i in range(-3, 0):
+                        pair_dx = serve_position_history[i][0] - serve_position_history[i-1][0]
+                        if pair_dx < 15:
+                            all_rightward = False
+                            break
+                        min_dx = min(min_dx, pair_dx)
+                    avg_dx = min_dx
+                    if all_rightward and avg_dx > 25:
+                        if len(serve_position_history) >= 2:
+                            p1 = serve_position_history[-2]
+                            p2 = serve_position_history[-1]
+                            dx = p2[0] - p1[0]
+                            dy = p2[1] - p1[1]
+                            dist = math.hypot(dx, dy)
+                            direction = math.degrees(math.atan2(dy, dx))
+                            analyzer.last_motion = {
+                                'distance': dist, 'dx': dx, 'dy': dy, 'direction_deg': direction
+                            }
+                            analyzer.last_delta = (dx, dy)
+                            analyzer.ball_velocity_history = [dist]
+                        analyzer.ball_center = potential_serve
+                        analyzer.tracking = True
+                        analyzer.ball_stopped = False
+                        analyzer.initial_ball_position = serve_position_history[0]
+                        analyzer.ball_size = None
+                        analyzer.stuck_frame_count = 0
+                        point_start_frame = analyzer.frame_count
+                        analyzer.point_start_frame_internal = analyzer.frame_count
+                        game_state = "TRACKING_POINT"
+                        ball_pos = potential_serve
+                        state_transitions.append({
+                            'frame': analyzer.frame_count,
+                            'from': 'WAITING_FOR_SERVE',
+                            'to': 'TRACKING_POINT',
+                            'reason': f'Serve in progress (avg dx={avg_dx:.1f}px/frame)',
+                            'ball_pos': potential_serve
+                        })
+                        serve_tracking_frames = 0
+                        last_serve_candidate = None
+                        serve_position_history = []
             else:
                 if serve_tracking_frames >= 3 and last_serve_candidate is not None:
                     is_rightward = True
