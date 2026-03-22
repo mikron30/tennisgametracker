@@ -1472,9 +1472,8 @@ class InteractiveBallAnalyzer:
             if dist_from_stuck < 100:
                 continue
 
-            # Skip motion in bottom half (ball in play is in upper portion)
-            if my > frame_height * 0.5:
-                continue
+            # NOTE: Do NOT exclude the bottom half — tennis rallies happen across the
+            # whole frame, and a racket hit can send the ball 800+ px in one frame.
 
             # Check ball color at the motion centroid
             h, s, v = hsv_frame[min(my, frame_height - 1), min(mx, frame_width - 1)]
@@ -1502,18 +1501,23 @@ class InteractiveBallAnalyzer:
 
             candidate_count += 1
 
-            # Score: favor small motion blobs (closer to ball size) in the playing area
-            # Penalize edges heavily
+            # Score: favor small motion blobs (closer to ball size) in the playing area.
+            # Penalize frame edges heavily.
             edge_penalty = 0
             if my < 20 or mx < 20 or mx > frame_width - 20:
                 edge_penalty = 200
 
-            # Prefer motion in the playing area (Y=100-800 for ball trajectory)
+            # Prefer motion in the full playing area of the court (top to ~90% of frame)
             y_score = 0
-            if 100 < my < 800:
-                y_score = -30  # bonus
+            if 50 < my < int(frame_height * 0.9):
+                y_score = -30  # bonus for being in the court area
 
-            score = motion_area * 0.3 + edge_penalty + y_score
+            # Prefer candidates closer to the last known position so that a ball
+            # briefly hidden (e.g. by racket contact) is re-found near where we lost it
+            # rather than a far-away false positive.
+            dist_penalty = dist_from_stuck * 0.15
+
+            score = motion_area * 0.3 + edge_penalty + y_score + dist_penalty
 
             print(f"  DEBUG: [REACQ] Motion+HSV at ({mx},{my}) area={motion_area:.0f}, "
                   f"H={h} S={s} V={v}, dist_stuck={dist_from_stuck:.0f}, score={score:.1f}")
@@ -1587,6 +1591,9 @@ class InteractiveBallAnalyzer:
                 search_radius = 120  # Increased from 80 to catch balls moving >80px/frame
                 # When ball is lost for several frames (e.g. player occlusion),
                 # try motion-based re-acquisition using frame differencing
+                if self.stuck_frame_count in (5, 10):
+                    vel_h = [round(v,1) for v in getattr(self, 'ball_velocity_history', [])[-5:]]
+                    print(f"[STUCK_MILESTONE] f{self.frame_count}: stuck={self.stuck_frame_count} pos={self.ball_center} vel_hist={vel_h}")
                 if self.stuck_frame_count >= 5 and hasattr(self, '_prev_frame_gray') and self._prev_frame_gray is not None:
                     reacq_pos = self._reacquire_ball_by_motion(frame)
                     if reacq_pos is not None:
@@ -1750,6 +1757,7 @@ class InteractiveBallAnalyzer:
             if self.ball_center:
                 print(f"  DEBUG: Previous ball position: {self.ball_center}")
                 print(f"  DEBUG: KEEPING marker at last known position: {self.ball_center}")
+                print(f"[BALL_LOST] f{self.frame_count}: no contours found, keeping pos={self.ball_center} stuck={self.stuck_frame_count}")
             print(f"  DEBUG: REASON: Ball may have:")
             print(f"  DEBUG:   - Gone off screen (check edge detection)")
             print(f"  DEBUG:   - Changed color/lighting dramatically")
@@ -1768,6 +1776,9 @@ class InteractiveBallAnalyzer:
                          (lm_dx > 0 and self.ball_center[0] > frame.shape[1] - 10) or
                          (lm_dy < 0 and self.ball_center[1] < 10) or
                          (lm_dy > 0 and self.ball_center[1] > frame.shape[0] - 10))):
+                        # Ball is outside frame moving away — count as stuck so
+                        # STUCK_TIMEOUT can eventually fire and release the tracker.
+                        self.stuck_frame_count += 1
                         return self.ball_center
                 retrack = self.retrack_with_alt_hsv(
                     search_frame, x1, y1, self.ball_center, predicted_point, self.ball_size, allow_inactive
@@ -2325,6 +2336,7 @@ class InteractiveBallAnalyzer:
         if self.ball_center:
             print(f"  DEBUG: KEEPING marker at last known position: {self.ball_center}")
             print(f"  DEBUG: Will continue searching in next frame at same position...")
+            print(f"[BALL_LOST] f{self.frame_count}: no valid candidate, keeping pos={self.ball_center} stuck={self.stuck_frame_count}")
         # Keep the ball_center at last position instead of losing it
         return self.ball_center
     
@@ -2490,9 +2502,13 @@ class InteractiveBallAnalyzer:
             p1_head_y = p1_y  # Top of bounding box is the head
             serve_search_y_max = min(p1_head_y, self.serve_area_y_max)
         else:
-            # Conservative default: only search upper portion of serve area
-            serve_search_y_max = min(self.serve_area_y_min + (self.serve_area_y_max - self.serve_area_y_min) // 2, 
-                                    self.serve_area_y_max)
+            # Player not yet detected (cold start): use 85% of the serve area height.
+            # This is calibrated to match the typical p1_head_y seen when the player
+            # detector has warmed up (~77-80px for this video), so the ball's natural
+            # descent trajectory (Y≈76) is detected while the overshoot zone near
+            # Y=88-94 is excluded (keeping last_dy > 5 clean for toss-complete).
+            serve_search_y_max = int(self.serve_area_y_min +
+                                     (self.serve_area_y_max - self.serve_area_y_min) * 0.85)
         
         # Apply HSV filter to find potential balls
         hsv_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
@@ -2673,7 +2689,9 @@ class InteractiveBallAnalyzer:
         if hasattr(self, 'ball_velocity_history') and len(self.ball_velocity_history) > 10:
             recent_velocities = self.ball_velocity_history[-10:]
             avg_velocity = sum(recent_velocities) / len(recent_velocities)
+            print(f"[BALL_STOPPED_CHECK] f{self.frame_count}: avg_vel={avg_velocity:.1f} hist={[round(v,1) for v in recent_velocities]}")
             if avg_velocity < 5:  # Very slow movement
+                print(f"[BALL_STOPPED] f{self.frame_count}: avg_vel={avg_velocity:.1f} < 5 → POINT ENDS")
                 return True, "Ball stopped (possible double bounce)"
         
         # Check if ball is near court edges (likely out)
@@ -2813,7 +2831,7 @@ class InteractiveBallAnalyzer:
         except Exception as e:
             print(f"Error saving HSV config: {e}")
     
-    def process_video(self):
+    def process_video(self, auto_play=False, max_frames=0):
         """Process video with intelligent tennis game analysis."""
         print("Intelligent Tennis Game Tracker")
         print("=" * 50)
@@ -2864,7 +2882,8 @@ class InteractiveBallAnalyzer:
         serve_tracking_frames = 0
         last_serve_candidate = None
         serve_position_history = []
-        play_mode = False
+        scan_position_history = []  # motion history for SCANNING_FOR_SERVE rightward check
+        play_mode = auto_play  # start playing immediately if --auto-play flag is set
         last_frame_for_debug = None
         last_ball_center_for_debug = None
         last_frame_index_for_debug = None
@@ -2938,7 +2957,10 @@ class InteractiveBallAnalyzer:
             ret, frame = self.cap.read()
             if not ret:
                 break
-            
+            if max_frames > 0 and (self.frame_count - self.start_frame) >= max_frames:
+                print(f"[MAX_FRAMES] Reached {max_frames} frames limit, stopping.")
+                break
+
             # Early serve detection: while waiting and within grace window, attempt ball track and enter tracking
             if game_state == "WAITING_FOR_SERVE" and self.frame_count <= (self.start_frame + early_serve_grace_frames):
                 self.using_alt_hsv = False
@@ -2971,23 +2993,49 @@ class InteractiveBallAnalyzer:
             # Handle different game states
             if game_state == "SCANNING_FOR_SERVE":
                 # Look for potential serve positions (ball in serve area)
+                # Require consistent rightward motion before starting — same check as WAITING_FOR_SERVE fast-start.
+                # A single detection (ball just sitting in serve area) must NOT trigger tracking.
                 potential_serve = self.detect_serve_position(frame)
                 if potential_serve:
-                    print(f"\n{'='*70}")
-                    print(f"SERVE DETECTED at frame {self.frame_count}!")
-                    print(f"Ball position: {potential_serve}")
-                    print(f"Starting to track the ball...")
-                    print(f"{'='*70}\n")
-                    serve_positions.append((self.frame_count, potential_serve))
-                    # Start tracking this potential serve
-                    self.ball_center = potential_serve
-                    self.tracking = True
-                    self.ball_stopped = False
-                    self.ball_velocity_history = []
-                    self.initial_ball_position = potential_serve
-                    self.ball_size = None  # Will be set by track_ball_in_frame
-                    point_start_frame = self.frame_count
-                    game_state = "TRACKING_POINT"
+                    scan_position_history.append(potential_serve)
+                    if len(scan_position_history) > 10:
+                        scan_position_history = scan_position_history[-10:]
+                    if len(scan_position_history) >= 4:
+                        all_rightward = True
+                        min_dx = float('inf')
+                        for i in range(-3, 0):
+                            pair_dx = scan_position_history[i][0] - scan_position_history[i-1][0]
+                            if pair_dx < 15:
+                                all_rightward = False
+                                break
+                            min_dx = min(min_dx, pair_dx)
+                        if all_rightward and min_dx > 25:
+                            print(f"\n{'='*70}")
+                            print(f"SERVE DETECTED at frame {self.frame_count}!")
+                            print(f"Ball position: {potential_serve}")
+                            print(f"Starting to track the ball...")
+                            print(f"{'='*70}\n")
+                            print(f"[TRACKING_START] f{self.frame_count}: serve detected at {potential_serve}")
+                            serve_positions.append((self.frame_count, potential_serve))
+                            p1 = scan_position_history[-2]
+                            p2 = scan_position_history[-1]
+                            _dx = p2[0] - p1[0]
+                            _dy = p2[1] - p1[1]
+                            _dist = math.hypot(_dx, _dy)
+                            _dir = math.degrees(math.atan2(_dy, _dx))
+                            self.last_motion = {'distance': _dist, 'dx': _dx, 'dy': _dy, 'direction_deg': _dir}
+                            self.last_delta = (_dx, _dy)
+                            self.ball_velocity_history = [_dist]
+                            self.ball_center = potential_serve
+                            self.tracking = True
+                            self.ball_stopped = False
+                            self.initial_ball_position = scan_position_history[0]
+                            self.ball_size = None
+                            point_start_frame = self.frame_count
+                            scan_position_history = []
+                            game_state = "TRACKING_POINT"
+                else:
+                    scan_position_history = []
             
             elif game_state == "TRACKING_POINT":
                 # Update player positions while tracking
@@ -2996,16 +3044,37 @@ class InteractiveBallAnalyzer:
                 # Track ball through the point
                 tracked_position = None
                 if self.tracking and self.hsv_lower is not None and self.ball_center is not None:
+                    prev_ball_center = self.ball_center
+                    prev_stuck = self.stuck_frame_count
                     tracked_position = self.track_ball_in_frame(frame)
+                    # Reject any position that jumps impossibly far in one frame (false positive).
+                    # When the tracker is in re-acquisition mode (stuck >= 5 before the call), allow
+                    # a larger jump because the ball may have traveled far while lost.
+                    if tracked_position and prev_ball_center:
+                        jump = math.hypot(tracked_position[0] - prev_ball_center[0],
+                                          tracked_position[1] - prev_ball_center[1])
+                        # Allow a larger jump when re-acquiring after being stuck for 5+ frames:
+                        # a racket hit can send the ball 800+ px in one frame, so we use 1500px
+                        # to let motion-based re-acquisition recover across the full court.
+                        max_jump = 1500 if prev_stuck >= 5 else 400
+                        if jump > max_jump:
+                            print(f"[JUMP_REJECTED] f{self.frame_count}: jumped {jump:.0f}px from {prev_ball_center} to {tracked_position} (limit={max_jump}px, prev_stuck={prev_stuck}), keeping previous")
+                            self.ball_center = prev_ball_center
+                            tracked_position = None
                 if tracked_position:
+                    vel = self.last_motion['distance'] if self.last_motion else 0
                     size_text = f"{self.ball_size:.1f}px" if self.ball_size is not None else "unknown"
+                    vel_hist_tail = [round(v, 1) for v in getattr(self, 'ball_velocity_history', [])[-5:]]
                     print(f"Frame {self.frame_count}: Ball tracked at {tracked_position} - Size: {size_text}")
+                    print(f"[TRACK] f{self.frame_count}: pos={tracked_position} vel={vel:.1f}px stuck={self.stuck_frame_count} vel_hist={vel_hist_tail}")
 
                     # Stuck-ball timeout: if ball hasn't moved for 15+ frames, end point
                     if self.stuck_frame_count >= 15:
                         point_end_frame = self.frame_count
+                        dur = point_end_frame - point_start_frame if point_start_frame else 0
                         print(f"Frame {self.frame_count}: POINT ENDED - Ball stuck for {self.stuck_frame_count} frames")
-                        print(f"Point duration: {point_end_frame - point_start_frame} frames")
+                        print(f"Point duration: {dur} frames")
+                        print(f"[POINT_END] f{self.frame_count}: reason=STUCK_TIMEOUT stuck={self.stuck_frame_count} duration={dur}f pos={tracked_position}")
                         game_state = "WAITING_FOR_SERVE"
                         reset_tracking_state()
                     else:
@@ -3013,8 +3082,10 @@ class InteractiveBallAnalyzer:
                         point_ended, reason = self.detect_point_end(tracked_position, frame)
                         if point_ended:
                             point_end_frame = self.frame_count
+                            dur = point_end_frame - point_start_frame if point_start_frame else 0
                             print(f"Frame {self.frame_count}: POINT ENDED - {reason}")
-                            print(f"Point duration: {point_end_frame - point_start_frame} frames")
+                            print(f"Point duration: {dur} frames")
+                            print(f"[POINT_END] f{self.frame_count}: reason={reason} duration={dur}f pos={tracked_position} vel={vel:.1f}px vel_hist={vel_hist_tail}")
                             if "net" in reason.lower():
                                 self.net_contact_points.append(tracked_position)
                                 reset_tracking_state()
@@ -3066,6 +3137,62 @@ class InteractiveBallAnalyzer:
                     serve_position_history.append(potential_serve)
                     if len(serve_position_history) > 10:
                         serve_position_history = serve_position_history[-10:]
+                    # Static false-positive filter: a real toss ball moves significantly
+                    # through the serve area; a static artifact (line, shadow, court marking)
+                    # stays at nearly the same pixel for many frames.
+                    # After 8 frames with total displacement < 10px → reset and ignore.
+                    if serve_tracking_frames >= 8 and len(serve_position_history) >= 4:
+                        xs = [p[0] for p in serve_position_history]
+                        ys = [p[1] for p in serve_position_history]
+                        total_disp = _math.hypot(max(xs) - min(xs), max(ys) - min(ys))
+                        if total_disp < 10:
+                            print(f"[SERVE_FP_RESET] f{self.frame_count}: static false positive at {potential_serve} "
+                                  f"total_disp={total_disp:.1f}px over {serve_tracking_frames}f — resetting")
+                            serve_tracking_frames = 0
+                            last_serve_candidate = None
+                            serve_position_history = []
+                    # Toss-in-flight: when a persistent false positive keeps the ball "in"
+                    # the serve area for far longer than a normal serve (3-8 frames), but
+                    # the position history shows the real ball was briefly near the top of
+                    # the serve area (toss apex), trigger tracking from that top position.
+                    # This handles the cold-start case (--start-frame N) where the player
+                    # detector hasn't warmed up yet and allows a wider serve search Y range
+                    # that catches a persistent false positive at the top of the search box.
+                    # serve_tracking_frames >= 10 ensures normal serves (3-8 frames) are
+                    # never affected by this path.
+                    if serve_tracking_frames >= 10 and len(serve_position_history) >= 3:
+                        toss_high_y = self.serve_area_y_min + int(
+                            (self.serve_area_y_max - self.serve_area_y_min) * 0.4
+                        )
+                        recent_min_y = min(p[1] for p in serve_position_history)
+                        if recent_min_y < toss_high_y and potential_serve[1] > recent_min_y + 15:
+                            # Find the most recent position in the top portion (actual toss
+                            # ball, not the false positive which sits at a higher Y value)
+                            top_positions = [p for p in serve_position_history if p[1] < toss_high_y]
+                            toss_start = top_positions[-1] if top_positions else last_serve_candidate
+                            _dx = potential_serve[0] - toss_start[0]
+                            _dy = potential_serve[1] - toss_start[1]
+                            _dist = _math.hypot(_dx, _dy)
+                            _dir = _math.degrees(_math.atan2(_dy, _dx))
+                            self.last_motion = {
+                                'distance': _dist, 'dx': _dx, 'dy': _dy, 'direction_deg': _dir
+                            }
+                            self.last_delta = (_dx, _dy)
+                            self.ball_velocity_history = [_dist]
+                            print(f"[TRACKING_START] f{self.frame_count}: toss-in-flight detected at {toss_start} "
+                                  f"serve_tracking_frames={serve_tracking_frames} recent_min_y={recent_min_y} toss_high_y={toss_high_y}")
+                            self.ball_center = toss_start
+                            self.tracking = True
+                            self.ball_stopped = False
+                            self.initial_ball_position = serve_position_history[0]
+                            self.ball_size = None
+                            self.stuck_frame_count = 0
+                            point_start_frame = self.frame_count
+                            self.point_start_frame_internal = self.frame_count
+                            game_state = "TRACKING_POINT"
+                            serve_tracking_frames = 0
+                            last_serve_candidate = None
+                            serve_position_history = []
                     # Early serve start: if ball is moving fast rightward within serve area,
                     # start tracking immediately (don't wait for serve area exit)
                     # Require ALL consecutive pairs to move rightward (not just first-to-last)
@@ -3098,6 +3225,7 @@ class InteractiveBallAnalyzer:
                             print(f"SERVE IN PROGRESS at frame {self.frame_count}!")
                             print(f"Ball position: {potential_serve}, avg dx={avg_dx:.1f}px/frame")
                             print(f"{'='*70}\n")
+                            print(f"[TRACKING_START] f{self.frame_count}: fast-serve detected at {potential_serve} avg_dx={avg_dx:.1f}px")
                             self.ball_center = potential_serve
                             self.tracking = True
                             self.ball_stopped = False
@@ -3111,17 +3239,17 @@ class InteractiveBallAnalyzer:
                             last_serve_candidate = None
                             serve_position_history = []
                 else:
-                    # Ball not in serve area - check if it was a real serve
-                    if serve_tracking_frames >= 3 and last_serve_candidate is not None:
-                        # Check if ball was moving rightward (serve direction)
-                        is_rightward = True
-                        if len(serve_position_history) >= 2:
-                            last_pos = serve_position_history[-1]
-                            first_pos = serve_position_history[-min(3, len(serve_position_history))]
-                            dx = last_pos[0] - first_pos[0]
-                            is_rightward = dx > 10
-                        if is_rightward:
-                            # Predict where ball is now based on serve velocity
+                    # Ball exited serve area — only start tracking if it was moving at serve speed.
+                    # A real serve has avg rightward speed > 20px/frame.
+                    # A ball just sitting/bouncing in the area (false positive like f492) has near-zero speed.
+                    if serve_tracking_frames >= 3 and last_serve_candidate is not None and len(serve_position_history) >= 2:
+                        total_dx = serve_position_history[-1][0] - serve_position_history[0][0]
+                        last_dx = serve_position_history[-1][0] - serve_position_history[-2][0]
+                        last_dy = serve_position_history[-1][1] - serve_position_history[-2][1]
+                        print(f"[SERVE_EXIT_CHECK] f{self.frame_count}: tracked {serve_tracking_frames}f, total_dx={total_dx:.0f}px, last_dx={last_dx:.0f}px, last_dy={last_dy:.0f}px")
+                        # Require ball was moving rightward AND not strongly upward (which would be a toss).
+                        # A toss has large negative dy (going up); a real serve strike has dy >= -last_dx.
+                        if last_dx > 20 and last_dy >= -last_dx:
                             predicted_pos = last_serve_candidate
                             if len(serve_position_history) >= 2:
                                 p1 = serve_position_history[-2]
@@ -3130,22 +3258,47 @@ class InteractiveBallAnalyzer:
                                 _dy = p2[1] - p1[1]
                                 _dist = _math.hypot(_dx, _dy)
                                 _dir = _math.degrees(_math.atan2(_dy, _dx))
-                                # Extrapolate 1 frame ahead
-                                predicted_pos = (int(p2[0] + _dx), int(p2[1] + _dy))
-                                self.last_motion = {
-                                    'distance': _dist, 'dx': _dx, 'dy': _dy, 'direction_deg': _dir
-                                }
+                                raw_pred = (int(p2[0] + _dx), int(p2[1] + _dy))
+                                # Clamp predicted position to within frame bounds so edge-wait
+                                # mode does not trap the tracker off-screen forever.
+                                frame_h = self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 2160
+                                frame_w = self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)  or 3840
+                                predicted_pos = (
+                                    int(max(0, min(frame_w - 1, raw_pred[0]))),
+                                    int(max(0, min(frame_h - 1, raw_pred[1]))),
+                                )
+                                self.last_motion = {'distance': _dist, 'dx': _dx, 'dy': _dy, 'direction_deg': _dir}
                                 self.last_delta = (_dx, _dy)
                                 self.ball_velocity_history = [_dist]
-                            print(f"\n{'='*70}")
-                            print(f"NEXT SERVE DETECTED at frame {self.frame_count}!")
-                            print(f"Last serve pos: {last_serve_candidate}, predicted: {predicted_pos}")
-                            print(f"Starting to track the ball...")
-                            print(f"{'='*70}\n")
+                            print(f"[TRACKING_START] f{self.frame_count}: serve-exit detected at {last_serve_candidate} total_dx={total_dx:.0f}px last_dx={last_dx:.0f}px, predicted={predicted_pos}")
                             self.ball_center = predicted_pos
                             self.tracking = True
                             self.ball_stopped = False
                             self.initial_ball_position = last_serve_candidate
+                            self.ball_size = None
+                            self.stuck_frame_count = 0
+                            point_start_frame = self.frame_count
+                            self.point_start_frame_internal = self.frame_count
+                            game_state = "TRACKING_POINT"
+                        elif last_dy > 5 and last_dx >= -10 and serve_tracking_frames >= 5:
+                            # Toss-complete: ball exiting serve area downward (falling after toss).
+                            # Player is about to strike the ball just below the serve area.
+                            # Start tracking from last known position — the 200px search radius
+                            # will find the ball at the strike point.
+                            p1 = serve_position_history[-2]
+                            p2 = serve_position_history[-1]
+                            _dx = p2[0] - p1[0]
+                            _dy = p2[1] - p1[1]
+                            _dist = _math.hypot(_dx, _dy)
+                            _dir = _math.degrees(_math.atan2(_dy, _dx))
+                            self.last_motion = {'distance': _dist, 'dx': _dx, 'dy': _dy, 'direction_deg': _dir}
+                            self.last_delta = (_dx, _dy)
+                            self.ball_velocity_history = [_dist]
+                            print(f"[TRACKING_START] f{self.frame_count}: toss-complete detected at {last_serve_candidate} serve_tracking_frames={serve_tracking_frames} last_dy={last_dy:.0f}px")
+                            self.ball_center = last_serve_candidate
+                            self.tracking = True
+                            self.ball_stopped = False
+                            self.initial_ball_position = serve_position_history[0]
                             self.ball_size = None
                             self.stuck_frame_count = 0
                             point_start_frame = self.frame_count
@@ -3281,8 +3434,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Interactive tennis ball analyzer/tracker")
     parser.add_argument("--start-frame", type=int, default=0,
                         help="Frame index to start from (default 0)")
+    parser.add_argument("--auto-play", action="store_true",
+                        help="Start playing immediately without waiting for SPACE")
+    parser.add_argument("--max-frames", type=int, default=0,
+                        help="Stop after processing this many frames (0 = no limit)")
     args = parser.parse_args()
-    
+
     video_path = "20251011124747503_FV3553362380_FV3553362.mp4"
     analyzer = InteractiveBallAnalyzer(video_path, start_frame=args.start_frame)
-    analyzer.process_video()
+    analyzer.process_video(auto_play=args.auto_play, max_frames=args.max_frames)
