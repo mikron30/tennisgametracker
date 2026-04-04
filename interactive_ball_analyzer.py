@@ -66,7 +66,9 @@ class InteractiveBallAnalyzer:
         self.alt5_hsv_upper = None
         self.alt6_hsv_lower = None
         self.alt6_hsv_upper = None
-        self.disable_behind_net_mode = os.environ.get("DISABLE_BEHIND_NET", "0") == "1"
+        # Keep behind-net / near-net HSV fully disabled by default.
+        # Set DISABLE_BEHIND_NET=0 to temporarily re-enable it if needed.
+        self.disable_behind_net_mode = os.environ.get("DISABLE_BEHIND_NET", "1") == "1"
         self.direction_change_points = []
         self.show_event_markers = False
         self.last_direction = None
@@ -108,6 +110,9 @@ class InteractiveBallAnalyzer:
         self._prev_serve_gray = None
         self._ignored_serve_positions = []
         self._ignored_tracking_positions = []
+        self._persistent_false_points = []
+        self._steady_false_point_observations = []
+        self._steady_false_point_file = None
         self._frame0_hotspot_combined_mask = None
         self._frame0_hotspot_masks = {}
         self._frame0_hotspot_entries = []
@@ -202,6 +207,16 @@ class InteractiveBallAnalyzer:
         dx = curr_pos[0] - prev_pos[0]
         return self._signed_serve_dx(dx) > min_dx
 
+    def _is_descending_serve_contact_motion(self, motion=None):
+        if motion is None:
+            motion = self.last_motion
+        if motion is None:
+            return False
+        dy = float(motion.get('dy', 0.0))
+        if self.serve_direction_dy == 0:
+            return dy > 12.0
+        return self._signed_serve_dy(dy) < -12.0
+
     def _serve_direction_search_active(self):
         if not self.serve_directional_search or self.ball_center is None or self.last_motion is None:
             return False
@@ -229,8 +244,11 @@ class InteractiveBallAnalyzer:
             return False
         return True
 
-    def _build_serve_direction_region(self, x, y, frame_shape, radius):
+    def _build_serve_direction_region(self, x, y, frame_shape, radius, descending_contact=False):
         frame_height, frame_width = frame_shape[:2]
+        serve_contact_drop_band = 0
+        if self.serve_direction_dy < 0 and descending_contact:
+            serve_contact_drop_band = max(70, int(radius * 0.18))
 
         if self.serve_direction_dx < 0:
             x1 = max(0, x - radius)
@@ -241,7 +259,7 @@ class InteractiveBallAnalyzer:
 
         if self.serve_direction_dy < 0:
             y1 = max(0, y - radius)
-            y2 = min(frame_height, y + 1)
+            y2 = min(frame_height, y + serve_contact_drop_band + 1)
         elif self.serve_direction_dy > 0:
             y1 = max(0, y)
             y2 = min(frame_height, y + radius + 1)
@@ -263,12 +281,396 @@ class InteractiveBallAnalyzer:
             if entry['expires'] >= self.frame_count
         ]
 
-    def _find_ignored_tracking_position(self, pos):
+    def _prune_steady_false_point_observations(self):
+        self._steady_false_point_observations = [
+            entry for entry in getattr(self, '_steady_false_point_observations', [])
+            if (self.frame_count - entry.get('last_frame', self.frame_count)) <= 90
+        ]
+
+    def _steady_false_point_file_path(self):
+        config_path = os.path.abspath(self.config_file or "hsv_config.json")
+        base = os.path.splitext(os.path.basename(config_path))[0]
+        return os.path.join(
+            os.path.dirname(config_path),
+            f"steady_false_points_{base}.json"
+        )
+
+    def _normalize_false_point_filter_key(self, filter_key):
+        if filter_key is None:
+            return None
+        key = str(filter_key).strip().lower()
+        if not key:
+            return None
+        if key == "primary":
+            return "primary"
+        if key in ("alt", "alternative", "alternative_1", "alt1"):
+            return "alt1"
+        if key.startswith("alternative_2") or key.startswith("alt2"):
+            return "alt2"
+        if key.startswith("alternative_3") or key.startswith("alt3"):
+            return "alt3"
+        if key.startswith("alt4"):
+            return "alt4"
+        if key.startswith("alt5"):
+            return "alt5"
+        if key.startswith("alt6"):
+            return "alt6"
+        if key.startswith("behind_net") or key.startswith("at_edge"):
+            return "behind_net"
+        if key.startswith("regular") or key in ("single", "single_prefocus", "serve_area", "current"):
+            return "regular_court"
+        return key
+
+    def _candidate_false_point_filter_key(self, source, hsv_mode=None):
+        source_key = self._normalize_false_point_filter_key(source)
+        if source_key == "primary":
+            mode_key = self._normalize_false_point_filter_key(hsv_mode)
+            if mode_key not in (None, "primary"):
+                return mode_key
+            if self.using_alt3_hsv:
+                return "alt3"
+            if self.using_alt2_hsv:
+                return "alt2"
+            if self.using_alt_hsv:
+                return "alt1"
+            return "regular_court"
+        if source_key == "alt":
+            return "alt1"
+        return source_key
+
+    def _load_persistent_false_points(self):
+        self._persistent_false_points = []
+        self._steady_false_point_file = self._steady_false_point_file_path()
+        if not os.path.exists(self._steady_false_point_file):
+            return
+
+        try:
+            with open(self._steady_false_point_file, "r") as f:
+                payload = json.load(f)
+        except Exception as e:
+            print(f"Persistent false-point load failed: {e}")
+            return
+
+        raw_entries = payload.get("false_points", payload if isinstance(payload, list) else [])
+        loaded = []
+        for raw in raw_entries:
+            pos = raw.get("pos")
+            if not isinstance(pos, (list, tuple)) or len(pos) < 2:
+                continue
+            filter_keys = raw.get("filter_keys", raw.get("filters", []))
+            if not isinstance(filter_keys, list):
+                filter_keys = [filter_keys]
+            normalized_keys = []
+            for key in filter_keys:
+                norm = self._normalize_false_point_filter_key(key)
+                if norm is not None and norm not in normalized_keys:
+                    normalized_keys.append(norm)
+            loaded.append({
+                "pos": (int(pos[0]), int(pos[1])),
+                "radius": int(raw.get("radius", 20)),
+                "count": int(raw.get("count", 1)),
+                "reason": raw.get("reason", "persistent false point"),
+                "filter_keys": normalized_keys,
+            })
+
+        self._persistent_false_points = loaded
+        print(
+            f"Loaded {len(self._persistent_false_points)} persistent false points "
+            f"from {os.path.basename(self._steady_false_point_file)}"
+        )
+
+    def _save_persistent_false_points(self):
+        if self._steady_false_point_file is None:
+            self._steady_false_point_file = self._steady_false_point_file_path()
+        payload = {
+            "config": os.path.basename(self.config_file or "hsv_config.json"),
+            "false_points": [
+                {
+                    "pos": [int(entry["pos"][0]), int(entry["pos"][1])],
+                    "radius": int(entry.get("radius", 20)),
+                    "count": int(entry.get("count", 1)),
+                    "reason": entry.get("reason", "persistent false point"),
+                    "filter_keys": list(entry.get("filter_keys", [])),
+                }
+                for entry in getattr(self, "_persistent_false_points", [])
+            ],
+        }
+        try:
+            with open(self._steady_false_point_file, "w") as f:
+                json.dump(payload, f, indent=2)
+        except Exception as e:
+            print(f"Persistent false-point save failed: {e}")
+
+    def _find_persistent_false_point(self, pos, filter_key=None):
+        px, py = pos
+        normalized_key = self._normalize_false_point_filter_key(filter_key)
+        alt_family = {"alt2", "alt4", "alt5", "alt6"}
+        for entry in getattr(self, "_persistent_false_points", []):
+            entry_keys = entry.get("filter_keys", [])
+            if normalized_key is not None and entry_keys:
+                if normalized_key not in entry_keys:
+                    if normalized_key not in alt_family or not alt_family.intersection(entry_keys):
+                        continue
+            dist = math.hypot(px - entry["pos"][0], py - entry["pos"][1])
+            if dist <= entry["radius"]:
+                return entry
+        return None
+
+    def _find_false_point_for_diagnostics(self, pos):
+        return self._find_persistent_false_point(pos, filter_key=None)
+
+    def _learn_persistent_false_point(self, pos, filter_key, radius=22, reason="steady false point", count=1):
+        normalized_key = self._normalize_false_point_filter_key(filter_key)
+        if normalized_key is None:
+            return None
+
+        for entry in self._persistent_false_points:
+            dist = math.hypot(pos[0] - entry["pos"][0], pos[1] - entry["pos"][1])
+            if dist > max(radius, entry.get("radius", 0)):
+                continue
+            keys = entry.setdefault("filter_keys", [])
+            if normalized_key not in keys:
+                keys.append(normalized_key)
+            merged_count = max(int(entry.get("count", 1)), int(count))
+            old_x, old_y = entry["pos"]
+            entry["pos"] = (
+                int(round((old_x * merged_count + pos[0]) / (merged_count + 1))),
+                int(round((old_y * merged_count + pos[1]) / (merged_count + 1))),
+            )
+            entry["radius"] = max(int(entry.get("radius", radius)), int(radius))
+            entry["count"] = merged_count + 1
+            entry["reason"] = reason
+            self._save_persistent_false_points()
+            print(
+                f"[FALSE_POINT_LEARN] f{self.frame_count}: refresh {normalized_key} false point "
+                f"at {entry['pos']} radius={entry['radius']} reason={reason}"
+            )
+            return entry
+
+        entry = {
+            "pos": (int(pos[0]), int(pos[1])),
+            "radius": int(radius),
+            "count": int(max(1, count)),
+            "reason": reason,
+            "filter_keys": [normalized_key],
+        }
+        self._persistent_false_points.append(entry)
+        self._save_persistent_false_points()
+        print(
+            f"[FALSE_POINT_LEARN] f{self.frame_count}: learned {normalized_key} false point "
+            f"at {entry['pos']} radius={entry['radius']} reason={reason}"
+        )
+        return entry
+
+    def _observe_steady_false_point(self, pos, filter_key, area, motion_mean, motion_max, reason):
+        normalized_key = self._normalize_false_point_filter_key(filter_key)
+        if normalized_key not in ("alt2", "alt6", "alt4", "alt5"):
+            return False
+        if area > 18.0 or motion_mean > 3.5 or motion_max > 12.0:
+            return False
+        if self.ball_center is not None and math.hypot(pos[0] - self.ball_center[0], pos[1] - self.ball_center[1]) < 35.0:
+            return False
+        if self._find_persistent_false_point(pos, filter_key=normalized_key) is not None:
+            return True
+
+        self._prune_steady_false_point_observations()
+        for entry in self._steady_false_point_observations:
+            if entry["filter_key"] != normalized_key:
+                continue
+            dist = math.hypot(pos[0] - entry["pos"][0], pos[1] - entry["pos"][1])
+            if dist > entry["radius"]:
+                continue
+            if entry["last_frame"] != self.frame_count:
+                old_count = entry["count"]
+                entry["count"] = old_count + 1
+                old_x, old_y = entry["pos"]
+                entry["pos"] = (
+                    int(round((old_x * old_count + pos[0]) / entry["count"])),
+                    int(round((old_y * old_count + pos[1]) / entry["count"])),
+                )
+            entry["last_frame"] = self.frame_count
+            entry["reason"] = reason
+            if entry["count"] >= 3:
+                self._learn_persistent_false_point(
+                    entry["pos"],
+                    normalized_key,
+                    radius=entry["radius"] + 4,
+                    reason=reason,
+                    count=entry["count"],
+                )
+                self._steady_false_point_observations.remove(entry)
+                return True
+            return False
+
+        self._steady_false_point_observations.append({
+            "pos": (int(pos[0]), int(pos[1])),
+            "radius": 18,
+            "count": 1,
+            "last_frame": self.frame_count,
+            "filter_key": normalized_key,
+            "reason": reason,
+        })
+        return False
+
+    def _erase_diagnostic_false_points(self, mask, x1, y1):
+        if mask is None or mask.size == 0:
+            return 0
+        hidden = 0
+        for entry in getattr(self, "_persistent_false_points", []):
+            px, py = entry["pos"]
+            local_x = int(px - x1)
+            local_y = int(py - y1)
+            if local_x < 0 or local_y < 0 or local_x >= mask.shape[1] or local_y >= mask.shape[0]:
+                continue
+            radius = max(6, int(entry.get("radius", 12)))
+            cv2.circle(mask, (local_x, local_y), radius, 0, -1)
+            hidden += 1
+        return hidden
+
+    def _prefer_regular_tracking_candidate(self, candidate_meta, predicted_point):
+        if self.ball_center is None or not candidate_meta:
+            return None
+        if getattr(self, "ground_bounce_count", 0) <= 0:
+            return None
+        if self.ball_center[1] > 260:
+            return None
+        if self.last_motion is not None and self.last_motion.get("distance", 0.0) > 45.0:
+            return None
+
+        best_entry = min(candidate_meta, key=lambda entry: entry["score"])
+        if best_entry.get("filter_key") == "regular_court":
+            return None
+
+        alt_family = {"alt1", "alt2", "alt3", "alt4", "alt5", "alt6"}
+        if best_entry.get("filter_key") not in alt_family:
+            return None
+
+        regular_candidates = [
+            entry for entry in candidate_meta
+            if entry.get("filter_key") == "regular_court"
+        ]
+        if not regular_candidates:
+            return None
+
+        regular_best = min(regular_candidates, key=lambda entry: (entry["score"], entry["distance"]))
+        pos_gap = math.hypot(
+            regular_best["pos"][0] - best_entry["pos"][0],
+            regular_best["pos"][1] - best_entry["pos"][1],
+        )
+        regular_pred = regular_best.get("predicted_distance")
+        best_pred = best_entry.get("predicted_distance")
+        regular_close_to_track = regular_best["distance"] <= best_entry["distance"] + 18.0
+        regular_close_to_pred = (
+            predicted_point is None or
+            regular_pred is None or
+            best_pred is None or
+            regular_pred <= best_pred + 24.0
+        )
+        regular_only = len(regular_candidates) == 1
+        score_margin = 85.0 if best_entry["filter_key"] in {"alt4", "alt5", "alt6"} else 42.0
+        if regular_only:
+            score_margin += 15.0
+
+        if (pos_gap <= 32.0 and
+                regular_best["score"] <= best_entry["score"] + score_margin and
+                regular_close_to_track and regular_close_to_pred):
+            print(
+                f"  DEBUG: Regular precedence -> preferring {regular_best['pos']} "
+                f"score={regular_best['score']:.1f} over {best_entry['pos']} "
+                f"from {best_entry['filter_key']}"
+            )
+            return regular_best
+
+        return None
+
+    def _find_single_standard_candidate(self, search_frame, x1, y1, prev_pos, predicted_point, frame_gray):
+        if prev_pos is None:
+            return None
+
+        lower, upper, label = self.get_standard_hsv_for_position(prev_pos[1])
+        if label != "regular_court" or lower is None or upper is None:
+            return None
+
+        hsv_frame = cv2.cvtColor(search_frame, cv2.COLOR_BGR2HSV)
+        kernel = np.ones((2, 2), np.uint8)
+        mask = cv2.inRange(hsv_frame, lower, upper)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        valid = []
+        contact_bounds = self._contact_reacquire_bounds(frame_gray.shape if frame_gray is not None else search_frame.shape, prev_pos)
+        max_area = max(150, self.serve_ball_size_max)
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            if area < 1 or area > max_area:
+                continue
+            if self.ball_size and self.ball_size > 40 and area < max(5, int(self.ball_size * 0.08)):
+                continue
+
+            M = cv2.moments(contour)
+            if M["m00"] == 0:
+                continue
+            cx = int(M["m10"] / M["m00"]) + x1
+            cy = int(M["m01"] / M["m00"]) + y1
+
+            ignored_entry = self._find_ignored_tracking_position((cx, cy), filter_key="regular_court")
+            if ignored_entry is not None:
+                continue
+            if contact_bounds is not None and (
+                    cx < contact_bounds["min_x"] or
+                    cx > contact_bounds["max_x"] or
+                    cy < contact_bounds["min_y"]):
+                continue
+
+            motion_metrics = self._candidate_motion_metrics(frame_gray, cx, cy)
+            motion_mean = motion_metrics["mean"] if motion_metrics is not None else 0.0
+            motion_max = motion_metrics["max"] if motion_metrics is not None else 0.0
+            frame0_hotspot = self._find_frame0_background_hotspot((cx, cy))
+            if frame0_hotspot is not None and motion_mean < 8.0 and motion_max < 35.0:
+                continue
+            if cy < 100 and motion_mean < 2.5 and motion_max < 10.0:
+                continue
+
+            distance = math.hypot(cx - prev_pos[0], cy - prev_pos[1])
+            size_ratio = 0.0
+            if self.ball_size and self.ball_size > 0:
+                size_ratio = abs(area - self.ball_size) / self.ball_size
+            predicted_distance = (
+                math.hypot(cx - predicted_point[0], cy - predicted_point[1])
+                if predicted_point is not None else None
+            )
+            score = distance + (size_ratio * 30.0)
+            if predicted_distance is not None:
+                score += predicted_distance * 0.4
+
+            valid.append({
+                "pos": (cx, cy),
+                "area": area,
+                "score": score,
+                "distance": distance,
+                "predicted_distance": predicted_distance,
+                "contour": contour,
+            })
+
+        if len(valid) != 1:
+            return None
+
+        candidate = valid[0]
+        print(
+            f"  DEBUG: Single regular candidate -> {candidate['pos']} "
+            f"area={candidate['area']:.1f} score={candidate['score']:.1f}"
+        )
+        return candidate
+
+    def _find_ignored_tracking_position(self, pos, filter_key=None):
         px, py = pos
         for entry in getattr(self, '_ignored_tracking_positions', []):
             dist = math.hypot(px - entry['pos'][0], py - entry['pos'][1])
             if dist <= entry['radius']:
                 return entry
+        if filter_key is not None:
+            return self._find_persistent_false_point(pos, filter_key=filter_key)
         return None
 
     def _learn_ignored_tracking_position(self, pos, radius=70, ttl=180, reason="static tracking hotspot"):
@@ -489,6 +891,105 @@ class InteractiveBallAnalyzer:
             'mean': float(np.mean(diff)),
             'max': float(np.max(diff)),
         }
+
+    def _collect_override_candidate_metrics(self, pos, area, prev_pos, predicted_point, frame_gray):
+        motion_metrics = self._candidate_motion_metrics(frame_gray, pos[0], pos[1])
+        motion_mean = motion_metrics['mean'] if motion_metrics is not None else 0.0
+        motion_max = motion_metrics['max'] if motion_metrics is not None else 0.0
+        prev_distance = math.hypot(pos[0] - prev_pos[0], pos[1] - prev_pos[1]) if prev_pos is not None else 0.0
+        predicted_distance = (
+            math.hypot(pos[0] - predicted_point[0], pos[1] - predicted_point[1])
+            if predicted_point is not None else None
+        )
+        frame0_hotspot = self._find_frame0_background_hotspot(pos)
+        static_hotspot = (
+            (area <= 3 and motion_mean < 1.0 and motion_max <= 5.0) or
+            (pos[1] < 100 and motion_mean < 2.5 and motion_max < 10.0)
+        )
+        frame0_background = (
+            frame0_hotspot is not None and
+            (motion_metrics is None or (motion_mean < 8.0 and motion_max < 35.0))
+        )
+        return {
+            'motion_mean': motion_mean,
+            'motion_max': motion_max,
+            'prev_distance': prev_distance,
+            'predicted_distance': predicted_distance,
+            'frame0_hotspot': frame0_hotspot,
+            'frame0_background': frame0_background,
+            'static_hotspot': static_hotspot,
+        }
+
+    def _should_accept_hsv_override(self, label, override, current_pos, current_area, prev_pos,
+                                    predicted_point, frame_gray, current_filter_key=None):
+        if override is None or current_pos is None or prev_pos is None:
+            return override is not None
+
+        override_metrics = self._collect_override_candidate_metrics(
+            override['pos'], override['area'], prev_pos, predicted_point, frame_gray
+        )
+        if override_metrics['static_hotspot'] or override_metrics['frame0_background']:
+            reason = (
+                f"static patch mean={override_metrics['motion_mean']:.1f} "
+                f"max={override_metrics['motion_max']:.1f}"
+            )
+            hotspot = override_metrics['frame0_hotspot']
+            if override_metrics['frame0_background'] and hotspot is not None:
+                hotspot_pos = tuple(hotspot.get('pos', list(override['pos'])))
+                hotspot_radius = hotspot.get('radius', 0)
+                reason = f"frame0 hotspot at {hotspot_pos} r={hotspot_radius}"
+            print(f"  DEBUG: Rejecting {label} override at {override['pos']} - {reason}")
+            return False
+
+        current_metrics = self._collect_override_candidate_metrics(
+            current_pos, current_area, prev_pos, predicted_point, frame_gray
+        )
+        current_dynamic = (
+            current_metrics['motion_max'] >= 20.0 or
+            current_metrics['motion_mean'] >= 6.0
+        )
+        override_weaker_motion = (
+            override_metrics['motion_max'] + 15.0 < current_metrics['motion_max'] and
+            override_metrics['motion_mean'] + 3.0 < current_metrics['motion_mean']
+        )
+        override_farther_from_prev = (
+            override_metrics['prev_distance'] > current_metrics['prev_distance'] + 35.0
+        )
+        override_farther_from_predicted = (
+            predicted_point is not None and
+            current_metrics['predicted_distance'] is not None and
+            override_metrics['predicted_distance'] is not None and
+            override_metrics['predicted_distance'] > current_metrics['predicted_distance'] + 25.0
+        )
+        if current_dynamic and override_weaker_motion and (
+                override_farther_from_prev or override_farther_from_predicted):
+            print(
+                f"  DEBUG: Rejecting {label} override at {override['pos']} - "
+                f"current pick {current_pos} is more dynamic and closer to track"
+            )
+            return False
+
+        if current_filter_key == "regular_court":
+            override_much_closer = (
+                override_metrics['prev_distance'] + 18.0 < current_metrics['prev_distance']
+            )
+            if (predicted_point is not None and
+                    current_metrics['predicted_distance'] is not None and
+                    override_metrics['predicted_distance'] is not None and
+                    override_metrics['predicted_distance'] + 15.0 < current_metrics['predicted_distance']):
+                override_much_closer = True
+            override_much_more_dynamic = (
+                override_metrics['motion_max'] > current_metrics['motion_max'] + 20.0 or
+                override_metrics['motion_mean'] > current_metrics['motion_mean'] + 4.0
+            )
+            if not override_much_closer and not override_much_more_dynamic:
+                print(
+                    f"  DEBUG: Rejecting {label} override at {override['pos']} - "
+                    f"keeping regular candidate {current_pos}"
+                )
+                return False
+
+        return True
 
     def _contact_reacquire_bounds(self, frame_shape, reference_pos):
         """Return a plausible reacquire window for upper-court contact recovery."""
@@ -768,7 +1269,7 @@ class InteractiveBallAnalyzer:
         return picked
 
     def retrack_with_alt_hsv(self, search_frame, x1, y1, prev_pos, predicted_point, prev_ball_size, allow_inactive,
-                             frame_gray=None):
+                             frame_gray=None, filter_key="alt1"):
         """Re-run detection with alternative HSV only after focus loss."""
         if self.alt_focus_hsv_lower is None or self.alt_focus_hsv_upper is None:
             return None
@@ -809,7 +1310,7 @@ class InteractiveBallAnalyzer:
             cy = int(M["m01"] / M["m00"]) + y1
 
             if not allow_inactive:
-                ignored_entry = self._find_ignored_tracking_position((cx, cy))
+                ignored_entry = self._find_ignored_tracking_position((cx, cy), filter_key=filter_key)
                 if ignored_entry is not None:
                     print(f"  DEBUG: retrack_using_alt skipping learned hotspot at ({cx},{cy}) "
                           f"reason={ignored_entry.get('reason', 'n/a')}")
@@ -902,7 +1403,7 @@ class InteractiveBallAnalyzer:
         }
 
     def retrack_with_alt2_hsv(self, search_frame, x1, y1, prev_pos, predicted_point, prev_ball_size, allow_inactive,
-                              lower=None, upper=None, frame_gray=None):
+                              lower=None, upper=None, frame_gray=None, filter_key="alt2"):
         """Re-run detection with alternative 2 HSV (H 46-72) when stuck."""
         hsv_lower = lower if lower is not None else self.alt2_hsv_lower
         hsv_upper = upper if upper is not None else self.alt2_hsv_upper
@@ -944,7 +1445,7 @@ class InteractiveBallAnalyzer:
             cy = int(M["m01"] / M["m00"]) + y1
 
             if not allow_inactive:
-                ignored_entry = self._find_ignored_tracking_position((cx, cy))
+                ignored_entry = self._find_ignored_tracking_position((cx, cy), filter_key=filter_key)
                 if ignored_entry is not None:
                     print(f"  DEBUG: retrack_using_alt2 skipping learned hotspot at ({cx},{cy}) "
                           f"reason={ignored_entry.get('reason', 'n/a')}")
@@ -1101,7 +1602,8 @@ class InteractiveBallAnalyzer:
         for label, lower, upper in self._get_upper_exit_low_s_hsv_specs():
             retrack = self.retrack_with_alt2_hsv(
                 search_frame, x1, y1, prev_pos, predicted_point, self.ball_size, False,
-                lower=lower, upper=upper, frame_gray=frame_gray
+                lower=lower, upper=upper, frame_gray=frame_gray,
+                filter_key=self._normalize_false_point_filter_key(label)
             )
             if retrack is None:
                 continue
@@ -1171,7 +1673,7 @@ class InteractiveBallAnalyzer:
                 continue
             retrack = self.retrack_with_alt2_hsv(
                 search_frame, x1, y1, self.ball_center, predicted_point, self.ball_size, False,
-                lower=lower, upper=upper, frame_gray=frame_gray
+                lower=lower, upper=upper, frame_gray=frame_gray, filter_key=label
             )
             if retrack is None:
                 continue
@@ -1204,6 +1706,7 @@ class InteractiveBallAnalyzer:
         mask = cv2.inRange(hsv_region, lower, upper)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+        self._erase_diagnostic_false_points(mask, x1, y1)
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
         local_display = region.copy()
@@ -1305,50 +1808,64 @@ class InteractiveBallAnalyzer:
             with open(self.config_file, "r") as f:
                 config = json.load(f)
                 
-                # Check if new format (with regular_court and behind_net)
-                if "regular_court" in config and "behind_net" in config:
-                    # New format with two HSV sets
+                # Newer configs may store the primary HSV set under regular_court,
+                # with behind_net either present (dual mode) or omitted (single mode).
+                if "regular_court" in config:
+                    regular_cfg = config["regular_court"]
                     self.hsv_regular = {
-                        'lower': np.array([config["regular_court"]["h_min"], config["regular_court"]["s_min"], config["regular_court"]["v_min"]], dtype=np.uint8),
-                        'upper': np.array([config["regular_court"]["h_max"], config["regular_court"]["s_max"], config["regular_court"]["v_max"]], dtype=np.uint8)
-                    }
-                    self.hsv_behind_net = {
-                        'lower': np.array([config["behind_net"]["h_min"], config["behind_net"]["s_min"], config["behind_net"]["v_min"]], dtype=np.uint8),
-                        'upper': np.array([config["behind_net"]["h_max"], config["behind_net"]["s_max"], config["behind_net"]["v_max"]], dtype=np.uint8)
+                        'lower': np.array([regular_cfg["h_min"], regular_cfg["s_min"], regular_cfg["v_min"]], dtype=np.uint8),
+                        'upper': np.array([regular_cfg["h_max"], regular_cfg["s_max"], regular_cfg["v_max"]], dtype=np.uint8)
                     }
                     self.pre_focus_hsv_regular = {
                         'lower': self.hsv_regular['lower'].copy(),
                         'upper': self.hsv_regular['upper'].copy()
                     }
                     self.pre_focus_hsv_regular['upper'][0] = min(self.pre_focus_hsv_regular['upper'][0], 73)
-                    self.pre_focus_hsv_behind_net = {
-                        'lower': self.hsv_behind_net['lower'].copy(),
-                        'upper': self.hsv_behind_net['upper'].copy()
-                    }
-                    self.pre_focus_hsv_behind_net['upper'][0] = min(self.pre_focus_hsv_behind_net['upper'][0], 73)
-                    self.net_area_y_min = config.get("net_area_y_min", 250)
-                    self.net_area_y_max = config.get("net_area_y_max", 350)
-                    
-                    # Load high/low net boundaries if available
-                    if "high_net_y_min" in config:
-                        self.high_net_y_min = config["high_net_y_min"]
-                        self.high_net_y_max = config["high_net_y_max"]
-                    if "low_net_y_min" in config:
-                        self.low_net_y_min = config["low_net_y_min"]
-                        self.low_net_y_max = config["low_net_y_max"]
-                    
+
+                    if "behind_net" in config:
+                        behind_net_cfg = config["behind_net"]
+                        self.hsv_behind_net = {
+                            'lower': np.array([behind_net_cfg["h_min"], behind_net_cfg["s_min"], behind_net_cfg["v_min"]], dtype=np.uint8),
+                            'upper': np.array([behind_net_cfg["h_max"], behind_net_cfg["s_max"], behind_net_cfg["v_max"]], dtype=np.uint8)
+                        }
+                        self.pre_focus_hsv_behind_net = {
+                            'lower': self.hsv_behind_net['lower'].copy(),
+                            'upper': self.hsv_behind_net['upper'].copy()
+                        }
+                        self.pre_focus_hsv_behind_net['upper'][0] = min(self.pre_focus_hsv_behind_net['upper'][0], 73)
+                        self.net_area_y_min = config.get("net_area_y_min", 250)
+                        self.net_area_y_max = config.get("net_area_y_max", 350)
+                        
+                        # Load high/low net boundaries if available
+                        if "high_net_y_min" in config:
+                            self.high_net_y_min = config["high_net_y_min"]
+                            self.high_net_y_max = config["high_net_y_max"]
+                        if "low_net_y_min" in config:
+                            self.low_net_y_min = config["low_net_y_min"]
+                            self.low_net_y_max = config["low_net_y_max"]
+                        
+                        if self.disable_behind_net_mode:
+                            print(f"Loaded REGULAR HSV config:")
+                            print(f"  Regular court: H:{regular_cfg['h_min']}-{regular_cfg['h_max']}, S:{regular_cfg['s_min']}-{regular_cfg['s_max']}, V:{regular_cfg['v_min']}-{regular_cfg['v_max']}")
+                            print(f"  Behind-net HSV disabled")
+                        else:
+                            print(f"Loaded DUAL HSV config:")
+                            print(f"  Regular court: H:{regular_cfg['h_min']}-{regular_cfg['h_max']}, S:{regular_cfg['s_min']}-{regular_cfg['s_max']}, V:{regular_cfg['v_min']}-{regular_cfg['v_max']}")
+                            print(f"  Behind net: H:{behind_net_cfg['h_min']}-{behind_net_cfg['h_max']}, S:{behind_net_cfg['s_min']}-{behind_net_cfg['s_max']}, V:{behind_net_cfg['v_min']}-{behind_net_cfg['v_max']}")
+                            print(f"  Net area: Y={self.net_area_y_min}-{self.net_area_y_max}")
+                            if hasattr(self, 'high_net_y_min') and hasattr(self, 'low_net_y_min'):
+                                print(f"    HIGH NET: Y={self.high_net_y_min}-{self.high_net_y_max}")
+                                print(f"    LOW NET: Y={self.low_net_y_min}-{self.low_net_y_max}")
+                    else:
+                        self.hsv_behind_net = None
+                        self.pre_focus_hsv_behind_net = None
+                        print(f"Loaded REGULAR HSV config:")
+                        print(f"  Regular court: H:{regular_cfg['h_min']}-{regular_cfg['h_max']}, S:{regular_cfg['s_min']}-{regular_cfg['s_max']}, V:{regular_cfg['v_min']}-{regular_cfg['v_max']}")
+
                     # Set initial HSV to regular court
                     self.hsv_lower = self.hsv_regular['lower']
                     self.hsv_upper = self.hsv_regular['upper']
-                    
-                    print(f"Loaded DUAL HSV config:")
-                    print(f"  Regular court: H:{config['regular_court']['h_min']}-{config['regular_court']['h_max']}, S:{config['regular_court']['s_min']}-{config['regular_court']['s_max']}, V:{config['regular_court']['v_min']}-{config['regular_court']['v_max']}")
-                    print(f"  Behind net: H:{config['behind_net']['h_min']}-{config['behind_net']['h_max']}, S:{config['behind_net']['s_min']}-{config['behind_net']['s_max']}, V:{config['behind_net']['v_min']}-{config['behind_net']['v_max']}")
-                    print(f"  Net area: Y={self.net_area_y_min}-{self.net_area_y_max}")
-                    if hasattr(self, 'high_net_y_min') and hasattr(self, 'low_net_y_min'):
-                        print(f"    HIGH NET: Y={self.high_net_y_min}-{self.high_net_y_max}")
-                        print(f"    LOW NET: Y={self.low_net_y_min}-{self.low_net_y_max}")
-                    
+
                     # Load serve area boundaries if available
                     if "serve_area_x_min" in config:
                         self.serve_area_points = config.get('serve_area_points', [])
@@ -1462,6 +1979,7 @@ class InteractiveBallAnalyzer:
                 self.hsv_lower = self.primary_hsv_lower
                 self.hsv_upper = self.primary_hsv_upper
                 self._build_frame0_background_hotspots()
+                self._load_persistent_false_points()
                 return config
         except Exception as e:
             print(f"Error loading config: {e}")
@@ -1870,8 +2388,10 @@ class InteractiveBallAnalyzer:
         return False
     
     def analyze_ball_at_point(self, frame, point):
-        """Analyze ball at the clicked point - simple version without HSV tuner."""
+        """Analyze a clicked ball position and open the HSV tuner windows."""
         x, y = point
+        prev_pos = self.ball_center
+        was_tracking = self.tracking and prev_pos is not None
         
         # Store the initial marked position to return to after ball stops
         self.initial_ball_position = point
@@ -1885,7 +2405,10 @@ class InteractiveBallAnalyzer:
         
         region = frame[y1:y2, x1:x2]
         hsv_region = cv2.cvtColor(region, cv2.COLOR_BGR2HSV)
-        mask = cv2.inRange(hsv_region, self.hsv_lower, self.hsv_upper)
+        if self.hsv_lower is not None and self.hsv_upper is not None:
+            mask = cv2.inRange(hsv_region, self.hsv_lower, self.hsv_upper)
+        else:
+            mask = np.zeros(hsv_region.shape[:2], dtype=np.uint8)
         
         # Calculate bulb size
         bulb_size = np.sum(mask > 0)
@@ -1903,8 +2426,7 @@ class InteractiveBallAnalyzer:
         self.ball_velocity_history = []  # Track recent velocities to detect stop
         
         # Track if this is a recovery from a lost ball
-        if hasattr(self, 'ball_center') and self.ball_center is not None and self.tracking:
-            prev_pos = self.ball_center
+        if was_tracking:
             print(f"\n{'='*70}")
             print(f"=== BALL TRACKING LOST - MANUAL RECOVERY NEEDED ===")
             print(f"{'='*70}")
@@ -1915,13 +2437,19 @@ class InteractiveBallAnalyzer:
             
             # Check if HSV of new ball is within our filter range
             print(f"\nHSV Analysis:")
-            print(f"  Current HSV filter: H={self.hsv_lower[0]}-{self.hsv_upper[0]}, S={self.hsv_lower[1]}-{self.hsv_upper[1]}, V={self.hsv_lower[2]}-{self.hsv_upper[2]}")
+            if self.hsv_lower is not None and self.hsv_upper is not None:
+                print(f"  Current HSV filter: H={self.hsv_lower[0]}-{self.hsv_upper[0]}, S={self.hsv_lower[1]}-{self.hsv_upper[1]}, V={self.hsv_lower[2]}-{self.hsv_upper[2]}")
+            else:
+                print("  Current HSV filter: not initialized")
             print(f"  Ball HSV at new position: H={hsv_values[0]}, S={hsv_values[1]}, V={hsv_values[2]}")
             
             # Check each component
-            h_in_range = self.hsv_lower[0] <= hsv_values[0] <= self.hsv_upper[0]
-            s_in_range = self.hsv_lower[1] <= hsv_values[1] <= self.hsv_upper[1]
-            v_in_range = self.hsv_lower[2] <= hsv_values[2] <= self.hsv_upper[2]
+            if self.hsv_lower is not None and self.hsv_upper is not None:
+                h_in_range = self.hsv_lower[0] <= hsv_values[0] <= self.hsv_upper[0]
+                s_in_range = self.hsv_lower[1] <= hsv_values[1] <= self.hsv_upper[1]
+                v_in_range = self.hsv_lower[2] <= hsv_values[2] <= self.hsv_upper[2]
+            else:
+                h_in_range = s_in_range = v_in_range = False
             
             print(f"  H in range: {h_in_range} {'[OK]' if h_in_range else '[OUT OF RANGE!]'}")
             print(f"  S in range: {s_in_range} {'[OK]' if s_in_range else '[OUT OF RANGE!]'}")
@@ -1936,377 +2464,293 @@ class InteractiveBallAnalyzer:
             
             print(f"{'='*70}")
             
-            # Show interactive HSV filter tuner with bulb sizes
-            self._open_interactive_hsv_tuner(frame, prev_pos)
         else:
             print(f"\n=== BALL MARKED AT ({x}, {y}) ===")
         
         print(f"HSV at point: H={hsv_values[0]}, S={hsv_values[1]}, V={hsv_values[2]}")
-        print(f"HSV Filter: H={self.hsv_lower[0]}-{self.hsv_upper[0]}, S={self.hsv_lower[1]}-{self.hsv_upper[1]}, V={self.hsv_lower[2]}-{self.hsv_upper[2]} (Tennis ball optimized)")
+        if self.hsv_lower is not None and self.hsv_upper is not None:
+            print(f"HSV Filter: H={self.hsv_lower[0]}-{self.hsv_upper[0]}, S={self.hsv_lower[1]}-{self.hsv_upper[1]}, V={self.hsv_lower[2]}-{self.hsv_upper[2]} (Tennis ball optimized)")
+        else:
+            print("HSV Filter: not initialized")
         print(f"Bulb size: {bulb_size} pixels")
         print(f"Initial position saved: ({x}, {y})")
-        print("Ball tracking enabled! Press 'D' to advance to next frame")
+        print("Ball tracking enabled! Press 'Q' or ESC to close the HSV windows, then 'D' to advance to next frame")
         
         # Add to table
+        hsv_range = None
+        if self.hsv_lower is not None and self.hsv_upper is not None:
+            hsv_range = [self.hsv_lower[0], self.hsv_upper[0], self.hsv_lower[1], self.hsv_upper[1], self.hsv_lower[2], self.hsv_upper[2]]
         self.hsv_table.append({
             'frame': self.frame_count,
             'position': (x, y),
             'hsv': hsv_values.tolist(),
             'bulb_size': bulb_size,
-            'hsv_range': [self.hsv_lower[0], self.hsv_upper[0], self.hsv_lower[1], self.hsv_upper[1], self.hsv_lower[2], self.hsv_upper[2]]
+            'hsv_range': hsv_range
         })
         
+        self._open_interactive_hsv_tuner(frame, point)
+        
         return True
+
+    def _get_click_hsv_tuner_specs(self):
+        specs = []
+
+        def _append(config_key, label, lower, upper):
+            if lower is None or upper is None:
+                return
+            specs.append({
+                'config_key': config_key,
+                'label': label,
+                'lower': lower.copy(),
+                'upper': upper.copy(),
+                'bulb_min': 3,
+                'bulb_max': 80,
+            })
+
+        regular_lower = regular_upper = None
+        if self.hsv_regular is not None:
+            regular_lower = self.hsv_regular['lower']
+            regular_upper = self.hsv_regular['upper']
+        elif self.primary_hsv_lower is not None and self.primary_hsv_upper is not None:
+            regular_lower = self.primary_hsv_lower
+            regular_upper = self.primary_hsv_upper
+        else:
+            regular_lower = self.hsv_lower
+            regular_upper = self.hsv_upper
+
+        _append("regular_court", "REGULAR COURT", regular_lower, regular_upper)
+        _append("alt1", "ALT1", self.alt_focus_hsv_lower, self.alt_focus_hsv_upper)
+        _append("alt2", "ALT2", self.alt2_hsv_lower, self.alt2_hsv_upper)
+        _append("alt3", "ALT3", self.alt3_hsv_lower, self.alt3_hsv_upper)
+        _append("alt4", "ALT4", self.alt4_hsv_lower, self.alt4_hsv_upper)
+        _append("alt5", "ALT5", self.alt5_hsv_lower, self.alt5_hsv_upper)
+        _append("alt6", "ALT6", self.alt6_hsv_lower, self.alt6_hsv_upper)
+        return specs
+
+    def _apply_click_hsv_tuner_updates(self, specs):
+        for spec in specs:
+            lower = spec['final_lower'].copy()
+            upper = spec['final_upper'].copy()
+            key = spec['config_key']
+
+            if key == "regular_court":
+                if self.hsv_regular is not None:
+                    self.hsv_regular['lower'] = lower.copy()
+                    self.hsv_regular['upper'] = upper.copy()
+                if self.primary_hsv_lower is not None and self.primary_hsv_upper is not None:
+                    self.primary_hsv_lower = lower.copy()
+                    self.primary_hsv_upper = upper.copy()
+                if self.pre_focus_hsv_regular is not None:
+                    self.pre_focus_hsv_regular = {
+                        'lower': lower.copy(),
+                        'upper': upper.copy(),
+                    }
+                    self.pre_focus_hsv_regular['upper'][0] = min(self.pre_focus_hsv_regular['upper'][0], 73)
+                if self.alt_hsv_lower is not None and self.alt_hsv_upper is not None:
+                    self.alt_hsv_lower = lower.copy()
+                    self.alt_hsv_upper = upper.copy()
+                    self.alt_hsv_upper[0] = min(self.alt_hsv_upper[0], 73)
+                in_net_area = (
+                    self.ball_center is not None and
+                    hasattr(self, 'net_area_y_min') and hasattr(self, 'net_area_y_max') and
+                    self._behind_net_enabled() and
+                    self.net_area_y_min <= self.ball_center[1] <= self.net_area_y_max
+                )
+                if not in_net_area and not self.using_alt_hsv and not self.using_alt2_hsv and not self.using_alt3_hsv:
+                    self.hsv_lower = lower.copy()
+                    self.hsv_upper = upper.copy()
+            elif key == "alt1":
+                self.alt_focus_hsv_lower = lower.copy()
+                self.alt_focus_hsv_upper = upper.copy()
+                if self.using_alt_hsv:
+                    self.hsv_lower = lower.copy()
+                    self.hsv_upper = upper.copy()
+            elif key == "alt2":
+                self.alt2_hsv_lower = lower.copy()
+                self.alt2_hsv_upper = upper.copy()
+                if self.using_alt2_hsv:
+                    self.hsv_lower = lower.copy()
+                    self.hsv_upper = upper.copy()
+            elif key == "alt3":
+                self.alt3_hsv_lower = lower.copy()
+                self.alt3_hsv_upper = upper.copy()
+                if self.using_alt3_hsv:
+                    self.hsv_lower = lower.copy()
+                    self.hsv_upper = upper.copy()
+            elif key == "alt4":
+                self.alt4_hsv_lower = lower.copy()
+                self.alt4_hsv_upper = upper.copy()
+            elif key == "alt5":
+                self.alt5_hsv_lower = lower.copy()
+                self.alt5_hsv_upper = upper.copy()
+            elif key == "alt6":
+                self.alt6_hsv_lower = lower.copy()
+                self.alt6_hsv_upper = upper.copy()
+
+    def _save_click_hsv_tuner_config(self, specs):
+        config_path = self.config_file or 'hsv_config.json'
+        try:
+            with open(config_path, 'r') as f:
+                hsv_config = json.load(f)
+        except Exception:
+            hsv_config = {}
+
+        for spec in specs:
+            key = spec['config_key']
+            lower = spec['final_lower']
+            upper = spec['final_upper']
+            entry = {
+                'h_min': int(lower[0]),
+                'h_max': int(upper[0]),
+                's_min': int(lower[1]),
+                's_max': int(upper[1]),
+                'v_min': int(lower[2]),
+                'v_max': int(upper[2]),
+            }
+            if key == "regular_court":
+                if "regular_court" in hsv_config or self.hsv_regular is not None:
+                    hsv_config.setdefault("regular_court", {})
+                    hsv_config["regular_court"].update(entry)
+                else:
+                    hsv_config.update(entry)
+            else:
+                hsv_config.setdefault(key, {})
+                hsv_config[key].update(entry)
+
+        with open(config_path, 'w') as f:
+            json.dump(hsv_config, f, indent=4)
+        return config_path
     
     def _open_interactive_hsv_tuner(self, frame, search_center):
-        """Open interactive HSV filter tuner with bulb size controls."""
-        print(f"\n>>> OPENING DUAL HSV FILTER TUNER <<<")
-        print(f"Showing search region around last known position: {search_center}")
-        
-        # Check if dual HSV mode is enabled
-        is_dual_mode = self.hsv_regular is not None and self._behind_net_enabled()
-        
-        if is_dual_mode:
-            print(f"Opening TWO windows:")
-            print(f"  1. REGULAR COURT HSV (left window)")
-            print(f"  2. BEHIND NET HSV (right window)")
-            print(f"Adjust the appropriate window based on ball location")
-        else:
-            print(f"Adjust HSV min/max and Bulb size min/max sliders")
-        
-        print(f"Press 'Q' or ESC to close and continue")
-        
-        # Get search region (120px radius)
+        """Open interactive HSV filter tuner windows for regular + alt filters."""
+        print(f"\n>>> OPENING CLICK HSV FILTER TUNERS <<<")
+        print(f"Showing search region around clicked position: {search_center}")
+
+        specs = self._get_click_hsv_tuner_specs()
+        if not specs:
+            print("No HSV filters available for click tuning.")
+            return
+
+        print("Opening windows:")
+        for idx, spec in enumerate(specs, start=1):
+            print(f"  {idx}. {spec['label']} HSV")
+        print("Press 'Q' or ESC to close and continue")
+
         search_radius = 120
         x_prev, y_prev = search_center
         x1 = max(0, x_prev - search_radius)
         y1 = max(0, y_prev - search_radius)
         x2 = min(frame.shape[1], x_prev + search_radius)
         y2 = min(frame.shape[0], y_prev + search_radius)
-        
         search_frame = frame[y1:y2, x1:x2].copy()
-        
-        if is_dual_mode:
-            # Create TWO windows for dual HSV mode
-            window_regular = "1. REGULAR COURT HSV"
-            window_behind_net = "2. BEHIND NET HSV"
-            
-            cv2.namedWindow(window_regular)
-            cv2.namedWindow(window_behind_net)
-            cv2.resizeWindow(window_regular, 800, 600)
-            cv2.resizeWindow(window_behind_net, 800, 600)
-            cv2.moveWindow(window_regular, 50, 50)
-            cv2.moveWindow(window_behind_net, 900, 50)
-            cv2.waitKey(1)
-            
-            # Regular court HSV values
-            h_min_reg = self.hsv_regular['lower'][0]
-            h_max_reg = self.hsv_regular['upper'][0]
-            s_min_reg = self.hsv_regular['lower'][1]
-            s_max_reg = self.hsv_regular['upper'][1]
-            v_min_reg = self.hsv_regular['lower'][2]
-            v_max_reg = self.hsv_regular['upper'][2]
-            
-            # Behind net HSV values
-            h_min_net = self.hsv_behind_net['lower'][0]
-            h_max_net = self.hsv_behind_net['upper'][0]
-            s_min_net = self.hsv_behind_net['lower'][1]
-            s_max_net = self.hsv_behind_net['upper'][1]
-            v_min_net = self.hsv_behind_net['lower'][2]
-            v_max_net = self.hsv_behind_net['upper'][2]
-            
-            bulb_min = 3
-            bulb_max = 80
-            
-            # Create trackbars for REGULAR COURT window
-            cv2.createTrackbar("H Min", window_regular, h_min_reg, 179, lambda x: None)
-            cv2.createTrackbar("H Max", window_regular, h_max_reg, 179, lambda x: None)
-            cv2.createTrackbar("S Min", window_regular, s_min_reg, 255, lambda x: None)
-            cv2.createTrackbar("S Max", window_regular, s_max_reg, 255, lambda x: None)
-            cv2.createTrackbar("V Min", window_regular, v_min_reg, 255, lambda x: None)
-            cv2.createTrackbar("V Max", window_regular, v_max_reg, 255, lambda x: None)
-            cv2.createTrackbar("Bulb Min", window_regular, bulb_min, 100, lambda x: None)
-            cv2.createTrackbar("Bulb Max", window_regular, bulb_max, 200, lambda x: None)
-            
-            # Create trackbars for BEHIND NET window
-            cv2.createTrackbar("H Min", window_behind_net, h_min_net, 179, lambda x: None)
-            cv2.createTrackbar("H Max", window_behind_net, h_max_net, 179, lambda x: None)
-            cv2.createTrackbar("S Min", window_behind_net, s_min_net, 255, lambda x: None)
-            cv2.createTrackbar("S Max", window_behind_net, s_max_net, 255, lambda x: None)
-            cv2.createTrackbar("V Min", window_behind_net, v_min_net, 255, lambda x: None)
-            cv2.createTrackbar("V Max", window_behind_net, v_max_net, 255, lambda x: None)
-            cv2.createTrackbar("Bulb Min", window_behind_net, bulb_min, 100, lambda x: None)
-            cv2.createTrackbar("Bulb Max", window_behind_net, bulb_max, 200, lambda x: None)
-            cv2.waitKey(1)
-            
-            while True:
-                # Get REGULAR COURT trackbar values
-                h_min_reg = cv2.getTrackbarPos("H Min", window_regular)
-                h_max_reg = cv2.getTrackbarPos("H Max", window_regular)
-                s_min_reg = cv2.getTrackbarPos("S Min", window_regular)
-                s_max_reg = cv2.getTrackbarPos("S Max", window_regular)
-                v_min_reg = cv2.getTrackbarPos("V Min", window_regular)
-                v_max_reg = cv2.getTrackbarPos("V Max", window_regular)
-                bulb_min_reg = cv2.getTrackbarPos("Bulb Min", window_regular)
-                bulb_max_reg = cv2.getTrackbarPos("Bulb Max", window_regular)
-                
-                # Get BEHIND NET trackbar values
-                h_min_net = cv2.getTrackbarPos("H Min", window_behind_net)
-                h_max_net = cv2.getTrackbarPos("H Max", window_behind_net)
-                s_min_net = cv2.getTrackbarPos("S Min", window_behind_net)
-                s_max_net = cv2.getTrackbarPos("S Max", window_behind_net)
-                v_min_net = cv2.getTrackbarPos("V Min", window_behind_net)
-                v_max_net = cv2.getTrackbarPos("V Max", window_behind_net)
-                bulb_min_net = cv2.getTrackbarPos("Bulb Min", window_behind_net)
-                bulb_max_net = cv2.getTrackbarPos("Bulb Max", window_behind_net)
-                
-                # Apply REGULAR COURT HSV filter
-                hsv_frame = cv2.cvtColor(search_frame, cv2.COLOR_BGR2HSV)
-                hsv_lower_reg = np.array([h_min_reg, s_min_reg, v_min_reg], dtype=np.uint8)
-                hsv_upper_reg = np.array([h_max_reg, s_max_reg, v_max_reg], dtype=np.uint8)
-                mask_reg = cv2.inRange(hsv_frame, hsv_lower_reg, hsv_upper_reg)
-                contours_reg, _ = cv2.findContours(mask_reg, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                
-                display_reg = search_frame.copy()
-                bulb_count_reg = 0
-                for contour in contours_reg:
-                    area = cv2.contourArea(contour)
-                    if area < bulb_min_reg or area > bulb_max_reg:
-                        continue
-                    M = cv2.moments(contour)
-                    if M["m00"] == 0:
-                        continue
-                    cx = int(M["m10"] / M["m00"])
-                    cy = int(M["m01"] / M["m00"])
-                    cv2.circle(display_reg, (cx, cy), 8, (0, 255, 0), 2)
-                    cv2.putText(display_reg, f"{area:.0f}", (cx + 12, cy), 
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
-                    bulb_count_reg += 1
-                
-                mask_reg_bgr = cv2.cvtColor(mask_reg, cv2.COLOR_GRAY2BGR)
-                combined_reg = np.hstack([display_reg, mask_reg_bgr])
-                info_reg = f"REGULAR COURT | Bulbs: {bulb_count_reg} | H={h_min_reg}-{h_max_reg} S={s_min_reg}-{s_max_reg} V={v_min_reg}-{v_max_reg}"
-                cv2.putText(combined_reg, info_reg, (10, 20), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-                cv2.imshow(window_regular, combined_reg)
-                
-                # Apply BEHIND NET HSV filter
-                hsv_lower_net = np.array([h_min_net, s_min_net, v_min_net], dtype=np.uint8)
-                hsv_upper_net = np.array([h_max_net, s_max_net, v_max_net], dtype=np.uint8)
-                mask_net = cv2.inRange(hsv_frame, hsv_lower_net, hsv_upper_net)
-                contours_net, _ = cv2.findContours(mask_net, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                
-                display_net = search_frame.copy()
-                bulb_count_net = 0
-                for contour in contours_net:
-                    area = cv2.contourArea(contour)
-                    if area < bulb_min_net or area > bulb_max_net:
-                        continue
-                    M = cv2.moments(contour)
-                    if M["m00"] == 0:
-                        continue
-                    cx = int(M["m10"] / M["m00"])
-                    cy = int(M["m01"] / M["m00"])
-                    cv2.circle(display_net, (cx, cy), 8, (255, 0, 0), 2)
-                    cv2.putText(display_net, f"{area:.0f}", (cx + 12, cy), 
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 0), 1)
-                    bulb_count_net += 1
-                
-                mask_net_bgr = cv2.cvtColor(mask_net, cv2.COLOR_GRAY2BGR)
-                combined_net = np.hstack([display_net, mask_net_bgr])
-                info_net = f"BEHIND NET | Bulbs: {bulb_count_net} | H={h_min_net}-{h_max_net} S={s_min_net}-{s_max_net} V={v_min_net}-{v_max_net}"
-                cv2.putText(combined_net, info_net, (10, 20), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
-                cv2.imshow(window_behind_net, combined_net)
-                
-                key = cv2.waitKey(50) & 0xFF
-                if key == ord('q') or key == 27:  # 'q' or ESC
-                    break
-            
-            # Close both windows
-            cv2.destroyWindow(window_regular)
-            cv2.destroyWindow(window_behind_net)
-            cv2.waitKey(1)
-            
-            # Update both HSV configs
-            self.hsv_regular['lower'] = hsv_lower_reg
-            self.hsv_regular['upper'] = hsv_upper_reg
-            self.hsv_behind_net['lower'] = hsv_lower_net
-            self.hsv_behind_net['upper'] = hsv_upper_net
-            
-            # Determine which HSV to use as active based on ball position
-            y_pos = search_center[1]
-            is_in_net_area = (hasattr(self, 'net_area_y_min') and 
-                             hasattr(self, 'net_area_y_max') and
-                             self.net_area_y_min <= y_pos <= self.net_area_y_max)
-            
-            if is_in_net_area:
-                self.hsv_lower = hsv_lower_net
-                self.hsv_upper = hsv_upper_net
-                h_min, h_max = h_min_net, h_max_net
-                s_min, s_max = s_min_net, s_max_net
-                v_min, v_max = v_min_net, v_max_net
-                bulb_min, bulb_max = bulb_min_net, bulb_max_net
-            else:
-                self.hsv_lower = hsv_lower_reg
-                self.hsv_upper = hsv_upper_reg
-                h_min, h_max = h_min_reg, h_max_reg
-                s_min, s_max = s_min_reg, s_max_reg
-                v_min, v_max = v_min_reg, v_max_reg
-                bulb_min, bulb_max = bulb_min_reg, bulb_max_reg
-            
-        else:
-            # Single HSV mode (original behavior)
-            tuner_window = "HSV Filter Tuner"
-            cv2.namedWindow(tuner_window)
-            cv2.resizeWindow(tuner_window, 1200, 600)
-            cv2.waitKey(1)
-            
-            # Current HSV values
-            h_min = self.hsv_lower[0]
-            h_max = self.hsv_upper[0]
-            s_min = self.hsv_lower[1]
-            s_max = self.hsv_upper[1]
-            v_min = self.hsv_lower[2]
-            v_max = self.hsv_upper[2]
-            bulb_min = 3
-            bulb_max = 80
-            
-            # Create trackbars
-            cv2.createTrackbar("H Min", tuner_window, h_min, 179, lambda x: None)
-            cv2.createTrackbar("H Max", tuner_window, h_max, 179, lambda x: None)
-            cv2.createTrackbar("S Min", tuner_window, s_min, 255, lambda x: None)
-            cv2.createTrackbar("S Max", tuner_window, s_max, 255, lambda x: None)
-            cv2.createTrackbar("V Min", tuner_window, v_min, 255, lambda x: None)
-            cv2.createTrackbar("V Max", tuner_window, v_max, 255, lambda x: None)
-            cv2.createTrackbar("Bulb Min", tuner_window, bulb_min, 100, lambda x: None)
-            cv2.createTrackbar("Bulb Max", tuner_window, bulb_max, 200, lambda x: None)
-            cv2.waitKey(1)
-            
-            while True:
-                # Get current trackbar values
-                h_min = cv2.getTrackbarPos("H Min", tuner_window)
-                h_max = cv2.getTrackbarPos("H Max", tuner_window)
-                s_min = cv2.getTrackbarPos("S Min", tuner_window)
-                s_max = cv2.getTrackbarPos("S Max", tuner_window)
-                v_min = cv2.getTrackbarPos("V Min", tuner_window)
-                v_max = cv2.getTrackbarPos("V Max", tuner_window)
-                bulb_min = cv2.getTrackbarPos("Bulb Min", tuner_window)
-                bulb_max = cv2.getTrackbarPos("Bulb Max", tuner_window)
-                
-                # Apply HSV filter
-                hsv_frame = cv2.cvtColor(search_frame, cv2.COLOR_BGR2HSV)
+
+        if search_frame.size == 0:
+            print("Error: Cannot extract tuner region")
+            return
+
+        window_width = 800
+        window_height = 600
+        cascade_origin_x = 40
+        cascade_origin_y = 40
+        cascade_step_x = 55
+        cascade_step_y = 40
+        cascade_cycle = 8
+
+        for idx, spec in enumerate(specs):
+            window_name = f"{idx + 1}. {spec['label']} HSV"
+            spec['window_name'] = window_name
+            cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+            cv2.resizeWindow(window_name, window_width, window_height)
+            cascade_idx = idx % cascade_cycle
+            window_x = cascade_origin_x + cascade_idx * cascade_step_x
+            window_y = cascade_origin_y + cascade_idx * cascade_step_y
+            cv2.moveWindow(window_name, window_x, window_y)
+            cv2.createTrackbar("H Min", window_name, int(spec['lower'][0]), 179, lambda x: None)
+            cv2.createTrackbar("H Max", window_name, int(spec['upper'][0]), 179, lambda x: None)
+            cv2.createTrackbar("S Min", window_name, int(spec['lower'][1]), 255, lambda x: None)
+            cv2.createTrackbar("S Max", window_name, int(spec['upper'][1]), 255, lambda x: None)
+            cv2.createTrackbar("V Min", window_name, int(spec['lower'][2]), 255, lambda x: None)
+            cv2.createTrackbar("V Max", window_name, int(spec['upper'][2]), 255, lambda x: None)
+            cv2.createTrackbar("Bulb Min", window_name, int(spec['bulb_min']), 100, lambda x: None)
+            cv2.createTrackbar("Bulb Max", window_name, int(spec['bulb_max']), 200, lambda x: None)
+        cv2.waitKey(1)
+
+        hsv_frame = cv2.cvtColor(search_frame, cv2.COLOR_BGR2HSV)
+        while True:
+            for spec in specs:
+                window_name = spec['window_name']
+                h_min = cv2.getTrackbarPos("H Min", window_name)
+                h_max = cv2.getTrackbarPos("H Max", window_name)
+                s_min = cv2.getTrackbarPos("S Min", window_name)
+                s_max = cv2.getTrackbarPos("S Max", window_name)
+                v_min = cv2.getTrackbarPos("V Min", window_name)
+                v_max = cv2.getTrackbarPos("V Max", window_name)
+                bulb_min = cv2.getTrackbarPos("Bulb Min", window_name)
+                bulb_max = cv2.getTrackbarPos("Bulb Max", window_name)
+
                 hsv_lower = np.array([h_min, s_min, v_min], dtype=np.uint8)
                 hsv_upper = np.array([h_max, s_max, v_max], dtype=np.uint8)
                 mask = cv2.inRange(hsv_frame, hsv_lower, hsv_upper)
-                
-                # Find contours
+                hidden_false_points = self._erase_diagnostic_false_points(mask, x1, y1)
                 contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                
-                # Draw detected bulbs on original frame
+
                 display_frame = search_frame.copy()
                 bulb_count = 0
-                
                 for contour in contours:
                     area = cv2.contourArea(contour)
                     if area < bulb_min or area > bulb_max:
                         continue
-                        
-                    # Calculate center
                     M = cv2.moments(contour)
                     if M["m00"] == 0:
                         continue
                     cx = int(M["m10"] / M["m00"])
                     cy = int(M["m01"] / M["m00"])
-                    
-                    # Draw circle and size label
                     cv2.circle(display_frame, (cx, cy), 8, (0, 255, 0), 2)
-                    cv2.putText(display_frame, f"{area:.0f}", (cx + 12, cy), 
+                    cv2.putText(display_frame, f"{area:.0f}", (cx + 12, cy),
                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
                     bulb_count += 1
-                
-                # Create side-by-side display
+
                 mask_bgr = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
                 combined = np.hstack([display_frame, mask_bgr])
-                
-                # Add text info
-                info_text = f"Bulbs detected: {bulb_count} | HSV: H={h_min}-{h_max} S={s_min}-{s_max} V={v_min}-{v_max} | Size: {bulb_min}-{bulb_max}px"
-                cv2.putText(combined, info_text, (10, 20), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
-                
-                cv2.imshow(tuner_window, combined)
-                
-                key = cv2.waitKey(50) & 0xFF
-                if key == ord('q') or key == 27:  # 'q' or ESC
-                    break
-            
-            # Update HSV values with tuned values
-            self.hsv_lower = hsv_lower
-            self.hsv_upper = hsv_upper
-            
-            # Close tuner window
+                info_text = (
+                    f"{spec['label']} | Bulbs: {bulb_count} | "
+                    f"H={h_min}-{h_max} S={s_min}-{s_max} V={v_min}-{v_max}"
+                )
+                if hidden_false_points:
+                    info_text += f" | Hidden false: {hidden_false_points}"
+                cv2.putText(combined, info_text, (10, 20),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                cv2.imshow(window_name, combined)
+
+                spec['final_lower'] = hsv_lower
+                spec['final_upper'] = hsv_upper
+                spec['final_bulb_min'] = bulb_min
+                spec['final_bulb_max'] = bulb_max
+
+            key = cv2.waitKey(50) & 0xFF
+            if key == ord('q') or key == 27:
+                break
+
+        self._apply_click_hsv_tuner_updates(specs)
+        config_path = self._save_click_hsv_tuner_config(specs)
+
+        for spec in specs:
             try:
-                cv2.destroyWindow(tuner_window)
-                cv2.waitKey(1)
-            except:
+                cv2.destroyWindow(spec['window_name'])
+            except Exception:
                 pass
-        
-        # Save to config file for persistence
-        # Load existing config to preserve structure
-        try:
-            with open('hsv_config.json', 'r') as f:
-                hsv_config = json.load(f)
-        except:
-            hsv_config = {}
-        
-        # Update the appropriate section
-        if is_dual_mode:
-            # In dual mode, save BOTH configurations
-            print(f"Saving BOTH HSV configurations:")
-            print(f"  Regular Court: H={h_min_reg}-{h_max_reg}, S={s_min_reg}-{s_max_reg}, V={v_min_reg}-{v_max_reg}")
-            print(f"  Behind Net: H={h_min_net}-{h_max_net}, S={s_min_net}-{s_max_net}, V={v_min_net}-{v_max_net}")
-            
-            hsv_config['regular_court'] = {
-                'h_min': int(h_min_reg),
-                'h_max': int(h_max_reg),
-                's_min': int(s_min_reg),
-                's_max': int(s_max_reg),
-                'v_min': int(v_min_reg),
-                'v_max': int(v_max_reg)
-            }
-            hsv_config['behind_net'] = {
-                'h_min': int(h_min_net),
-                'h_max': int(h_max_net),
-                's_min': int(s_min_net),
-                's_max': int(s_max_net),
-                'v_min': int(v_min_net),
-                'v_max': int(v_max_net)
-            }
-        else:
-            # Single HSV mode - update entire config
-            hsv_config = {
-                'h_min': int(h_min),
-                'h_max': int(h_max),
-                's_min': int(s_min),
-                's_max': int(s_max),
-                'v_min': int(v_min),
-                'v_max': int(v_max)
-            }
-        
-        with open('hsv_config.json', 'w') as f:
-            json.dump(hsv_config, f, indent=4)
-        
-        # Close tuner window(s) - already closed in dual mode
-        if not is_dual_mode:
-            try:
-                cv2.destroyWindow(tuner_window)
-                cv2.waitKey(1)
-            except:
-                pass
-        
-        print(f"Tuner closed. Updated HSV: H={h_min}-{h_max}, S={s_min}-{s_max}, V={v_min}-{v_max}")
-        print(f"HSV values saved to hsv_config.json")
-        print(f"Bulb size filter: {bulb_min}-{bulb_max}px\n")
+        cv2.waitKey(1)
+
+        print("Tuner closed. Updated HSV ranges:")
+        for spec in specs:
+            lower = spec['final_lower']
+            upper = spec['final_upper']
+            print(
+                f"  {spec['label']}: H={lower[0]}-{upper[0]}, "
+                f"S={lower[1]}-{upper[1]}, V={lower[2]}-{upper[2]} | "
+                f"Bulb={spec['final_bulb_min']}-{spec['final_bulb_max']}px"
+            )
+        print(f"HSV values saved to {config_path}\n")
     
     def _reacquire_ball_by_motion(self, frame):
         """Re-acquire ball after occlusion using frame differencing + HSV.
@@ -2477,6 +2921,11 @@ class InteractiveBallAnalyzer:
             return None
 
         frame_height, frame_width = frame.shape[:2]
+        search_frame = frame
+        search_radius = None
+        x1, y1 = 0, 0
+        x2, y2 = frame_width, frame_height
+        search_anchor_y = frame_height // 2
         self._prune_ignored_tracking_positions()
         frame_gray = None
         if hasattr(self, '_prev_frame_gray') and self._prev_frame_gray is not None:
@@ -2495,8 +2944,26 @@ class InteractiveBallAnalyzer:
         serve_contact_grace = getattr(self, '_serve_contact_grace_frames', 0) > 0
         rally_contact_grace = getattr(self, '_rally_contact_grace_frames', 0) > 0
         ground_bounce_grace = getattr(self, '_ground_bounce_grace_frames', 0) > 0
+        serve_contact_descending = (
+            serve_contact_grace and (
+                self._is_descending_serve_contact_motion() or
+                self._is_descending_serve_contact_motion(self.prev_motion)
+            )
+        )
         contact_recovery_active = getattr(self, '_contact_recovery_frames', 0) > 0
         contact_reacquire_bounds = self._contact_reacquire_bounds(frame.shape, self.ball_center) if self.ball_center else None
+        upper_contact_turn_commit = (
+            not allow_inactive and
+            contact_reacquire_bounds is not None and
+            self.ball_center is not None and
+            getattr(self, 'direction_change_streak', 0) >= 2 and
+            self.ground_bounce_count > 0 and
+            self.ball_size is not None and
+            self.ball_size >= 20 and
+            self.ball_size <= 35 and
+            self.ball_center[1] >= max(190, int(frame.shape[0] * 0.085)) and
+            self.ball_center[1] <= max(260, int(frame.shape[0] * 0.13))
+        )
         lower_contact_launch_context = None
         ground_bounce_context = None
         if serve_contact_grace:
@@ -2584,6 +3051,9 @@ class InteractiveBallAnalyzer:
                 if rally_contact_grace:
                     search_radius = max(search_radius, self.max_ball_speed)
                     print(f"  DEBUG: [RALLY-CONTACT] wide search radius={search_radius}px, frames_left={self._rally_contact_grace_frames}")
+                if serve_contact_descending:
+                    search_radius = max(search_radius, self.max_ball_speed)
+                    print(f"  DEBUG: [SERVE-CONTACT] wide search radius={search_radius}px, frames_left={self._serve_contact_grace_frames}")
                 if ground_bounce_grace:
                     search_radius = max(search_radius, max(self.max_ball_speed, 110))
                     print(f"  DEBUG: [GROUND-BOUNCE] wide search radius={search_radius}px, frames_left={self._ground_bounce_grace_frames}")
@@ -2659,8 +3129,6 @@ class InteractiveBallAnalyzer:
             x, y = self.initial_ball_position
             search_radius = 80  # Larger radius for initial search
         else:
-            search_frame = frame
-            x1, y1 = 0, 0
             # When tracking is inactive (serve scan), give a hint region around serve area if defined
             if allow_inactive and hasattr(self, 'serve_area_x_min') and hasattr(self, 'serve_area_x_max'):
                 # Center search at middle of serve area to reduce false positives
@@ -2677,6 +3145,9 @@ class InteractiveBallAnalyzer:
             else:
                 print(f"\n  DEBUG: No previous ball position, searching entire frame")
         
+        if search_radius is not None:
+            search_anchor_y = y
+        
         predicted_point = None
         # Predict next position using last known motion if available
         if self.ball_center and hasattr(self, 'last_delta') and self.last_delta is not None:
@@ -2690,7 +3161,9 @@ class InteractiveBallAnalyzer:
             if not allow_inactive and not getattr(self, 'edge_wait', False) and self.stuck_frame_count < 3:
                 search_radius = min(search_radius, self.max_ball_speed)
             if serve_direction_search:
-                x1, y1, x2, y2 = self._build_serve_direction_region(x, y, frame.shape, search_radius)
+                x1, y1, x2, y2 = self._build_serve_direction_region(
+                    x, y, frame.shape, search_radius, descending_contact=serve_contact_descending
+                )
             else:
                 x1 = max(0, x - search_radius)
                 y1 = max(0, y - search_radius)
@@ -2699,7 +3172,7 @@ class InteractiveBallAnalyzer:
             
             search_frame = frame[y1:y2, x1:x2]
             # Determine which HSV config will be used
-            _, _, hsv_mode_check = self.select_hsv_for_position(y)
+            _, _, hsv_mode_check = self.select_hsv_for_position(search_anchor_y)
             if serve_direction_search:
                 print(f"\n  DEBUG: [SERVE-DIR] Searching {self.serve_direction_label()} from ({x},{y}) "
                       f"with radius {search_radius}px, region: ({x1},{y1})-({x2},{y2}), HSV mode: {hsv_mode_check}")
@@ -2717,7 +3190,7 @@ class InteractiveBallAnalyzer:
         should_check_both = False
         if is_dual_mode and hasattr(self, 'net_area_y_min') and hasattr(self, 'net_area_y_max'):
             # Check if ball is approaching, in, or leaving net area
-            if (self.net_area_y_min - net_approach_margin) <= y <= (self.net_area_y_max + net_approach_margin):
+            if (self.net_area_y_min - net_approach_margin) <= search_anchor_y <= (self.net_area_y_max + net_approach_margin):
                 should_check_both = True
         if is_dual_mode and contact_recovery_active:
             should_check_both = True
@@ -2728,7 +3201,7 @@ class InteractiveBallAnalyzer:
             self.ball_center is not None and
             self.ground_bounce_count > 0 and
             (self.frame_count - getattr(self, 'last_ground_bounce_frame', -1000000)) <= 20 and
-            y < max(145, int(frame.shape[0] * 0.08)) and
+            search_anchor_y < max(145, int(frame.shape[0] * 0.08)) and
             (
                 self.stuck_frame_count >= 2 or
                 getattr(self, '_upper_exit_wait_frames', 0) > 0
@@ -2738,7 +3211,7 @@ class InteractiveBallAnalyzer:
         if should_check_both:
             # Search with BOTH filters and combine results
             hsv_mode = "dual_net"
-            print(f"  DEBUG: Ball near net area (Y={y}, net Y={self.net_area_y_min}-{self.net_area_y_max})")
+            print(f"  DEBUG: Ball near net area (Y={search_anchor_y}, net Y={self.net_area_y_min}-{self.net_area_y_max})")
             print(f"  DEBUG: Checking BOTH HSV filters to find best match")
             
             # Get contours from REGULAR COURT filter
@@ -2799,7 +3272,7 @@ class InteractiveBallAnalyzer:
             print(f"  DEBUG: Found {len(contours_reg)} regular + {len(contours_net)} behind_net + {len(contours_alt2)} alt2 + {len(contours_alt4)} alt4 + {len(contours_alt5)} alt5 + {len(contours_alt6)} alt6 = {len(contours)} total contours")
         else:
             # Normal single HSV filter search
-            hsv_lower_use, hsv_upper_use, hsv_mode = self.select_hsv_for_position(y)
+            hsv_lower_use, hsv_upper_use, hsv_mode = self.select_hsv_for_position(search_anchor_y)
             if allow_inactive and hasattr(self, 'serve_area_x_min'):
                 # Use full configured HSV for serve scan (do not cap H max)
                 hsv_lower_use = self.hsv_lower
@@ -2873,7 +3346,10 @@ class InteractiveBallAnalyzer:
             print(f"  DEBUG: REASON: Ball may have:")
             print(f"  DEBUG:   - Gone off screen (check edge detection)")
             print(f"  DEBUG:   - Changed color/lighting dramatically")
-            print(f"  DEBUG:   - Moved faster than {search_radius}px/frame")
+            if search_radius is not None:
+                print(f"  DEBUG:   - Moved faster than {search_radius}px/frame")
+            else:
+                print(f"  DEBUG:   - Fallen outside the current full-frame HSV search")
             print(f"  DEBUG:   - Be occluded by player/net")
             print(f"  DEBUG: Will continue searching in next frame at same position...")
 
@@ -2964,7 +3440,7 @@ class InteractiveBallAnalyzer:
                         return self.ball_center
                 retrack = self.retrack_with_alt_hsv(
                     search_frame, x1, y1, self.ball_center, predicted_point, self.ball_size, allow_inactive,
-                    frame_gray=frame_gray
+                    frame_gray=frame_gray, filter_key="alt1"
                 )
                 if retrack is not None:
                     new_pos = retrack['pos']
@@ -2982,7 +3458,7 @@ class InteractiveBallAnalyzer:
             if self.alt2_hsv_lower is not None and self.alt2_hsv_upper is not None:
                 retrack2 = self.retrack_with_alt2_hsv(
                     search_frame, x1, y1, self.ball_center, predicted_point, self.ball_size, allow_inactive,
-                    frame_gray=frame_gray
+                    frame_gray=frame_gray, filter_key="alt2"
                 )
                 if retrack2 is not None:
                     new_pos = retrack2['pos']
@@ -3010,7 +3486,8 @@ class InteractiveBallAnalyzer:
                         if angle_jump > 45 or speed_ratio > 1.8 or speed_ratio < 0.6:
                             retrack3 = self.retrack_with_alt2_hsv(
                                 search_frame, x1, y1, prev_pos, predicted_point, self.ball_size, allow_inactive,
-                                lower=self.alt3_hsv_lower, upper=self.alt3_hsv_upper, frame_gray=frame_gray
+                                lower=self.alt3_hsv_lower, upper=self.alt3_hsv_upper, frame_gray=frame_gray,
+                                filter_key="alt3"
                             )
                             if retrack3 is not None:
                                 new_pos = retrack3['pos']
@@ -3026,7 +3503,8 @@ class InteractiveBallAnalyzer:
             if self.alt3_hsv_lower is not None and self.alt3_hsv_upper is not None:
                 retrack3 = self.retrack_with_alt2_hsv(
                     search_frame, x1, y1, self.ball_center, predicted_point, self.ball_size, allow_inactive,
-                    lower=self.alt3_hsv_lower, upper=self.alt3_hsv_upper, frame_gray=frame_gray
+                    lower=self.alt3_hsv_lower, upper=self.alt3_hsv_upper, frame_gray=frame_gray,
+                    filter_key="alt3"
                 )
                 if retrack3 is not None:
                     new_pos = retrack3['pos']
@@ -3077,6 +3555,7 @@ class InteractiveBallAnalyzer:
         best_score = float('inf')
         best_source = None
         candidates = []
+        candidate_meta = []
         upper_exit_transition_context = (
             not allow_inactive and
             self.ball_center is not None and
@@ -3133,6 +3612,7 @@ class InteractiveBallAnalyzer:
             # Calculate position in original frame coordinates
             cx = int(M["m10"] / M["m00"]) + x1
             cy = int(M["m01"] / M["m00"]) + y1
+            candidate_filter_key = self._candidate_false_point_filter_key(source, hsv_mode)
             
             # Reject candidates outside serve area when inactive
             if allow_inactive and hasattr(self, 'serve_area_x_min'):
@@ -3155,18 +3635,26 @@ class InteractiveBallAnalyzer:
                 size_ratio = 0
 
             if serve_direction_search and self.ball_center:
+                serve_direction_min_dx = self.serve_contact_min_dx
+                serve_direction_min_dy = self.serve_contact_min_dy
+                if serve_contact_descending:
+                    serve_direction_min_dx = 0
+                    serve_direction_min_dy = min(
+                        serve_direction_min_dy,
+                        -max(60, int(frame_height * 0.03))
+                    )
                 signed_dx = self._signed_serve_dx(cx - self.ball_center[0])
-                if signed_dx < self.serve_contact_min_dx:
-                    print(f"  DEBUG: Contour {i} REJECTED - serve-direction dx={signed_dx:.1f}px < {self.serve_contact_min_dx}")
+                if signed_dx < serve_direction_min_dx:
+                    print(f"  DEBUG: Contour {i} REJECTED - serve-direction dx={signed_dx:.1f}px < {serve_direction_min_dx}")
                     continue
                 if self.serve_direction_dy != 0:
                     signed_dy = self._signed_serve_dy(cy - self.ball_center[1])
-                    if signed_dy < self.serve_contact_min_dy:
-                        print(f"  DEBUG: Contour {i} REJECTED - serve-direction dy={signed_dy:.1f}px < {self.serve_contact_min_dy}")
+                    if signed_dy < serve_direction_min_dy:
+                        print(f"  DEBUG: Contour {i} REJECTED - serve-direction dy={signed_dy:.1f}px < {serve_direction_min_dy}")
                         continue
 
             if not allow_inactive:
-                ignored_entry = self._find_ignored_tracking_position((cx, cy))
+                ignored_entry = self._find_ignored_tracking_position((cx, cy), filter_key=candidate_filter_key)
                 if ignored_entry is not None:
                     print(f"  DEBUG: Contour {i} REJECTED - learned hotspot at ({cx},{cy}) "
                           f"reason={ignored_entry.get('reason', 'n/a')}")
@@ -3241,13 +3729,34 @@ class InteractiveBallAnalyzer:
                 _rr_size = max(_rr_size, 50)
                 _post_size_ratio = abs(area - _rr_size) / _rr_size
                 score = _post_size_ratio * 100 + distance * 0.1
-            elif serve_contact_grace and self.stuck_frame_count >= 1:
+            elif serve_contact_grace:
                 # During serve contact the ball can jump hundreds of pixels and reverse
                 # direction instantly, so distance to the previous toss location is a
                 # weak signal. Prefer contours that still look like the same ball size.
                 _contact_ref_size = max(self.ball_size or area, 50)
                 _contact_size_ratio = abs(area - _contact_ref_size) / _contact_ref_size
                 score = _contact_size_ratio * 100 + distance * 0.1
+            elif upper_contact_turn_commit:
+                # On the last held upper-contact frame, prefer the launched ball that
+                # clears upward/lateral space away from the contact blob.
+                upward_progress = self.ball_center[1] - cy if self.ball_center is not None else 0.0
+                lateral_shift = abs(cx - self.ball_center[0]) if self.ball_center is not None else 0.0
+                _upper_turn_ref_size = max(8.0, min(float(self.ball_size or area), 18.0))
+                _upper_turn_size_ratio = abs(area - _upper_turn_ref_size) / max(_upper_turn_ref_size, 1.0)
+                score = _upper_turn_size_ratio * 35.0 + distance * 0.45
+                if area < 4.0:
+                    score += (4.0 - area) * 12.0
+                if upward_progress < 18.0:
+                    score += (18.0 - upward_progress) * 8.0
+                else:
+                    score -= min(85.0, upward_progress * 2.6)
+                if lateral_shift < 45.0:
+                    score += (45.0 - lateral_shift) * 2.5
+                if area > max(_upper_turn_ref_size * 1.4, 24.0) and upward_progress < 24.0:
+                    score += (area - _upper_turn_ref_size) * 2.0
+                if predicted_point is not None:
+                    _upper_turn_pred_dist = math.hypot(cx - predicted_point[0], cy - predicted_point[1])
+                    score += _upper_turn_pred_dist * 0.08
             elif ground_bounce_context is not None:
                 origin_x, origin_y = ground_bounce_context['origin']
                 expected_x, expected_y = ground_bounce_context['expected']
@@ -3396,6 +3905,17 @@ class InteractiveBallAnalyzer:
                                   (cy < 100 and motion_mean < 2.5 and motion_max < 10.0))
                 if static_hotspot:
                     score += 1200
+                if candidate_filter_key is not None:
+                    steady_reason = None
+                    if frame0_hotspot is not None and motion_mean < 8.0 and motion_max < 35.0:
+                        steady_reason = "frame0-backed steady false point"
+                    elif area <= 18.0 and motion_mean < 3.5 and motion_max < 12.0:
+                        steady_reason = "steady repeated false point"
+                    if steady_reason is not None and self._observe_steady_false_point(
+                            (cx, cy), candidate_filter_key, area, motion_mean, motion_max, steady_reason):
+                        print(f"  DEBUG: Contour {i} REJECTED - persistent false point at ({cx},{cy}) "
+                              f"filter={candidate_filter_key}")
+                        continue
             if upper_wall_search_context and self.ball_center is not None:
                 prev_x, prev_y = self.ball_center
                 if source == 'alt6':
@@ -3408,6 +3928,21 @@ class InteractiveBallAnalyzer:
                     score += 140.0
              
             candidates.append((i, source, cx, cy, area, distance, size_ratio, score))
+            predicted_distance_meta = (
+                math.hypot(cx - predicted_point[0], cy - predicted_point[1])
+                if predicted_point is not None else None
+            )
+            candidate_meta.append({
+                'index': i,
+                'source': source,
+                'filter_key': candidate_filter_key,
+                'pos': (cx, cy),
+                'area': area,
+                'distance': distance,
+                'score': score,
+                'predicted_distance': predicted_distance_meta,
+                'contour': contour,
+            })
             source_label = f"[{source}]" if source != 'single' else ""
             print(f"  DEBUG: Contour {i} {source_label} CANDIDATE - pos=({cx},{cy}), area={area:.1f}px, distance={distance:.1f}px, size_ratio={size_ratio:.2f}, score={score:.1f}{motion_note}")
             
@@ -3604,9 +4139,55 @@ class InteractiveBallAnalyzer:
                     best_source = upper_exit_alt['label']
                     print(f"Frame {self.frame_count}: [UPPER ALT OVERRIDE] Replacing behind_net pick with {best_source} at ({cx},{cy})")
 
+            selected_area_for_precedence = (
+                selected_override['area'] if selected_override is not None else cv2.contourArea(best_contour)
+            )
+            current_filter_key = self._candidate_false_point_filter_key(best_source, hsv_mode)
+            if (not allow_inactive and best_source == "alt6"
+                    and self.ball_center is not None and contact_reacquire_bounds is not None
+                    and self.ground_bounce_count > 0 and self.ball_center[1] <= 260):
+                regular_single = self._find_single_standard_candidate(
+                    search_frame, x1, y1, self.ball_center, predicted_point, frame_gray
+                )
+                if regular_single is not None:
+                    current_distance = math.hypot(cx - self.ball_center[0], cy - self.ball_center[1])
+                    current_predicted_distance = (
+                        math.hypot(cx - predicted_point[0], cy - predicted_point[1])
+                        if predicted_point is not None else None
+                    )
+                    regular_predicted_distance = regular_single.get("predicted_distance")
+                    regular_pos_gap = math.hypot(
+                        regular_single["pos"][0] - cx,
+                        regular_single["pos"][1] - cy,
+                    )
+                    min_regular_area = 4.0
+                    if self.ball_size is not None and self.ball_size > 0:
+                        min_regular_area = max(min_regular_area, min(18.0, self.ball_size * 0.28))
+                    if selected_area_for_precedence > 0:
+                        min_regular_area = max(
+                            min_regular_area,
+                            min(14.0, selected_area_for_precedence * 0.38),
+                        )
+                    if (regular_single["area"] >= min_regular_area and
+                            regular_pos_gap <= 24.0 and
+                            regular_single["score"] <= best_score + 30.0 and
+                            regular_single["distance"] <= current_distance + 16.0 and
+                            (predicted_point is None or current_predicted_distance is None or
+                             regular_predicted_distance is None or
+                             regular_predicted_distance <= current_predicted_distance + 20.0)):
+                        best_contour = regular_single["contour"]
+                        best_source = "regular"
+                        best_score = regular_single["score"]
+                        cx, cy = regular_single["pos"]
+                        print(
+                            f"Frame {self.frame_count}: [REGULAR PRECEDENCE] "
+                            f"Using single regular candidate at ({cx}, {cy})"
+                        )
+
             # Get HSV values at new position
             hsv_values = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)[cy, cx]
             bulb_size = selected_override['area'] if selected_override is not None else cv2.contourArea(best_contour)
+            current_filter_key = self._candidate_false_point_filter_key(best_source, hsv_mode)
             if best_source == 'alt4' and self.alt4_hsv_lower is not None and self.alt4_hsv_upper is not None:
                 self.hsv_lower = self.alt4_hsv_lower
                 self.hsv_upper = self.alt4_hsv_upper
@@ -3620,6 +4201,8 @@ class InteractiveBallAnalyzer:
             # Calculate velocity (distance moved)
             prev_pos = self.ball_center if self.ball_center else None
             prev_ball_size = self.ball_size
+            current_pos = (cx, cy)
+            current_area = bulb_size
             dx = dy = 0
             direction_deg = None
             if prev_pos:
@@ -3637,7 +4220,7 @@ class InteractiveBallAnalyzer:
             skip_upper_wall_override = upper_wall_search_context and best_source in ('alt4', 'alt5', 'alt6')
             if (not serve_contact_grace and not rally_contact_grace and not ground_bounce_grace and not serve_direction_search
                     and lower_contact_launch_context is None and not _in_post_reacq and self.last_motion
-                    and not skip_upper_wall_override
+                    and not skip_upper_wall_override and not upper_contact_turn_commit
                     and self.ball_center and self.stuck_frame_count < 5):
                 lm_dx = self.last_motion['dx']
                 lm_dy = self.last_motion['dy']
@@ -3655,9 +4238,12 @@ class InteractiveBallAnalyzer:
                         (lm_dist and speed_diff > lm_dist * 0.6)):
                     retrack = self.retrack_with_alt_hsv(
                         search_frame, x1, y1, self.ball_center, predicted_point, self.ball_size, allow_inactive,
-                        frame_gray=frame_gray
+                        frame_gray=frame_gray, filter_key="alt1"
                     )
-                    if retrack is not None:
+                    override_applied = False
+                    if retrack is not None and self._should_accept_hsv_override(
+                            "alt1", retrack, current_pos, current_area, prev_pos, predicted_point,
+                            frame_gray, current_filter_key=current_filter_key):
                         cx, cy = retrack['pos']
                         hsv_values = retrack['hsv']
                         bulb_size = retrack['area']
@@ -3667,12 +4253,16 @@ class InteractiveBallAnalyzer:
                             self.hsv_lower = self.alt_focus_hsv_lower
                             self.hsv_upper = self.alt_focus_hsv_upper
                         print(f"Frame {self.frame_count}: [ALT HSV OVERRIDE] Ball at ({cx}, {cy})")
-                    elif self.alt2_hsv_lower is not None and self.alt2_hsv_upper is not None:
+                        override_applied = True
+                    if (not override_applied and self.alt2_hsv_lower is not None and
+                            self.alt2_hsv_upper is not None):
                         retrack2 = self.retrack_with_alt2_hsv(
                             search_frame, x1, y1, self.ball_center, predicted_point, self.ball_size, allow_inactive,
-                            frame_gray=frame_gray
+                            frame_gray=frame_gray, filter_key="alt2"
                         )
-                        if retrack2 is not None:
+                        if retrack2 is not None and self._should_accept_hsv_override(
+                                "alt2", retrack2, current_pos, current_area, prev_pos, predicted_point,
+                                frame_gray, current_filter_key=current_filter_key):
                             cx, cy = retrack2['pos']
                             hsv_values = retrack2['hsv']
                             bulb_size = retrack2['area']
@@ -3682,6 +4272,7 @@ class InteractiveBallAnalyzer:
                             self.hsv_lower = self.alt2_hsv_lower
                             self.hsv_upper = self.alt2_hsv_upper
                             print(f"Frame {self.frame_count}: [ALT2 HSV OVERRIDE] Ball at ({cx}, {cy})")
+                            override_applied = True
                             if self.last_motion and self.alt3_hsv_lower is not None and self.alt3_hsv_upper is not None:
                                 lm_dist = self.last_motion['distance']
                                 mv_dx = cx - self.ball_center[0]
@@ -3696,9 +4287,13 @@ class InteractiveBallAnalyzer:
                                 if angle_jump > 45 or speed_ratio > 1.8 or speed_ratio < 0.6:
                                     retrack3 = self.retrack_with_alt2_hsv(
                                         search_frame, x1, y1, self.ball_center, predicted_point, self.ball_size, allow_inactive,
-                                        lower=self.alt3_hsv_lower, upper=self.alt3_hsv_upper, frame_gray=frame_gray
+                                        lower=self.alt3_hsv_lower, upper=self.alt3_hsv_upper, frame_gray=frame_gray,
+                                        filter_key="alt3"
                                     )
-                                    if retrack3 is not None:
+                                    if retrack3 is not None and self._should_accept_hsv_override(
+                                            "alt3", retrack3, current_pos, current_area, prev_pos,
+                                            predicted_point, frame_gray,
+                                            current_filter_key=current_filter_key):
                                         cx, cy = retrack3['pos']
                                         hsv_values = retrack3['hsv']
                                         bulb_size = retrack3['area']
@@ -3710,9 +4305,12 @@ class InteractiveBallAnalyzer:
                     elif self.alt3_hsv_lower is not None and self.alt3_hsv_upper is not None:
                         retrack3 = self.retrack_with_alt2_hsv(
                             search_frame, x1, y1, self.ball_center, predicted_point, self.ball_size, allow_inactive,
-                            lower=self.alt3_hsv_lower, upper=self.alt3_hsv_upper, frame_gray=frame_gray
+                            lower=self.alt3_hsv_lower, upper=self.alt3_hsv_upper, frame_gray=frame_gray,
+                            filter_key="alt3"
                         )
-                        if retrack3 is not None:
+                        if retrack3 is not None and self._should_accept_hsv_override(
+                                "alt3", retrack3, current_pos, current_area, prev_pos, predicted_point,
+                                frame_gray, current_filter_key=current_filter_key):
                             cx, cy = retrack3['pos']
                             hsv_values = retrack3['hsv']
                             bulb_size = retrack3['area']
@@ -4024,7 +4622,7 @@ class InteractiveBallAnalyzer:
                 print(f"Frame {self.frame_count}: Re-running detection with alt HSV after focus loss")
                 retrack = self.retrack_with_alt_hsv(
                     search_frame, x1, y1, prev_pos, predicted_point, prev_ball_size, allow_inactive,
-                    frame_gray=frame_gray
+                    frame_gray=frame_gray, filter_key="alt1"
                 )
                 if retrack is not None:
                     new_pos = retrack['pos']
@@ -4061,7 +4659,7 @@ class InteractiveBallAnalyzer:
                     self.hsv_upper = self.alt2_hsv_upper
                 retrack2 = self.retrack_with_alt2_hsv(
                     search_frame, x1, y1, prev_pos, predicted_point, prev_ball_size, allow_inactive,
-                    frame_gray=frame_gray
+                    frame_gray=frame_gray, filter_key="alt2"
                 )
                 if retrack2 is not None:
                     new_pos = retrack2['pos']
@@ -4889,6 +5487,15 @@ class InteractiveBallAnalyzer:
             last_serve_candidate = None
             serve_position_history = []
             serve_candidate_details_history = []
+
+        def log_tracking_start_position():
+            if self.ball_center is None:
+                return
+            size_text = f"{self.ball_size:.1f}px" if self.ball_size is not None else "unknown"
+            vel = self.last_motion['distance'] if self.last_motion else 0.0
+            vel_hist_tail = [round(v, 1) for v in getattr(self, 'ball_velocity_history', [])[-5:]]
+            print(f"Frame {self.frame_count}: Ball tracked at {self.ball_center} - Size: {size_text}")
+            print(f"[TRACK] f{self.frame_count}: pos={self.ball_center} vel={vel:.1f}px stuck={self.stuck_frame_count} vel_hist={vel_hist_tail}")
         
         # Modified mouse callback that converts resized coordinates to original
         def mouse_callback_with_scale(event, x, y, flags, param):
@@ -4911,7 +5518,7 @@ class InteractiveBallAnalyzer:
         hsv_config = self.load_hsv_config()
         
         # Check if net area needs to be marked (first time setup)
-        if hsv_config and "net_area_y_min" not in hsv_config:
+        if (not self.disable_behind_net_mode) and hsv_config and "net_area_y_min" not in hsv_config:
             print("\n" + "=" * 70)
             print("FIRST TIME SETUP: Please mark the net area")
             print("=" * 70)
@@ -5000,6 +5607,7 @@ class InteractiveBallAnalyzer:
                         self.ball_center = last_serve_candidate
                         self.waiting_serve_candidate = None
                         self.waiting_serve_candidate_frame = -1
+                        log_tracking_start_position()
                     else:
                         serve_tracking_frames = 0
                         last_serve_candidate = None
@@ -5054,6 +5662,7 @@ class InteractiveBallAnalyzer:
                             self.point_start_frame_internal = self.frame_count
                             scan_position_history = []
                             game_state = "TRACKING_POINT"
+                            log_tracking_start_position()
                 else:
                     scan_position_history = []
             
@@ -5267,8 +5876,10 @@ class InteractiveBallAnalyzer:
                             # ball, not the false positive which sits at a higher Y value)
                             top_positions = [p for p in serve_position_history if p[1] < toss_high_y]
                             toss_start = top_positions[-1] if top_positions else last_serve_candidate
-                            _dx = potential_serve[0] - toss_start[0]
-                            _dy = potential_serve[1] - toss_start[1]
+                            tracking_start = potential_serve
+                            motion_seed = serve_position_history[-2] if len(serve_position_history) >= 2 else toss_start
+                            _dx = tracking_start[0] - motion_seed[0]
+                            _dy = tracking_start[1] - motion_seed[1]
                             _dist = _math.hypot(_dx, _dy)
                             _dir = _math.degrees(_math.atan2(_dy, _dx))
                             self.last_motion = {
@@ -5276,24 +5887,25 @@ class InteractiveBallAnalyzer:
                             }
                             self.last_delta = (_dx, _dy)
                             self.ball_velocity_history = [_dist]
-                            print(f"[TRACKING_START] f{self.frame_count}: toss-in-flight detected at {toss_start} "
+                            print(f"[TRACKING_START] f{self.frame_count}: toss-in-flight apex={toss_start} start={tracking_start} "
                                   f"serve_tracking_frames={serve_tracking_frames} recent_min_y={recent_min_y} "
                                   f"vertical_drop={vertical_drop:.0f}px total_disp={total_disp:.0f}px "
                                   f"recent_step_max={recent_step_max:.1f}px toss_high_y={toss_high_y}")
-                            self.ball_center = toss_start
+                            self.ball_center = tracking_start
                             self.tracking = True
                             self.ball_stopped = False
                             self._serve_contact_grace_frames = max(self._serve_contact_grace_frames, 6)
                             self.initial_ball_position = serve_position_history[0]
                             self.ball_size = None
                             self.ball_hsv = None
-                            seed_tracking_from_serve_history(last_serve_candidate)
+                            seed_tracking_from_serve_history(tracking_start)
                             self.stuck_frame_count = 0
                             point_start_frame = self.frame_count
                             self.point_start_frame_internal = self.frame_count
                             self.waiting_serve_candidate = None
                             self.waiting_serve_candidate_frame = -1
                             game_state = "TRACKING_POINT"
+                            log_tracking_start_position()
                             clear_waiting_serve_history()
                     # Early serve start: if ball is moving fast in the configured serve direction within the serve area,
                     # start tracking immediately (don't wait for serve area exit)
@@ -5343,6 +5955,7 @@ class InteractiveBallAnalyzer:
                             self.waiting_serve_candidate = None
                             self.waiting_serve_candidate_frame = -1
                             game_state = "TRACKING_POINT"
+                            log_tracking_start_position()
                             clear_waiting_serve_history()
                 else:
                     # Ball exited serve area — only start tracking if it was moving at serve speed
@@ -5394,6 +6007,7 @@ class InteractiveBallAnalyzer:
                             self.waiting_serve_candidate = None
                             self.waiting_serve_candidate_frame = -1
                             game_state = "TRACKING_POINT"
+                            log_tracking_start_position()
                         elif last_dy > 5 and last_dx >= -10 and serve_tracking_frames >= 5:
                             # Toss-complete: ball exiting serve area downward (falling after toss).
                             # Player is about to strike the ball just below the serve area.
@@ -5423,6 +6037,7 @@ class InteractiveBallAnalyzer:
                             self.waiting_serve_candidate = None
                             self.waiting_serve_candidate_frame = -1
                             game_state = "TRACKING_POINT"
+                            log_tracking_start_position()
                     clear_waiting_serve_history()
             
             # Resize frame to fit screen

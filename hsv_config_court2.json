@@ -1,0 +1,128 @@
+{
+    "regular_court": {
+        "h_min": 20,
+        "h_max": 85,
+        "s_min": 50,
+        "s_max": 255,
+        "v_min": 130,
+        "v_max": 255
+    },
+    "alt1": {
+        "h_min": 55,
+        "h_max": 85,
+        "s_min": 50,
+        "s_max": 255,
+        "v_min": 130,
+        "v_max": 255
+    },
+    "alt2": {
+        "h_min": 15,
+        "h_max": 80,
+        "s_min": 40,
+        "s_max": 255,
+        "v_min": 100,
+        "v_max": 255
+    },
+    "alt3": {
+        "h_min": 60,
+        "h_max": 75,
+        "s_min": 70,
+        "s_max": 255,
+        "v_min": 150,
+        "v_max": 255
+    },
+    "alt4": {
+        "h_min": 40,
+        "h_max": 98,
+        "s_min": 108,
+        "s_max": 195,
+        "v_min": 67,
+        "v_max": 115
+    },
+    "alt5": {
+        "h_min": 66,
+        "h_max": 98,
+        "s_min": 108,
+        "s_max": 132,
+        "v_min": 66,
+        "v_max": 135
+    },
+    "alt6": {
+        "h_min": 72,
+        "h_max": 85,
+        "s_min": 37,
+        "s_max": 87,
+        "v_min": 65,
+        "v_max": 121
+    },
+    "behind_net": {
+        "h_min": 20,
+        "h_max": 85,
+        "s_min": 30,
+        "s_max": 255,
+        "v_min": 80,
+        "v_max": 255
+    },
+    "net_area_y_min": 700,
+    "net_area_y_max": 950,
+    "high_net_y_min": 700,
+    "high_net_y_max": 850,
+    "low_net_y_min": 800,
+    "low_net_y_max": 950,
+    "serve_area_points": [
+        [
+            760,
+            650
+        ],
+        [
+            2900,
+            650
+        ],
+        [
+            2900,
+            1100
+        ],
+        [
+            760,
+            1100
+        ]
+    ],
+    "serve_area_x_min": 760,
+    "serve_area_x_max": 2900,
+    "serve_area_y_min": 650,
+    "serve_area_y_max": 1100,
+    "serve_width_ratio": 0.8,
+    "serve_player_position": "auto",
+    "serve_direction_dx": -1,
+    "serve_direction_dy": -1,
+    "serve_directional_search": true,
+    "serve_directional_search_frames": 20,
+    "serve_contact_y_ratio": 0.7,
+    "serve_contact_min_prev_dy": 20,
+    "serve_contact_max_prev_dx": 20,
+    "serve_contact_min_ball_size": 180,
+    "serve_contact_min_dx": 100,
+    "serve_contact_min_dy": 40,
+    "serve_ball_size_min": 50,
+    "serve_ball_size_max": 800,
+    "ball_max_speed": 400,
+    "max_point_frames": 200,
+    "tracking_ignore_hotspots": [
+        {
+            "pos": [
+                2195,
+                195
+            ],
+            "radius": 20,
+            "reason": "court-side static spot near player at frame 575"
+        },
+        {
+            "pos": [
+                1914,
+                143
+            ],
+            "radius": 32,
+            "reason": "upper false spot near frame 649/650"
+        }
+    ]
+}
