@@ -67,6 +67,8 @@ class InteractiveBallAnalyzer:
         self.alt5_hsv_upper = None
         self.alt6_hsv_lower = None
         self.alt6_hsv_upper = None
+        self.s30_hsv_lower = None
+        self.s30_hsv_upper = None
         self.alts9_11_hsv_lower = None
         self.alts9_11_hsv_upper = None
         # Keep behind-net / near-net HSV fully disabled by default.
@@ -321,6 +323,8 @@ class InteractiveBallAnalyzer:
             return "alt5"
         if key.startswith("alt6"):
             return "alt6"
+        if key.startswith("s_30") or key.startswith("s30"):
+            return "regular_court"
         if key.startswith("alts9_11") or key.startswith("alts911"):
             return "alts9_11"
         if key.startswith("behind_net") or key.startswith("at_edge"):
@@ -801,6 +805,8 @@ class InteractiveBallAnalyzer:
             specs.append(("alt2", self.alt2_hsv_lower, self.alt2_hsv_upper))
         if self.alt3_hsv_lower is not None and self.alt3_hsv_upper is not None:
             specs.append(("alt3", self.alt3_hsv_lower, self.alt3_hsv_upper))
+        if self.s30_hsv_lower is not None and self.s30_hsv_upper is not None:
+            specs.append(("s_30", self.s30_hsv_lower, self.s30_hsv_upper))
         if self.alts9_11_hsv_lower is not None and self.alts9_11_hsv_upper is not None:
             specs.append(("alts9_11", self.alts9_11_hsv_lower, self.alts9_11_hsv_upper))
         return specs
@@ -1927,6 +1933,9 @@ class InteractiveBallAnalyzer:
         if self.alt6_hsv_lower is not None and self.alt6_hsv_upper is not None:
             self.show_alternative_debug(frame, point, self.alt6_hsv_lower, self.alt6_hsv_upper,
                                         f"Predicted {frame_index} (alt6)")
+        if self.s30_hsv_lower is not None and self.s30_hsv_upper is not None:
+            self.show_alternative_debug(frame, point, self.s30_hsv_lower, self.s30_hsv_upper,
+                                        f"Predicted {frame_index} (s_30)")
         if self.alts9_11_hsv_lower is not None and self.alts9_11_hsv_upper is not None:
             self.show_alternative_debug(frame, point, self.alts9_11_hsv_lower, self.alts9_11_hsv_upper,
                                         f"Predicted {frame_index} (alts9_11)")
@@ -2125,6 +2134,21 @@ class InteractiveBallAnalyzer:
                     ], dtype=np.uint8)
                     self.alt6_hsv_upper = np.array([
                         config["alt6"]["h_max"], config["alt6"]["s_max"], config["alt6"]["v_max"]
+                    ], dtype=np.uint8)
+                if self.hsv_regular is not None:
+                    self.s30_hsv_lower = self.hsv_regular['lower'].copy()
+                    self.s30_hsv_upper = self.hsv_regular['upper'].copy()
+                elif self.primary_hsv_lower is not None and self.primary_hsv_upper is not None:
+                    self.s30_hsv_lower = self.primary_hsv_lower.copy()
+                    self.s30_hsv_upper = self.primary_hsv_upper.copy()
+                if self.s30_hsv_lower is not None:
+                    self.s30_hsv_lower[1] = min(int(self.s30_hsv_lower[1]), 30)
+                if "s_30" in config:
+                    self.s30_hsv_lower = np.array([
+                        config["s_30"]["h_min"], config["s_30"]["s_min"], config["s_30"]["v_min"]
+                    ], dtype=np.uint8)
+                    self.s30_hsv_upper = np.array([
+                        config["s_30"]["h_max"], config["s_30"]["s_max"], config["s_30"]["v_max"]
                     ], dtype=np.uint8)
                 if "alts9_11" in config:
                     self.alts9_11_hsv_lower = np.array([
@@ -2685,6 +2709,7 @@ class InteractiveBallAnalyzer:
         _append("alt4", "ALT4", self.alt4_hsv_lower, self.alt4_hsv_upper)
         _append("alt5", "ALT5", self.alt5_hsv_lower, self.alt5_hsv_upper)
         _append("alt6", "ALT6", self.alt6_hsv_lower, self.alt6_hsv_upper)
+        _append("s_30", "S_30", self.s30_hsv_lower, self.s30_hsv_upper)
         _append("alts9_11", "ALTS9_11", self.alts9_11_hsv_lower, self.alts9_11_hsv_upper)
         return specs
 
@@ -2745,6 +2770,9 @@ class InteractiveBallAnalyzer:
                 if self.using_alt6_hsv:
                     self.hsv_lower = lower.copy()
                     self.hsv_upper = upper.copy()
+            elif key == "s_30":
+                self.s30_hsv_lower = lower.copy()
+                self.s30_hsv_upper = upper.copy()
             elif key == "alts9_11":
                 self.alts9_11_hsv_lower = lower.copy()
                 self.alts9_11_hsv_upper = upper.copy()
@@ -3747,6 +3775,22 @@ class InteractiveBallAnalyzer:
                     self.hsv_upper = upper_exit_low_s['upper']
                     self.stuck_frame_count = 0
                     print(f"Frame {self.frame_count}: [UPPER EXIT LOW-S RECOVER] Ball at {new_pos} via {upper_exit_low_s['label']}")
+                    return self.ball_center
+
+            if self.s30_hsv_lower is not None and self.s30_hsv_upper is not None:
+                retrack_s30 = self.retrack_with_alt2_hsv(
+                    search_frame, x1, y1, self.ball_center, predicted_point, self.ball_size, allow_inactive,
+                    lower=self.s30_hsv_lower, upper=self.s30_hsv_upper, frame_gray=frame_gray,
+                    filter_key="s_30"
+                )
+                if retrack_s30 is not None:
+                    new_pos = retrack_s30['pos']
+                    self.ball_center = new_pos
+                    self.ball_hsv = retrack_s30['hsv']
+                    self.ball_size = retrack_s30['area']
+                    self._activate_regular_hsv()
+                    self.stuck_frame_count = 0
+                    print(f"Frame {self.frame_count}: [S_30 HSV RECOVER] Ball at {new_pos}")
                     return self.ball_center
 
             if (not allow_inactive and self.ball_center and self.last_seen_frame == (self.frame_count - 1)

@@ -1,11 +1,11 @@
 {
     "regular_court": {
-        "h_min": 57,
-        "h_max": 98,
-        "s_min": 100,
-        "s_max": 133,
-        "v_min": 67,
-        "v_max": 133
+        "h_min": 20,
+        "h_max": 85,
+        "s_min": 50,
+        "s_max": 255,
+        "v_min": 130,
+        "v_max": 255
     },
     "alt1": {
         "h_min": 40,
