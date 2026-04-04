@@ -48,12 +48,20 @@
         "v_max": 135
     },
     "alt6": {
-        "h_min": 72,
-        "h_max": 85,
+        "h_min": 43,
+        "h_max": 79,
         "s_min": 37,
-        "s_max": 87,
+        "s_max": 138,
         "v_min": 65,
         "v_max": 121
+    },
+    "alts9_11": {
+        "h_min": 20,
+        "h_max": 77,
+        "s_min": 9,
+        "s_max": 11,
+        "v_min": 125,
+        "v_max": 255
     },
     "behind_net": {
         "h_min": 20,

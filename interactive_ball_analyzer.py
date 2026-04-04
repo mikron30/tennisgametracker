@@ -60,12 +60,15 @@ class InteractiveBallAnalyzer:
         self.using_alt3_hsv = False
         self.alt3_hsv_lower = None
         self.alt3_hsv_upper = None
+        self.using_alt6_hsv = False
         self.alt4_hsv_lower = None
         self.alt4_hsv_upper = None
         self.alt5_hsv_lower = None
         self.alt5_hsv_upper = None
         self.alt6_hsv_lower = None
         self.alt6_hsv_upper = None
+        self.alts9_11_hsv_lower = None
+        self.alts9_11_hsv_upper = None
         # Keep behind-net / near-net HSV fully disabled by default.
         # Set DISABLE_BEHIND_NET=0 to temporarily re-enable it if needed.
         self.disable_behind_net_mode = os.environ.get("DISABLE_BEHIND_NET", "1") == "1"
@@ -174,6 +177,9 @@ class InteractiveBallAnalyzer:
                 self.focus_loss_frame = self.frame_count
                 self.focus_loss_active = True
                 self.using_alt_hsv = True
+                self.using_alt2_hsv = False
+                self.using_alt3_hsv = False
+                self.using_alt6_hsv = False
                 if self.alt_focus_hsv_lower is not None and self.alt_focus_hsv_upper is not None:
                     self.hsv_lower = self.alt_focus_hsv_lower
                     self.hsv_upper = self.alt_focus_hsv_upper
@@ -315,6 +321,8 @@ class InteractiveBallAnalyzer:
             return "alt5"
         if key.startswith("alt6"):
             return "alt6"
+        if key.startswith("alts9_11") or key.startswith("alts911"):
+            return "alts9_11"
         if key.startswith("behind_net") or key.startswith("at_edge"):
             return "behind_net"
         if key.startswith("regular") or key in ("single", "single_prefocus", "serve_area", "current"):
@@ -404,7 +412,7 @@ class InteractiveBallAnalyzer:
     def _find_persistent_false_point(self, pos, filter_key=None):
         px, py = pos
         normalized_key = self._normalize_false_point_filter_key(filter_key)
-        alt_family = {"alt2", "alt4", "alt5", "alt6"}
+        alt_family = {"alt2", "alt4", "alt5", "alt6", "alts9_11"}
         for entry in getattr(self, "_persistent_false_points", []):
             entry_keys = entry.get("filter_keys", [])
             if normalized_key is not None and entry_keys:
@@ -464,7 +472,7 @@ class InteractiveBallAnalyzer:
 
     def _observe_steady_false_point(self, pos, filter_key, area, motion_mean, motion_max, reason):
         normalized_key = self._normalize_false_point_filter_key(filter_key)
-        if normalized_key not in ("alt2", "alt6", "alt4", "alt5"):
+        if normalized_key not in ("alt2", "alt6", "alt4", "alt5", "alts9_11"):
             return False
         if area > 18.0 or motion_mean > 3.5 or motion_max > 12.0:
             return False
@@ -588,7 +596,7 @@ class InteractiveBallAnalyzer:
             return None
 
         lower, upper, label = self.get_standard_hsv_for_position(prev_pos[1])
-        if label != "regular_court" or lower is None or upper is None:
+        if label not in {"regular_court", "primary"} or lower is None or upper is None:
             return None
 
         hsv_frame = cv2.cvtColor(search_frame, cv2.COLOR_BGR2HSV)
@@ -614,32 +622,50 @@ class InteractiveBallAnalyzer:
             cx = int(M["m10"] / M["m00"]) + x1
             cy = int(M["m01"] / M["m00"]) + y1
 
-            ignored_entry = self._find_ignored_tracking_position((cx, cy), filter_key="regular_court")
-            if ignored_entry is not None:
-                continue
-            if contact_bounds is not None and (
-                    cx < contact_bounds["min_x"] or
-                    cx > contact_bounds["max_x"] or
-                    cy < contact_bounds["min_y"]):
-                continue
-
             motion_metrics = self._candidate_motion_metrics(frame_gray, cx, cy)
             motion_mean = motion_metrics["mean"] if motion_metrics is not None else 0.0
             motion_max = motion_metrics["max"] if motion_metrics is not None else 0.0
+            distance = math.hypot(cx - prev_pos[0], cy - prev_pos[1])
+            predicted_distance = (
+                math.hypot(cx - predicted_point[0], cy - predicted_point[1])
+                if predicted_point is not None else None
+            )
+
+            ignored_entry = self._find_ignored_tracking_position((cx, cy), filter_key="regular_court")
+            ignored_ball_override = (
+                ignored_entry is not None and
+                motion_max >= 40.0 and
+                motion_mean >= 10.0 and
+                (predicted_distance is None or predicted_distance <= 40.0)
+            )
+            if ignored_entry is not None and not ignored_ball_override:
+                continue
+            if ignored_ball_override:
+                print(
+                    f"  DEBUG: Single regular candidate bypassing ignored hotspot at ({cx},{cy}) "
+                    f"motion_mean={motion_mean:.1f} motion_max={motion_max:.1f}"
+                )
+
+            relaxed_min_y = None
+            if contact_bounds is not None:
+                relaxed_min_y = contact_bounds["min_y"]
+                if (predicted_distance is not None and predicted_distance <= 40.0 and
+                        motion_max >= 40.0 and motion_mean >= 10.0):
+                    relaxed_min_y = max(0, relaxed_min_y - 28)
+                if (cx < contact_bounds["min_x"] or
+                        cx > contact_bounds["max_x"] or
+                        cy < relaxed_min_y):
+                    continue
+
             frame0_hotspot = self._find_frame0_background_hotspot((cx, cy))
             if frame0_hotspot is not None and motion_mean < 8.0 and motion_max < 35.0:
                 continue
             if cy < 100 and motion_mean < 2.5 and motion_max < 10.0:
                 continue
 
-            distance = math.hypot(cx - prev_pos[0], cy - prev_pos[1])
             size_ratio = 0.0
             if self.ball_size and self.ball_size > 0:
                 size_ratio = abs(area - self.ball_size) / self.ball_size
-            predicted_distance = (
-                math.hypot(cx - predicted_point[0], cy - predicted_point[1])
-                if predicted_point is not None else None
-            )
             score = distance + (size_ratio * 30.0)
             if predicted_distance is not None:
                 score += predicted_distance * 0.4
@@ -662,6 +688,65 @@ class InteractiveBallAnalyzer:
             f"area={candidate['area']:.1f} score={candidate['score']:.1f}"
         )
         return candidate
+
+    def _activate_regular_hsv(self):
+        self.using_alt_hsv = False
+        self.using_alt2_hsv = False
+        self.using_alt3_hsv = False
+        self.using_alt6_hsv = False
+        if self.hsv_regular is not None:
+            self.hsv_lower = self.hsv_regular['lower']
+            self.hsv_upper = self.hsv_regular['upper']
+        elif self.primary_hsv_lower is not None and self.primary_hsv_upper is not None:
+            self.hsv_lower = self.primary_hsv_lower
+            self.hsv_upper = self.primary_hsv_upper
+
+    def _should_use_single_regular_candidate(self, regular_single, predicted_point, search_radius,
+                                             current_pos=None, current_area=0.0,
+                                             current_score=None, current_distance=None,
+                                             current_predicted_distance=None):
+        if regular_single is None or self.ball_center is None:
+            return False
+
+        min_regular_area = 4.0
+        if self.ball_size is not None and self.ball_size > 0:
+            min_regular_area = max(min_regular_area, min(18.0, self.ball_size * 0.28))
+        if current_area is not None and current_area > 0:
+            min_regular_area = max(
+                min_regular_area,
+                min(14.0, current_area * 0.38),
+            )
+        if regular_single["area"] < min_regular_area:
+            return False
+
+        regular_predicted_distance = regular_single.get("predicted_distance")
+        if current_pos is None:
+            if search_radius is None:
+                search_radius = float(self.max_ball_speed or 95)
+            distance_cap = max(95.0, min(float(search_radius), 135.0))
+            predicted_cap = max(28.0, min(72.0, float(search_radius) * 0.22))
+            if regular_single["distance"] > distance_cap:
+                return False
+            if (predicted_point is not None and regular_predicted_distance is not None and
+                    regular_predicted_distance > predicted_cap):
+                return False
+            return True
+
+        regular_pos_gap = math.hypot(
+            regular_single["pos"][0] - current_pos[0],
+            regular_single["pos"][1] - current_pos[1],
+        )
+        return (
+            regular_pos_gap <= 24.0 and
+            regular_single["score"] <= current_score + 30.0 and
+            regular_single["distance"] <= current_distance + 16.0 and
+            (
+                predicted_point is None or
+                current_predicted_distance is None or
+                regular_predicted_distance is None or
+                regular_predicted_distance <= current_predicted_distance + 20.0
+            )
+        )
 
     def _find_ignored_tracking_position(self, pos, filter_key=None):
         px, py = pos
@@ -716,7 +801,30 @@ class InteractiveBallAnalyzer:
             specs.append(("alt2", self.alt2_hsv_lower, self.alt2_hsv_upper))
         if self.alt3_hsv_lower is not None and self.alt3_hsv_upper is not None:
             specs.append(("alt3", self.alt3_hsv_lower, self.alt3_hsv_upper))
+        if self.alts9_11_hsv_lower is not None and self.alts9_11_hsv_upper is not None:
+            specs.append(("alts9_11", self.alts9_11_hsv_lower, self.alts9_11_hsv_upper))
         return specs
+
+    def _build_sparse_low_s_mask(self, hsv_frame, lower, upper):
+        if lower is None or upper is None:
+            return None
+        mask = cv2.inRange(hsv_frame, lower, upper)
+        mask = cv2.dilate(mask, np.ones((2, 2), np.uint8), iterations=1)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((2, 2), np.uint8))
+        return mask
+
+    def _should_try_alts9_11_override(self, frame_shape, allow_inactive):
+        if allow_inactive:
+            return False
+        if self.alts9_11_hsv_lower is None or self.alts9_11_hsv_upper is None:
+            return False
+        if self.ball_center is None or self.last_motion is None:
+            return False
+        if self.ball_center[1] > max(300, int(frame_shape[0] * 0.14)):
+            return False
+        if self.ball_size is not None and self.ball_size > 20:
+            return False
+        return self.last_motion.get('distance', 0.0) <= 8.0
 
     def _behind_net_enabled(self):
         return (not self.disable_behind_net_mode) and self.hsv_behind_net is not None
@@ -961,6 +1069,41 @@ class InteractiveBallAnalyzer:
             override_metrics['predicted_distance'] is not None and
             override_metrics['predicted_distance'] > current_metrics['predicted_distance'] + 25.0
         )
+        override_much_smaller = (
+            current_area is not None and current_area >= 8.0 and
+            override.get('area', 0.0) <= max(3.0, current_area * 0.35)
+        )
+        if override_much_smaller and (
+                override_farther_from_prev or override_farther_from_predicted):
+            print(
+                f"  DEBUG: Rejecting {label} override at {override['pos']} - "
+                f"override area {override.get('area', 0.0):.1f}px too small vs current {current_area:.1f}px"
+            )
+            return False
+
+        if label == "alts9_11":
+            current_jump = current_metrics['prev_distance'] >= 55.0
+            override_track_lock = override_metrics['prev_distance'] + 30.0 < current_metrics['prev_distance']
+            override_dynamic = (
+                override_metrics['motion_max'] >= 18.0 or
+                override_metrics['motion_mean'] >= 6.0
+            )
+            if current_jump and override_track_lock and override_dynamic:
+                print(
+                    f"  DEBUG: Accepting {label} override at {override['pos']} - "
+                    f"closer to previous track than current jump {current_pos}"
+                )
+                return True
+            reject_reason = "current pick is not a suspicious jump"
+            if current_jump and not override_track_lock:
+                reject_reason = "override is not close enough to previous track"
+            elif current_jump and not override_dynamic:
+                reject_reason = "override is too static"
+            print(
+                f"  DEBUG: Rejecting {label} override at {override['pos']} - {reject_reason}"
+            )
+            return False
+
         if current_dynamic and override_weaker_motion and (
                 override_farther_from_prev or override_farther_from_predicted):
             print(
@@ -1403,7 +1546,7 @@ class InteractiveBallAnalyzer:
         }
 
     def retrack_with_alt2_hsv(self, search_frame, x1, y1, prev_pos, predicted_point, prev_ball_size, allow_inactive,
-                              lower=None, upper=None, frame_gray=None, filter_key="alt2"):
+                              lower=None, upper=None, frame_gray=None, filter_key="alt2", sparse_mode=False):
         """Re-run detection with alternative 2 HSV (H 46-72) when stuck."""
         hsv_lower = lower if lower is not None else self.alt2_hsv_lower
         hsv_upper = upper if upper is not None else self.alt2_hsv_upper
@@ -1411,10 +1554,13 @@ class InteractiveBallAnalyzer:
             return None
         
         hsv_frame = cv2.cvtColor(search_frame, cv2.COLOR_BGR2HSV)
-        mask_alt2 = cv2.inRange(hsv_frame, hsv_lower, hsv_upper)
-        kernel = np.ones((2, 2), np.uint8)
-        mask_alt2 = cv2.morphologyEx(mask_alt2, cv2.MORPH_OPEN, kernel)
-        mask_alt2 = cv2.morphologyEx(mask_alt2, cv2.MORPH_CLOSE, kernel)
+        if sparse_mode:
+            mask_alt2 = self._build_sparse_low_s_mask(hsv_frame, hsv_lower, hsv_upper)
+        else:
+            mask_alt2 = cv2.inRange(hsv_frame, hsv_lower, hsv_upper)
+            kernel = np.ones((2, 2), np.uint8)
+            mask_alt2 = cv2.morphologyEx(mask_alt2, cv2.MORPH_OPEN, kernel)
+            mask_alt2 = cv2.morphologyEx(mask_alt2, cv2.MORPH_CLOSE, kernel)
         contours_alt2, _ = cv2.findContours(mask_alt2, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
         if not contours_alt2:
@@ -1665,6 +1811,7 @@ class InteractiveBallAnalyzer:
             ("alt4", self.alt4_hsv_lower, self.alt4_hsv_upper),
             ("alt5", self.alt5_hsv_lower, self.alt5_hsv_upper),
             ("alt6", self.alt6_hsv_lower, self.alt6_hsv_upper),
+            ("alts9_11", self.alts9_11_hsv_lower, self.alts9_11_hsv_upper),
         ]
         best = None
         best_distance = None
@@ -1673,7 +1820,8 @@ class InteractiveBallAnalyzer:
                 continue
             retrack = self.retrack_with_alt2_hsv(
                 search_frame, x1, y1, self.ball_center, predicted_point, self.ball_size, False,
-                lower=lower, upper=upper, frame_gray=frame_gray, filter_key=label
+                lower=lower, upper=upper, frame_gray=frame_gray, filter_key=label,
+                sparse_mode=(label == "alts9_11")
             )
             if retrack is None:
                 continue
@@ -1779,6 +1927,9 @@ class InteractiveBallAnalyzer:
         if self.alt6_hsv_lower is not None and self.alt6_hsv_upper is not None:
             self.show_alternative_debug(frame, point, self.alt6_hsv_lower, self.alt6_hsv_upper,
                                         f"Predicted {frame_index} (alt6)")
+        if self.alts9_11_hsv_lower is not None and self.alts9_11_hsv_upper is not None:
+            self.show_alternative_debug(frame, point, self.alts9_11_hsv_lower, self.alts9_11_hsv_upper,
+                                        f"Predicted {frame_index} (alts9_11)")
 
     def open_prev_frame_hsv_debug(self, frame, point, frame_index, hsv_slot):
         """Open HSV debug windows around the last ball in the previous frame."""
@@ -1975,6 +2126,13 @@ class InteractiveBallAnalyzer:
                     self.alt6_hsv_upper = np.array([
                         config["alt6"]["h_max"], config["alt6"]["s_max"], config["alt6"]["v_max"]
                     ], dtype=np.uint8)
+                if "alts9_11" in config:
+                    self.alts9_11_hsv_lower = np.array([
+                        config["alts9_11"]["h_min"], config["alts9_11"]["s_min"], config["alts9_11"]["v_min"]
+                    ], dtype=np.uint8)
+                    self.alts9_11_hsv_upper = np.array([
+                        config["alts9_11"]["h_max"], config["alts9_11"]["s_max"], config["alts9_11"]["v_max"]
+                    ], dtype=np.uint8)
                 # Use primary as active by default (full config range)
                 self.hsv_lower = self.primary_hsv_lower
                 self.hsv_upper = self.primary_hsv_upper
@@ -1988,6 +2146,8 @@ class InteractiveBallAnalyzer:
     
     def select_hsv_for_position(self, y_position, at_edge=False):
         """Select appropriate HSV config based on ball Y position."""
+        if self.using_alt6_hsv and self.alt6_hsv_lower is not None and self.alt6_hsv_upper is not None:
+            return self.alt6_hsv_lower, self.alt6_hsv_upper, "alternative_6"
         if self.using_alt3_hsv and self.alt3_hsv_lower is not None and self.alt3_hsv_upper is not None:
             return self.alt3_hsv_lower, self.alt3_hsv_upper, "alternative_3"
         if self.using_alt2_hsv and self.alt2_hsv_lower is not None and self.alt2_hsv_upper is not None:
@@ -2525,6 +2685,7 @@ class InteractiveBallAnalyzer:
         _append("alt4", "ALT4", self.alt4_hsv_lower, self.alt4_hsv_upper)
         _append("alt5", "ALT5", self.alt5_hsv_lower, self.alt5_hsv_upper)
         _append("alt6", "ALT6", self.alt6_hsv_lower, self.alt6_hsv_upper)
+        _append("alts9_11", "ALTS9_11", self.alts9_11_hsv_lower, self.alts9_11_hsv_upper)
         return specs
 
     def _apply_click_hsv_tuner_updates(self, specs):
@@ -2556,7 +2717,8 @@ class InteractiveBallAnalyzer:
                     self._behind_net_enabled() and
                     self.net_area_y_min <= self.ball_center[1] <= self.net_area_y_max
                 )
-                if not in_net_area and not self.using_alt_hsv and not self.using_alt2_hsv and not self.using_alt3_hsv:
+                if (not in_net_area and not self.using_alt_hsv and not self.using_alt2_hsv
+                        and not self.using_alt3_hsv and not self.using_alt6_hsv):
                     self.hsv_lower = lower.copy()
                     self.hsv_upper = upper.copy()
             elif key == "alt1":
@@ -2577,15 +2739,21 @@ class InteractiveBallAnalyzer:
                 if self.using_alt3_hsv:
                     self.hsv_lower = lower.copy()
                     self.hsv_upper = upper.copy()
+            elif key == "alt6":
+                self.alt6_hsv_lower = lower.copy()
+                self.alt6_hsv_upper = upper.copy()
+                if self.using_alt6_hsv:
+                    self.hsv_lower = lower.copy()
+                    self.hsv_upper = upper.copy()
+            elif key == "alts9_11":
+                self.alts9_11_hsv_lower = lower.copy()
+                self.alts9_11_hsv_upper = upper.copy()
             elif key == "alt4":
                 self.alt4_hsv_lower = lower.copy()
                 self.alt4_hsv_upper = upper.copy()
             elif key == "alt5":
                 self.alt5_hsv_lower = lower.copy()
                 self.alt5_hsv_upper = upper.copy()
-            elif key == "alt6":
-                self.alt6_hsv_lower = lower.copy()
-                self.alt6_hsv_upper = upper.copy()
 
     def _save_click_hsv_tuner_config(self, specs):
         config_path = self.config_file or 'hsv_config.json'
@@ -3207,7 +3375,6 @@ class InteractiveBallAnalyzer:
                 getattr(self, '_upper_exit_wait_frames', 0) > 0
             )
         )
-        
         if should_check_both:
             # Search with BOTH filters and combine results
             hsv_mode = "dual_net"
@@ -3423,6 +3590,26 @@ class InteractiveBallAnalyzer:
                     self._contact_recovery_frames = max(getattr(self, '_contact_recovery_frames', 0), 4)
                     return self.ball_center
 
+            if (not allow_inactive and self.ball_center is not None
+                    and contact_reacquire_bounds is not None
+                    and self.ball_center[1] <= 260
+                    and (self.ball_size is None or self.ball_size <= 35)
+                    and self.stuck_frame_count >= 2):
+                regular_single = self._find_single_standard_candidate(
+                    search_frame, x1, y1, self.ball_center, predicted_point, frame_gray
+                )
+                regular_search_radius = search_radius if search_radius is not None else max(x2 - x1, y2 - y1) / 2.0
+                if self._should_use_single_regular_candidate(
+                        regular_single, predicted_point, regular_search_radius):
+                    new_pos = regular_single['pos']
+                    hsv_full = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+                    self.ball_center = new_pos
+                    self.ball_hsv = hsv_full[new_pos[1], new_pos[0]]
+                    self.ball_size = regular_single['area']
+                    self._activate_regular_hsv()
+                    print(f"Frame {self.frame_count}: [REGULAR RECOVER] Ball at {new_pos}")
+                    return self.ball_center
+
             # Fallback: try alternative HSV if primary found nothing
             if self.alt_focus_hsv_lower is not None and self.alt_focus_hsv_upper is not None:
                 if getattr(self, 'edge_wait', False) and self.last_motion:
@@ -3449,6 +3636,8 @@ class InteractiveBallAnalyzer:
                     self.ball_size = retrack['area']
                     self.using_alt_hsv = True
                     self.using_alt2_hsv = False
+                    self.using_alt3_hsv = False
+                    self.using_alt6_hsv = False
                     if self.alt_focus_hsv_lower is not None and self.alt_focus_hsv_upper is not None:
                         self.hsv_lower = self.alt_focus_hsv_lower
                         self.hsv_upper = self.alt_focus_hsv_upper
@@ -3469,6 +3658,7 @@ class InteractiveBallAnalyzer:
                     self.using_alt_hsv = False
                     self.using_alt2_hsv = True
                     self.using_alt3_hsv = False
+                    self.using_alt6_hsv = False
                     self.hsv_lower = self.alt2_hsv_lower
                     self.hsv_upper = self.alt2_hsv_upper
                     print(f"Frame {self.frame_count}: [ALT2 HSV RECOVER] Ball at {new_pos}")
@@ -3496,9 +3686,29 @@ class InteractiveBallAnalyzer:
                                 self.ball_size = retrack3['area']
                                 self.using_alt2_hsv = False
                                 self.using_alt3_hsv = True
+                                self.using_alt6_hsv = False
                                 self.hsv_lower = self.alt3_hsv_lower
                                 self.hsv_upper = self.alt3_hsv_upper
                                 print(f"Frame {self.frame_count}: [ALT3 HSV RECOVER] Ball at {new_pos}")
+                    return self.ball_center
+            if self.alt6_hsv_lower is not None and self.alt6_hsv_upper is not None:
+                retrack6 = self.retrack_with_alt2_hsv(
+                    search_frame, x1, y1, self.ball_center, predicted_point, self.ball_size, allow_inactive,
+                    lower=self.alt6_hsv_lower, upper=self.alt6_hsv_upper, frame_gray=frame_gray,
+                    filter_key="alt6"
+                )
+                if retrack6 is not None:
+                    new_pos = retrack6['pos']
+                    self.ball_center = new_pos
+                    self.ball_hsv = retrack6['hsv']
+                    self.ball_size = retrack6['area']
+                    self.using_alt_hsv = False
+                    self.using_alt2_hsv = False
+                    self.using_alt3_hsv = False
+                    self.using_alt6_hsv = True
+                    self.hsv_lower = self.alt6_hsv_lower
+                    self.hsv_upper = self.alt6_hsv_upper
+                    print(f"Frame {self.frame_count}: [ALT6 HSV RECOVER] Ball at {new_pos}")
                     return self.ball_center
             if self.alt3_hsv_lower is not None and self.alt3_hsv_upper is not None:
                 retrack3 = self.retrack_with_alt2_hsv(
@@ -3514,6 +3724,7 @@ class InteractiveBallAnalyzer:
                     self.using_alt_hsv = False
                     self.using_alt2_hsv = False
                     self.using_alt3_hsv = True
+                    self.using_alt6_hsv = False
                     self.hsv_lower = self.alt3_hsv_lower
                     self.hsv_upper = self.alt3_hsv_upper
                     print(f"Frame {self.frame_count}: [ALT3 HSV RECOVER] Ball at {new_pos}")
@@ -3531,6 +3742,7 @@ class InteractiveBallAnalyzer:
                     self.using_alt_hsv = False
                     self.using_alt2_hsv = False
                     self.using_alt3_hsv = False
+                    self.using_alt6_hsv = False
                     self.hsv_lower = upper_exit_low_s['lower']
                     self.hsv_upper = upper_exit_low_s['upper']
                     self.stuck_frame_count = 0
@@ -3926,7 +4138,6 @@ class InteractiveBallAnalyzer:
                         score -= 10.0
                 elif source == 'behind_net' and cy >= prev_y + 8:
                     score += 140.0
-             
             candidates.append((i, source, cx, cy, area, distance, size_ratio, score))
             predicted_distance_meta = (
                 math.hypot(cx - predicted_point[0], cy - predicted_point[1])
@@ -4145,7 +4356,8 @@ class InteractiveBallAnalyzer:
             current_filter_key = self._candidate_false_point_filter_key(best_source, hsv_mode)
             if (not allow_inactive and best_source == "alt6"
                     and self.ball_center is not None and contact_reacquire_bounds is not None
-                    and self.ground_bounce_count > 0 and self.ball_center[1] <= 260):
+                    and self.ball_center[1] <= 260
+                    and (self.ball_size is None or self.ball_size <= 35)):
                 regular_single = self._find_single_standard_candidate(
                     search_frame, x1, y1, self.ball_center, predicted_point, frame_gray
                 )
@@ -4155,30 +4367,18 @@ class InteractiveBallAnalyzer:
                         math.hypot(cx - predicted_point[0], cy - predicted_point[1])
                         if predicted_point is not None else None
                     )
-                    regular_predicted_distance = regular_single.get("predicted_distance")
-                    regular_pos_gap = math.hypot(
-                        regular_single["pos"][0] - cx,
-                        regular_single["pos"][1] - cy,
-                    )
-                    min_regular_area = 4.0
-                    if self.ball_size is not None and self.ball_size > 0:
-                        min_regular_area = max(min_regular_area, min(18.0, self.ball_size * 0.28))
-                    if selected_area_for_precedence > 0:
-                        min_regular_area = max(
-                            min_regular_area,
-                            min(14.0, selected_area_for_precedence * 0.38),
-                        )
-                    if (regular_single["area"] >= min_regular_area and
-                            regular_pos_gap <= 24.0 and
-                            regular_single["score"] <= best_score + 30.0 and
-                            regular_single["distance"] <= current_distance + 16.0 and
-                            (predicted_point is None or current_predicted_distance is None or
-                             regular_predicted_distance is None or
-                             regular_predicted_distance <= current_predicted_distance + 20.0)):
+                    if self._should_use_single_regular_candidate(
+                            regular_single, predicted_point, search_radius,
+                            current_pos=(cx, cy),
+                            current_area=selected_area_for_precedence,
+                            current_score=best_score,
+                            current_distance=current_distance,
+                            current_predicted_distance=current_predicted_distance):
                         best_contour = regular_single["contour"]
                         best_source = "regular"
                         best_score = regular_single["score"]
                         cx, cy = regular_single["pos"]
+                        self._activate_regular_hsv()
                         print(
                             f"Frame {self.frame_count}: [REGULAR PRECEDENCE] "
                             f"Using single regular candidate at ({cx}, {cy})"
@@ -4195,6 +4395,10 @@ class InteractiveBallAnalyzer:
                 self.hsv_lower = self.alt5_hsv_lower
                 self.hsv_upper = self.alt5_hsv_upper
             elif best_source == 'alt6' and self.alt6_hsv_lower is not None and self.alt6_hsv_upper is not None:
+                self.using_alt_hsv = False
+                self.using_alt2_hsv = False
+                self.using_alt3_hsv = False
+                self.using_alt6_hsv = True
                 self.hsv_lower = self.alt6_hsv_lower
                 self.hsv_upper = self.alt6_hsv_upper
             
@@ -4249,6 +4453,8 @@ class InteractiveBallAnalyzer:
                         bulb_size = retrack['area']
                         self.using_alt_hsv = True
                         self.using_alt2_hsv = False
+                        self.using_alt3_hsv = False
+                        self.using_alt6_hsv = False
                         if self.alt_focus_hsv_lower is not None and self.alt_focus_hsv_upper is not None:
                             self.hsv_lower = self.alt_focus_hsv_lower
                             self.hsv_upper = self.alt_focus_hsv_upper
@@ -4269,6 +4475,7 @@ class InteractiveBallAnalyzer:
                             self.using_alt_hsv = False
                             self.using_alt2_hsv = True
                             self.using_alt3_hsv = False
+                            self.using_alt6_hsv = False
                             self.hsv_lower = self.alt2_hsv_lower
                             self.hsv_upper = self.alt2_hsv_upper
                             print(f"Frame {self.frame_count}: [ALT2 HSV OVERRIDE] Ball at ({cx}, {cy})")
@@ -4299,10 +4506,51 @@ class InteractiveBallAnalyzer:
                                         bulb_size = retrack3['area']
                                         self.using_alt2_hsv = False
                                         self.using_alt3_hsv = True
+                                        self.using_alt6_hsv = False
                                         self.hsv_lower = self.alt3_hsv_lower
                                         self.hsv_upper = self.alt3_hsv_upper
                                         print(f"Frame {self.frame_count}: [ALT3 HSV OVERRIDE] Ball at ({cx}, {cy})")
-                    elif self.alt3_hsv_lower is not None and self.alt3_hsv_upper is not None:
+                    if (not override_applied and self.alt6_hsv_lower is not None and
+                            self.alt6_hsv_upper is not None):
+                        retrack6 = self.retrack_with_alt2_hsv(
+                            search_frame, x1, y1, self.ball_center, predicted_point, self.ball_size, allow_inactive,
+                            lower=self.alt6_hsv_lower, upper=self.alt6_hsv_upper, frame_gray=frame_gray,
+                            filter_key="alt6"
+                        )
+                        if retrack6 is not None and self._should_accept_hsv_override(
+                                "alt6", retrack6, current_pos, current_area, prev_pos, predicted_point,
+                                frame_gray, current_filter_key=current_filter_key):
+                            cx, cy = retrack6['pos']
+                            hsv_values = retrack6['hsv']
+                            bulb_size = retrack6['area']
+                            self.using_alt_hsv = False
+                            self.using_alt2_hsv = False
+                            self.using_alt3_hsv = False
+                            self.using_alt6_hsv = True
+                            self.hsv_lower = self.alt6_hsv_lower
+                            self.hsv_upper = self.alt6_hsv_upper
+                            print(f"Frame {self.frame_count}: [ALT6 HSV OVERRIDE] Ball at ({cx}, {cy})")
+                            override_applied = True
+                    if self._should_try_alts9_11_override(frame.shape, allow_inactive):
+                        specialist_current_pos = (cx, cy)
+                        specialist_current_area = bulb_size
+                        retrack_s911 = self.retrack_with_alt2_hsv(
+                            search_frame, x1, y1, self.ball_center, predicted_point, self.ball_size, allow_inactive,
+                            lower=self.alts9_11_hsv_lower, upper=self.alts9_11_hsv_upper,
+                            frame_gray=frame_gray, filter_key="alts9_11", sparse_mode=True
+                        )
+                        if retrack_s911 is not None and self._should_accept_hsv_override(
+                                "alts9_11", retrack_s911, specialist_current_pos, specialist_current_area,
+                                prev_pos, predicted_point,
+                                frame_gray, current_filter_key=current_filter_key):
+                            cx, cy = retrack_s911['pos']
+                            hsv_values = retrack_s911['hsv']
+                            bulb_size = retrack_s911['area']
+                            print(f"Frame {self.frame_count}: [ALTS9_11 HSV OVERRIDE] Ball at ({cx}, {cy})")
+                            override_applied = True
+                    if (not override_applied and
+                            (self.alt6_hsv_lower is None or self.alt6_hsv_upper is None) and
+                            self.alt3_hsv_lower is not None and self.alt3_hsv_upper is not None):
                         retrack3 = self.retrack_with_alt2_hsv(
                             search_frame, x1, y1, self.ball_center, predicted_point, self.ball_size, allow_inactive,
                             lower=self.alt3_hsv_lower, upper=self.alt3_hsv_upper, frame_gray=frame_gray,
@@ -4317,6 +4565,7 @@ class InteractiveBallAnalyzer:
                             self.using_alt_hsv = False
                             self.using_alt2_hsv = False
                             self.using_alt3_hsv = True
+                            self.using_alt6_hsv = False
                             self.hsv_lower = self.alt3_hsv_lower
                             self.hsv_upper = self.alt3_hsv_upper
                             print(f"Frame {self.frame_count}: [ALT3 HSV OVERRIDE] Ball at ({cx}, {cy})")
@@ -4654,6 +4903,8 @@ class InteractiveBallAnalyzer:
             if self.using_alt_hsv and not self.using_alt2_hsv and self.last_motion and self.last_motion['distance'] == 0:
                 print(f"Frame {self.frame_count}: No movement detected, switching to alternative 2 HSV")
                 self.using_alt2_hsv = True
+                self.using_alt3_hsv = False
+                self.using_alt6_hsv = False
                 if self.alt2_hsv_lower is not None and self.alt2_hsv_upper is not None:
                     self.hsv_lower = self.alt2_hsv_lower
                     self.hsv_upper = self.alt2_hsv_upper
@@ -4740,6 +4991,25 @@ class InteractiveBallAnalyzer:
             print(f"  DEBUG:   - Consider adjusting size filter if ball is visible")
             if predicted_point:
                 print(f"  DEBUG: Predicted point was {predicted_point}, consider widening search around it")
+        if (best_contour is None and not allow_inactive and self.ball_center is not None
+                and contact_reacquire_bounds is not None
+                and self.ball_center[1] <= 260
+                and (self.ball_size is None or self.ball_size <= 35)
+                and self.stuck_frame_count >= 2):
+            regular_single = self._find_single_standard_candidate(
+                search_frame, x1, y1, self.ball_center, predicted_point, frame_gray
+            )
+            regular_search_radius = search_radius if search_radius is not None else max(x2 - x1, y2 - y1) / 2.0
+            if self._should_use_single_regular_candidate(
+                    regular_single, predicted_point, regular_search_radius):
+                new_pos = regular_single['pos']
+                hsv_full = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+                self.ball_center = new_pos
+                self.ball_hsv = hsv_full[new_pos[1], new_pos[0]]
+                self.ball_size = regular_single['area']
+                self._activate_regular_hsv()
+                print(f"Frame {self.frame_count}: [REGULAR RECOVER] Ball at {new_pos}")
+                return self.ball_center
         # Early-frame fallback: if nothing selected, try full-frame smallest contour
         if best_contour is None and early_frames:
             fallback_mask = cv2.inRange(frame, hsv_lower_use, hsv_upper_use) if 'hsv_lower_use' in locals() else None
@@ -4769,6 +5039,7 @@ class InteractiveBallAnalyzer:
                 self.using_alt_hsv = False
                 self.using_alt2_hsv = False
                 self.using_alt3_hsv = False
+                self.using_alt6_hsv = False
                 self.hsv_lower = upper_exit_low_s['lower']
                 self.hsv_upper = upper_exit_low_s['upper']
                 self.stuck_frame_count = 0
@@ -4916,6 +5187,8 @@ class InteractiveBallAnalyzer:
             cv2.putText(result, motion_text, (10, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
         if self.focus_loss_active:
             cv2.putText(result, "FOCUS LOST", (10, 180), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        elif self.using_alt6_hsv:
+            cv2.putText(result, "USING ALTERNATIVE 6 HSV", (10, 180), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         elif self.using_alt2_hsv:
             cv2.putText(result, "USING ALTERNATIVE 2 HSV", (10, 180), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         elif self.using_alt_hsv:
@@ -5411,6 +5684,8 @@ class InteractiveBallAnalyzer:
             self.near_edge = False
             self.using_alt_hsv = False
             self.using_alt2_hsv = False
+            self.using_alt3_hsv = False
+            self.using_alt6_hsv = False
             self.focus_loss_active = False
             self.stuck_frame_count = 0
             self.point_start_frame_internal = None
@@ -5584,6 +5859,8 @@ class InteractiveBallAnalyzer:
             if game_state == "WAITING_FOR_SERVE" and self.frame_count <= (self.start_frame + early_serve_grace_frames):
                 self.using_alt_hsv = False
                 self.using_alt2_hsv = False
+                self.using_alt3_hsv = False
+                self.using_alt6_hsv = False
                 candidate = self.track_ball_in_frame(frame, allow_inactive=True)
                 if candidate is not None:
                     if hasattr(self, 'serve_area_x_min'):
