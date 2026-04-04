@@ -60,9 +60,10 @@ class InteractiveBallAnalyzer:
         self.using_alt3_hsv = False
         self.alt3_hsv_lower = None
         self.alt3_hsv_upper = None
-        self.using_alt6_hsv = False
+        self.using_alt4_hsv = False
         self.alt4_hsv_lower = None
         self.alt4_hsv_upper = None
+        self.using_alt6_hsv = False
         self.alt5_hsv_lower = None
         self.alt5_hsv_upper = None
         self.alt6_hsv_lower = None
@@ -697,6 +698,7 @@ class InteractiveBallAnalyzer:
         self.using_alt_hsv = False
         self.using_alt2_hsv = False
         self.using_alt3_hsv = False
+        self.using_alt4_hsv = False
         self.using_alt6_hsv = False
         if self.hsv_regular is not None:
             self.hsv_lower = self.hsv_regular['lower']
@@ -2174,6 +2176,8 @@ class InteractiveBallAnalyzer:
             return self.alt6_hsv_lower, self.alt6_hsv_upper, "alternative_6"
         if self.using_alt3_hsv and self.alt3_hsv_lower is not None and self.alt3_hsv_upper is not None:
             return self.alt3_hsv_lower, self.alt3_hsv_upper, "alternative_3"
+        if self.using_alt4_hsv and self.alt4_hsv_lower is not None and self.alt4_hsv_upper is not None:
+            return self.alt4_hsv_lower, self.alt4_hsv_upper, "alternative_4"
         if self.using_alt2_hsv and self.alt2_hsv_lower is not None and self.alt2_hsv_upper is not None:
             return self.alt2_hsv_lower, self.alt2_hsv_upper, "alternative_2"
         if self.using_alt_hsv and self.alt_focus_hsv_lower is not None and self.alt_focus_hsv_upper is not None:
@@ -3665,6 +3669,7 @@ class InteractiveBallAnalyzer:
                     self.using_alt_hsv = True
                     self.using_alt2_hsv = False
                     self.using_alt3_hsv = False
+                    self.using_alt4_hsv = False
                     self.using_alt6_hsv = False
                     if self.alt_focus_hsv_lower is not None and self.alt_focus_hsv_upper is not None:
                         self.hsv_lower = self.alt_focus_hsv_lower
@@ -3686,6 +3691,7 @@ class InteractiveBallAnalyzer:
                     self.using_alt_hsv = False
                     self.using_alt2_hsv = True
                     self.using_alt3_hsv = False
+                    self.using_alt4_hsv = False
                     self.using_alt6_hsv = False
                     self.hsv_lower = self.alt2_hsv_lower
                     self.hsv_upper = self.alt2_hsv_upper
@@ -3719,6 +3725,26 @@ class InteractiveBallAnalyzer:
                                 self.hsv_upper = self.alt3_hsv_upper
                                 print(f"Frame {self.frame_count}: [ALT3 HSV RECOVER] Ball at {new_pos}")
                     return self.ball_center
+            if self.alt4_hsv_lower is not None and self.alt4_hsv_upper is not None:
+                retrack4 = self.retrack_with_alt2_hsv(
+                    search_frame, x1, y1, self.ball_center, predicted_point, self.ball_size, allow_inactive,
+                    lower=self.alt4_hsv_lower, upper=self.alt4_hsv_upper, frame_gray=frame_gray,
+                    filter_key="alt4"
+                )
+                if retrack4 is not None:
+                    new_pos = retrack4['pos']
+                    self.ball_center = new_pos
+                    self.ball_hsv = retrack4['hsv']
+                    self.ball_size = retrack4['area']
+                    self.using_alt_hsv = False
+                    self.using_alt2_hsv = False
+                    self.using_alt3_hsv = False
+                    self.using_alt4_hsv = True
+                    self.using_alt6_hsv = False
+                    self.hsv_lower = self.alt4_hsv_lower
+                    self.hsv_upper = self.alt4_hsv_upper
+                    print(f"Frame {self.frame_count}: [ALT4 HSV RECOVER] Ball at {new_pos}")
+                    return self.ball_center
             if self.alt6_hsv_lower is not None and self.alt6_hsv_upper is not None:
                 retrack6 = self.retrack_with_alt2_hsv(
                     search_frame, x1, y1, self.ball_center, predicted_point, self.ball_size, allow_inactive,
@@ -3733,6 +3759,7 @@ class InteractiveBallAnalyzer:
                     self.using_alt_hsv = False
                     self.using_alt2_hsv = False
                     self.using_alt3_hsv = False
+                    self.using_alt4_hsv = False
                     self.using_alt6_hsv = True
                     self.hsv_lower = self.alt6_hsv_lower
                     self.hsv_upper = self.alt6_hsv_upper
@@ -4433,6 +4460,11 @@ class InteractiveBallAnalyzer:
             bulb_size = selected_override['area'] if selected_override is not None else cv2.contourArea(best_contour)
             current_filter_key = self._candidate_false_point_filter_key(best_source, hsv_mode)
             if best_source == 'alt4' and self.alt4_hsv_lower is not None and self.alt4_hsv_upper is not None:
+                self.using_alt_hsv = False
+                self.using_alt2_hsv = False
+                self.using_alt3_hsv = False
+                self.using_alt4_hsv = True
+                self.using_alt6_hsv = False
                 self.hsv_lower = self.alt4_hsv_lower
                 self.hsv_upper = self.alt4_hsv_upper
             elif best_source == 'alt5' and self.alt5_hsv_lower is not None and self.alt5_hsv_upper is not None:
@@ -4442,6 +4474,7 @@ class InteractiveBallAnalyzer:
                 self.using_alt_hsv = False
                 self.using_alt2_hsv = False
                 self.using_alt3_hsv = False
+                self.using_alt4_hsv = False
                 self.using_alt6_hsv = True
                 self.hsv_lower = self.alt6_hsv_lower
                 self.hsv_upper = self.alt6_hsv_upper
@@ -4498,6 +4531,7 @@ class InteractiveBallAnalyzer:
                         self.using_alt_hsv = True
                         self.using_alt2_hsv = False
                         self.using_alt3_hsv = False
+                        self.using_alt4_hsv = False
                         self.using_alt6_hsv = False
                         if self.alt_focus_hsv_lower is not None and self.alt_focus_hsv_upper is not None:
                             self.hsv_lower = self.alt_focus_hsv_lower
@@ -4554,6 +4588,28 @@ class InteractiveBallAnalyzer:
                                         self.hsv_lower = self.alt3_hsv_lower
                                         self.hsv_upper = self.alt3_hsv_upper
                                         print(f"Frame {self.frame_count}: [ALT3 HSV OVERRIDE] Ball at ({cx}, {cy})")
+                    if (not override_applied and self.alt4_hsv_lower is not None and
+                            self.alt4_hsv_upper is not None):
+                        retrack4 = self.retrack_with_alt2_hsv(
+                            search_frame, x1, y1, self.ball_center, predicted_point, self.ball_size, allow_inactive,
+                            lower=self.alt4_hsv_lower, upper=self.alt4_hsv_upper, frame_gray=frame_gray,
+                            filter_key="alt4"
+                        )
+                        if retrack4 is not None and self._should_accept_hsv_override(
+                                "alt4", retrack4, current_pos, current_area, prev_pos, predicted_point,
+                                frame_gray, current_filter_key=current_filter_key):
+                            cx, cy = retrack4['pos']
+                            hsv_values = retrack4['hsv']
+                            bulb_size = retrack4['area']
+                            self.using_alt_hsv = False
+                            self.using_alt2_hsv = False
+                            self.using_alt3_hsv = False
+                            self.using_alt4_hsv = True
+                            self.using_alt6_hsv = False
+                            self.hsv_lower = self.alt4_hsv_lower
+                            self.hsv_upper = self.alt4_hsv_upper
+                            print(f"Frame {self.frame_count}: [ALT4 HSV OVERRIDE] Ball at ({cx}, {cy})")
+                            override_applied = True
                     if (not override_applied and self.alt6_hsv_lower is not None and
                             self.alt6_hsv_upper is not None):
                         retrack6 = self.retrack_with_alt2_hsv(
