@@ -5896,6 +5896,58 @@ class InteractiveBallAnalyzer:
             serve_position_history = []
             serve_candidate_details_history = []
 
+        def serve_start_y_threshold():
+            if not hasattr(self, 'serve_area_y_min') or not hasattr(self, 'serve_area_y_max'):
+                return None
+            serve_h = max(1, self.serve_area_y_max - self.serve_area_y_min)
+            # A valid serve history must start from the LOWER part of the serve box,
+            # not appear suddenly only near the top of the box.
+            return self.serve_area_y_min + int(serve_h * 0.55)
+
+        def serve_candidate_can_start(pos):
+            start_y = serve_start_y_threshold()
+            if start_y is None:
+                return True
+            return pos[1] >= start_y
+
+        def serve_history_points():
+            return [p for p in serve_position_history if p is not None and len(p) >= 2]
+
+        def serve_history_has_valid_launch():
+            hist_all = serve_history_points()
+            if len(hist_all) < 3:
+                return False
+            start_y = serve_start_y_threshold()
+            if start_y is None:
+                return True
+
+            # The serve history must begin low enough in the first few samples.
+            start_index = None
+            for idx, pos in enumerate(hist_all[:6]):
+                if pos[1] >= start_y:
+                    start_index = idx
+                    break
+            if start_index is None:
+                return False
+
+            hist = hist_all[start_index:]
+            if len(hist) < 3:
+                return False
+
+            min_y = min(p[1] for p in hist)
+            total_up = hist[0][1] - min_y
+            min_required_up = max(70, int((self.serve_area_y_max - self.serve_area_y_min) * 0.16))
+            if total_up < min_required_up:
+                return False
+
+            up_steps = 0
+            for i in range(1, len(hist)):
+                step_dy = hist[i][1] - hist[i - 1][1]
+                signed_step_dy = self._signed_serve_dy(step_dy) if self.serve_direction_dy != 0 else -step_dy
+                if signed_step_dy >= 8:
+                    up_steps += 1
+            return up_steps >= 2
+
         def log_tracking_start_position():
             if self.ball_center is None:
                 return
@@ -6001,6 +6053,9 @@ class InteractiveBallAnalyzer:
                                 self.serve_area_y_min <= candidate[1] <= self.serve_area_y_max):
                             print(f"Frame {self.frame_count}: Early serve candidate outside serve area, ignoring")
                             candidate = None
+                    if candidate is not None and serve_tracking_frames == 0 and not serve_candidate_can_start(candidate):
+                        print(f"Frame {self.frame_count}: Early serve candidate too high to start serve history, ignoring")
+                        candidate = None
                     if candidate is not None:
                         serve_tracking_frames += 1
                         last_serve_candidate = candidate
@@ -6205,9 +6260,13 @@ class InteractiveBallAnalyzer:
                 import math as _math
                 potential_serve = self.detect_serve_position(frame)
                 if potential_serve:
-                    self.waiting_serve_candidate = potential_serve
-                    self.waiting_serve_candidate_frame = self.frame_count
-                    if last_serve_candidate is not None:
+                    if serve_tracking_frames == 0 and not serve_candidate_can_start(potential_serve):
+                        print(f"Frame {self.frame_count}: Serve candidate too high to start serve history, ignoring")
+                        potential_serve = None
+                    if potential_serve:
+                        self.waiting_serve_candidate = potential_serve
+                        self.waiting_serve_candidate_frame = self.frame_count
+                    if potential_serve and last_serve_candidate is not None:
                         candidate_jump = _math.hypot(
                             potential_serve[0] - last_serve_candidate[0],
                             potential_serve[1] - last_serve_candidate[1],
@@ -6236,9 +6295,10 @@ class InteractiveBallAnalyzer:
                     # through the serve area; a static artifact (line, shadow, court marking)
                     # stays at nearly the same pixel for many frames.
                     # After 8 frames with total displacement < 10px → reset and ignore.
-                    if serve_tracking_frames >= 15 and len(serve_position_history) >= 4:
-                        xs = [p[0] for p in serve_position_history]
-                        ys = [p[1] for p in serve_position_history]
+                    valid_serve_history = serve_history_points()
+                    if serve_tracking_frames >= 15 and len(valid_serve_history) >= 4:
+                        xs = [p[0] for p in valid_serve_history]
+                        ys = [p[1] for p in valid_serve_history]
                         total_disp = _math.hypot(max(xs) - min(xs), max(ys) - min(ys))
                         if total_disp < 10:
                             print(f"[SERVE_FP_RESET] f{self.frame_count}: static false positive at {potential_serve} "
@@ -6258,31 +6318,32 @@ class InteractiveBallAnalyzer:
                     # that catches a persistent false positive at the top of the search box.
                     # serve_tracking_frames >= 10 ensures normal serves (3-8 frames) are
                     # never affected by this path.
-                    if serve_tracking_frames >= 10 and len(serve_position_history) >= 3:
+                    valid_serve_history = serve_history_points()
+                    if serve_tracking_frames >= 10 and len(valid_serve_history) >= 3:
                         toss_high_y = self.serve_area_y_min + int(
                             (self.serve_area_y_max - self.serve_area_y_min) * 0.45
                         )
                         recent_steps = [
                             _math.hypot(
-                                serve_position_history[i][0] - serve_position_history[i - 1][0],
-                                serve_position_history[i][1] - serve_position_history[i - 1][1],
+                                valid_serve_history[i][0] - valid_serve_history[i - 1][0],
+                                valid_serve_history[i][1] - valid_serve_history[i - 1][1],
                             )
-                            for i in range(1, len(serve_position_history))
+                            for i in range(1, len(valid_serve_history))
                         ]
                         recent_step_max = max(recent_steps[-4:], default=0.0)
-                        recent_min_y = min(p[1] for p in serve_position_history)
-                        recent_max_y = max(p[1] for p in serve_position_history)
+                        recent_min_y = min(p[1] for p in valid_serve_history)
+                        recent_max_y = max(p[1] for p in valid_serve_history)
                         total_disp = _math.hypot(
-                            max(p[0] for p in serve_position_history) - min(p[0] for p in serve_position_history),
+                            max(p[0] for p in valid_serve_history) - min(p[0] for p in valid_serve_history),
                             recent_max_y - recent_min_y
                         )
                         toss_drop_threshold = max(50, int((self.serve_area_y_max - self.serve_area_y_min) * 0.12))
                         toss_speed_threshold = max(18, int((self.serve_area_y_max - self.serve_area_y_min) * 0.05))
                         apex_index = min(
-                            range(len(serve_position_history)),
-                            key=lambda idx: serve_position_history[idx][1]
+                            range(len(valid_serve_history)),
+                            key=lambda idx: valid_serve_history[idx][1]
                         )
-                        pre_apex_positions = serve_position_history[:apex_index + 1]
+                        pre_apex_positions = valid_serve_history[:apex_index + 1]
                         pre_apex_rise = 0.0
                         pre_apex_up_steps = []
                         if pre_apex_positions:
@@ -6305,10 +6366,10 @@ class InteractiveBallAnalyzer:
                                 and has_real_toss_rise):
                             # Find the most recent position in the top portion (actual toss
                             # ball, not the false positive which sits at a higher Y value)
-                            top_positions = [p for p in serve_position_history if p[1] < toss_high_y]
+                            top_positions = [p for p in valid_serve_history if p[1] < toss_high_y]
                             toss_start = top_positions[-1] if top_positions else last_serve_candidate
                             tracking_start = potential_serve
-                            motion_seed = serve_position_history[-2] if len(serve_position_history) >= 2 else toss_start
+                            motion_seed = valid_serve_history[-2] if len(valid_serve_history) >= 2 else toss_start
                             _dx = tracking_start[0] - motion_seed[0]
                             _dy = tracking_start[1] - motion_seed[1]
                             _dist = _math.hypot(_dx, _dy)
@@ -6326,7 +6387,7 @@ class InteractiveBallAnalyzer:
                             self.tracking = True
                             self.ball_stopped = False
                             self._serve_contact_grace_frames = max(self._serve_contact_grace_frames, 6)
-                            self.initial_ball_position = serve_position_history[0]
+                            self.initial_ball_position = valid_serve_history[0]
                             self.ball_size = None
                             self.ball_hsv = None
                             seed_tracking_from_serve_history(tracking_start)
@@ -6341,12 +6402,13 @@ class InteractiveBallAnalyzer:
                     # Early serve start: if ball is moving fast in the configured serve direction within the serve area,
                     # start tracking immediately (don't wait for serve area exit)
                     # Require ALL consecutive pairs to move in the serve direction (not just first-to-last)
-                    if len(serve_position_history) >= 4:
+                    valid_serve_history = serve_history_points()
+                    if len(valid_serve_history) >= 4 and serve_history_has_valid_launch():
                         # Check last 3 consecutive pairs all move forward with signed dx > 15
                         all_forward = True
                         min_signed_dx = float('inf')
                         for i in range(-3, 0):
-                            pair_dx = serve_position_history[i][0] - serve_position_history[i-1][0]
+                            pair_dx = valid_serve_history[i][0] - valid_serve_history[i-1][0]
                             signed_dx = self._signed_serve_dx(pair_dx)
                             if signed_dx < 15:
                                 all_forward = False
@@ -6355,9 +6417,9 @@ class InteractiveBallAnalyzer:
                         avg_dx = min_signed_dx  # Use minimum signed dx as the threshold
                         if all_forward and avg_dx >= 25:
                             predicted_pos = potential_serve
-                            if len(serve_position_history) >= 2:
-                                p1 = serve_position_history[-2]
-                                p2 = serve_position_history[-1]
+                            if len(valid_serve_history) >= 2:
+                                p1 = valid_serve_history[-2]
+                                p2 = valid_serve_history[-1]
                                 _dx = p2[0] - p1[0]
                                 _dy = p2[1] - p1[1]
                                 _dist = _math.hypot(_dx, _dy)
@@ -6376,7 +6438,7 @@ class InteractiveBallAnalyzer:
                             self.tracking = True
                             self.ball_stopped = False
                             self._serve_contact_grace_frames = max(self._serve_contact_grace_frames, 6)
-                            self.initial_ball_position = serve_position_history[0]
+                            self.initial_ball_position = valid_serve_history[0]
                             self.ball_size = None
                             self.ball_hsv = None
                             seed_tracking_from_serve_history(potential_serve)
@@ -6392,10 +6454,11 @@ class InteractiveBallAnalyzer:
                     # Ball exited serve area — only start tracking if it was moving at serve speed
                     # in the configured serve direction.
                     # A ball just sitting/bouncing in the area (false positive like f492) has near-zero speed.
-                    if serve_tracking_frames >= 3 and last_serve_candidate is not None and len(serve_position_history) >= 2:
-                        total_dx = serve_position_history[-1][0] - serve_position_history[0][0]
-                        last_dx = serve_position_history[-1][0] - serve_position_history[-2][0]
-                        last_dy = serve_position_history[-1][1] - serve_position_history[-2][1]
+                    valid_serve_history = serve_history_points()
+                    if serve_tracking_frames >= 3 and last_serve_candidate is not None and len(valid_serve_history) >= 2 and serve_history_has_valid_launch():
+                        total_dx = valid_serve_history[-1][0] - valid_serve_history[0][0]
+                        last_dx = valid_serve_history[-1][0] - valid_serve_history[-2][0]
+                        last_dy = valid_serve_history[-1][1] - valid_serve_history[-2][1]
                         print(f"[SERVE_EXIT_CHECK] f{self.frame_count}: tracked {serve_tracking_frames}f, total_dx={total_dx:.0f}px, last_dx={last_dx:.0f}px, last_dy={last_dy:.0f}px")
                         signed_total_dx = self._signed_serve_dx(total_dx)
                         signed_last_dx = self._signed_serve_dx(last_dx)
@@ -6403,9 +6466,9 @@ class InteractiveBallAnalyzer:
                         # Reject toss motion that still moves strongly opposite the configured serve launch.
                         if signed_last_dx > 20 and (self.serve_direction_dy == 0 or signed_last_dy >= -signed_last_dx):
                             predicted_pos = last_serve_candidate
-                            if len(serve_position_history) >= 2:
-                                p1 = serve_position_history[-2]
-                                p2 = serve_position_history[-1]
+                            if len(valid_serve_history) >= 2:
+                                p1 = valid_serve_history[-2]
+                                p2 = valid_serve_history[-1]
                                 _dx = p2[0] - p1[0]
                                 _dy = p2[1] - p1[1]
                                 _dist = _math.hypot(_dx, _dy)
@@ -6444,8 +6507,8 @@ class InteractiveBallAnalyzer:
                             # Player is about to strike the ball just below the serve area.
                             # Start tracking from last known position — the 200px search radius
                             # will find the ball at the strike point.
-                            p1 = serve_position_history[-2]
-                            p2 = serve_position_history[-1]
+                            p1 = valid_serve_history[-2]
+                            p2 = valid_serve_history[-1]
                             _dx = p2[0] - p1[0]
                             _dy = p2[1] - p1[1]
                             _dist = _math.hypot(_dx, _dy)
@@ -6458,7 +6521,7 @@ class InteractiveBallAnalyzer:
                             self.tracking = True
                             self.ball_stopped = False
                             self._serve_contact_grace_frames = max(self._serve_contact_grace_frames, 6)
-                            self.initial_ball_position = serve_position_history[0]
+                            self.initial_ball_position = valid_serve_history[0]
                             self.ball_size = None
                             self.ball_hsv = None
                             seed_tracking_from_serve_history(last_serve_candidate)
