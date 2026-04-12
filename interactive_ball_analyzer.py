@@ -1616,7 +1616,8 @@ class InteractiveBallAnalyzer:
         }
 
     def retrack_with_alt2_hsv(self, search_frame, x1, y1, prev_pos, predicted_point, prev_ball_size, allow_inactive,
-                              lower=None, upper=None, frame_gray=None, filter_key="alt2", sparse_mode=False):
+                              lower=None, upper=None, frame_gray=None, filter_key="alt2", sparse_mode=False,
+                              ignore_false_points=False):
         """Re-run detection with alternative 2 HSV (H 46-72) when stuck."""
         debug_label = "Alt2" if filter_key == "alt2" else str(filter_key)
         hsv_lower = lower if lower is not None else self.alt2_hsv_lower
@@ -1630,7 +1631,7 @@ class InteractiveBallAnalyzer:
         else:
             mask_alt2 = cv2.inRange(hsv_frame, hsv_lower, hsv_upper)
             kernel = np.ones((2, 2), np.uint8)
-            if filter_key == "alts_20":
+            if filter_key in ("alts_20", "h_10"):
                 mask_alt2 = cv2.morphologyEx(mask_alt2, cv2.MORPH_CLOSE, kernel)
                 mask_alt2 = cv2.dilate(mask_alt2, kernel, iterations=1)
             else:
@@ -1667,7 +1668,7 @@ class InteractiveBallAnalyzer:
 
             if not allow_inactive:
                 ignored_entry = self._find_ignored_tracking_position((cx, cy), filter_key=filter_key)
-                if ignored_entry is not None:
+                if ignored_entry is not None and not ignore_false_points:
                     print(f"  DEBUG: retrack_using_alt2 skipping learned hotspot at ({cx},{cy}) "
                           f"reason={ignored_entry.get('reason', 'n/a')}")
                     continue
@@ -3805,6 +3806,40 @@ class InteractiveBallAnalyzer:
                     self.ground_bounce_count > 0 and
                     self.stuck_frame_count > 0
                 )
+                upper_local_h10_retry = (
+                    self.ball_center is not None and
+                    search_radius is not None and search_radius <= 100 and
+                    self.ball_center[1] <= 210 and
+                    (predicted_point is None or predicted_point[1] <= 214) and
+                    (self.ball_size is None or self.ball_size <= 8)
+                )
+                if (upper_local_h10_retry and
+                        self.h10_hsv_lower is not None and self.h10_hsv_upper is not None and
+                        self._should_try_h10_recover(frame, predicted_point, allow_inactive)):
+                    retrack_h10 = self.retrack_with_alt2_hsv(
+                        search_frame, x1, y1, self.ball_center, predicted_point, self.ball_size, allow_inactive,
+                        lower=self.h10_hsv_lower, upper=self.h10_hsv_upper, frame_gray=frame_gray,
+                        filter_key="h_10", ignore_false_points=True
+                    )
+                    if retrack_h10 is not None:
+                        h10_pos = retrack_h10['pos']
+                        prev_distance = math.hypot(
+                            h10_pos[0] - self.ball_center[0],
+                            h10_pos[1] - self.ball_center[1]
+                        )
+                        predicted_distance = (
+                            math.hypot(h10_pos[0] - predicted_point[0], h10_pos[1] - predicted_point[1])
+                            if predicted_point is not None else prev_distance
+                        )
+                        local_cap = min(42.0, max(26.0, search_radius * 0.55))
+                        if prev_distance <= local_cap and predicted_distance <= (local_cap + 10.0):
+                            self.ball_center = h10_pos
+                            self.ball_hsv = retrack_h10['hsv']
+                            self.ball_size = retrack_h10['area']
+                            self._activate_regular_hsv()
+                            self.stuck_frame_count = 0
+                            print(f"Frame {self.frame_count}: [H_10 EARLY LOCAL RECOVER] Ball at {h10_pos}")
+                            return self.ball_center
                 contact_reference = self.ball_center if upper_post_bounce_recover else (predicted_point or self.ball_center)
                 contact_recover = self._recover_contact_phase_ball(
                     frame, contact_reference, frame_gray,
@@ -4607,6 +4642,40 @@ class InteractiveBallAnalyzer:
                         source=best_source,
                     )
                     self._learn_ignored_tracking_position((cx, cy), radius=80, ttl=200, reason=reason)
+                    if (self.h10_hsv_lower is not None and self.h10_hsv_upper is not None and
+                            self._should_try_h10_recover(frame, predicted_point, allow_inactive)):
+                        retrack_h10 = self.retrack_with_alt2_hsv(
+                            search_frame, x1, y1, self.ball_center, predicted_point, self.ball_size, allow_inactive,
+                            lower=self.h10_hsv_lower, upper=self.h10_hsv_upper, frame_gray=frame_gray,
+                            filter_key="h_10", ignore_false_points=True
+                        )
+                        if retrack_h10 is not None:
+                            h10_pos = retrack_h10['pos']
+                            h10_prev_distance = math.hypot(
+                                h10_pos[0] - self.ball_center[0],
+                                h10_pos[1] - self.ball_center[1]
+                            )
+                            h10_pred_distance = (
+                                math.hypot(h10_pos[0] - predicted_point[0], h10_pos[1] - predicted_point[1])
+                                if predicted_point is not None else h10_prev_distance
+                            )
+                            local_cap = max(55.0, min(105.0, actual_distance * 0.6))
+                            very_local_cap = max(28.0, local_cap * 0.35)
+                            if (
+                                h10_prev_distance <= very_local_cap or
+                                (h10_prev_distance <= local_cap and h10_pred_distance <= (local_cap + 18.0))
+                            ):
+                                self.ball_center = h10_pos
+                                self.ball_hsv = retrack_h10['hsv']
+                                self.ball_size = retrack_h10['area']
+                                self._activate_regular_hsv()
+                                self.stuck_frame_count = 0
+                                print(f"Frame {self.frame_count}: [H_10 FP RECOVER] Ball at {h10_pos}")
+                                return self.ball_center
+                            print(
+                                f"  DEBUG: Rejecting h_10 false-point recover at {h10_pos} - "
+                                f"too far from local track window ({h10_prev_distance:.1f}px/{h10_pred_distance:.1f}px > {local_cap:.1f}px)"
+                            )
                     self.stuck_frame_count += 1
                     print(f"Frame {self.frame_count}: [TRACKING_FP_REJECT] holding {self.ball_center} "
                           f"instead of false hotspot ({cx},{cy}) motion_mean={motion_mean:.1f} motion_max={motion_max:.1f}")
@@ -5396,6 +5465,41 @@ class InteractiveBallAnalyzer:
                 self.stuck_frame_count = 0
                 print(f"Frame {self.frame_count}: [UPPER EXIT LOW-S RECOVER] Ball at {new_pos} via {upper_exit_low_s['label']}")
                 return self.ball_center
+        h10_local_upper_y_cap = max(220, int(frame.shape[0] * 0.12))
+        if (best_contour is None and self.ball_center is not None and
+                self.ball_center[1] <= h10_local_upper_y_cap and
+                (predicted_point is None or predicted_point[1] <= (h10_local_upper_y_cap + 16)) and
+                search_radius is not None and search_radius <= 100 and
+                self.h10_hsv_lower is not None and self.h10_hsv_upper is not None and
+                self._should_try_h10_recover(frame, predicted_point, allow_inactive)):
+            retrack_h10 = self.retrack_with_alt2_hsv(
+                search_frame, x1, y1, self.ball_center, predicted_point, self.ball_size, allow_inactive,
+                lower=self.h10_hsv_lower, upper=self.h10_hsv_upper, frame_gray=frame_gray,
+                filter_key="h_10", ignore_false_points=True
+            )
+            if retrack_h10 is not None:
+                h10_pos = retrack_h10['pos']
+                prev_distance = math.hypot(
+                    h10_pos[0] - self.ball_center[0],
+                    h10_pos[1] - self.ball_center[1]
+                )
+                predicted_distance = (
+                    math.hypot(h10_pos[0] - predicted_point[0], h10_pos[1] - predicted_point[1])
+                    if predicted_point is not None else prev_distance
+                )
+                local_cap = min(45.0, max(28.0, (search_radius or 0) * 0.6)) if search_radius is not None else 35.0
+                if prev_distance <= local_cap and predicted_distance <= (local_cap + 12.0):
+                    self.ball_center = h10_pos
+                    self.ball_hsv = retrack_h10['hsv']
+                    self.ball_size = retrack_h10['area']
+                    self._activate_regular_hsv()
+                    self.stuck_frame_count = 0
+                    print(f"Frame {self.frame_count}: [H_10 NO-VALID RECOVER] Ball at {h10_pos}")
+                    return self.ball_center
+                print(
+                    f"  DEBUG: Rejecting h_10 no-valid recover at {h10_pos} - "
+                    f"too far from local window ({prev_distance:.1f}px/{predicted_distance:.1f}px > {local_cap:.1f}px)"
+                )
         if self.ball_center:
             print(f"  DEBUG: KEEPING marker at last known position: {self.ball_center}")
             print(f"  DEBUG: Will continue searching in next frame at same position...")
