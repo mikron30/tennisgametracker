@@ -56,8 +56,16 @@
         "v_max": 121
     },
     "s_30": {
-        "h_min": 20,
-        "h_max": 85,
+        "h_min": 11,
+        "h_max": 72,
+        "s_min": 30,
+        "s_max": 255,
+        "v_min": 130,
+        "v_max": 255
+    },
+    "h_10": {
+        "h_min": 11,
+        "h_max": 72,
         "s_min": 30,
         "s_max": 255,
         "v_min": 130,
@@ -140,5 +148,13 @@
             "radius": 32,
             "reason": "upper false spot near frame 649/650"
         }
-    ]
+    ],
+    "alts_20": {
+        "h_min": 50,
+        "h_max": 60,
+        "s_min": 20,
+        "s_max": 30,
+        "v_min": 130,
+        "v_max": 250
+    }
 }
