@@ -142,6 +142,7 @@ class InteractiveBallAnalyzer:
         self._last_detected_serve_candidate = None
         self._debug_contour_candidates = []
         self._debug_rejected_contours = []
+        self._deferred_motion_anchor = None
         
     def log_motion_metrics(self, dx, dy, distance, direction_deg):
         """Log per-frame motion and raise a focus-loss flag when movement spikes."""
@@ -672,10 +673,9 @@ class InteractiveBallAnalyzer:
 
             relaxed_min_y = None
             if contact_bounds is not None:
-                relaxed_min_y = contact_bounds["min_y"]
-                if (predicted_distance is not None and predicted_distance <= 40.0 and
-                        motion_max >= 40.0 and motion_mean >= 10.0):
-                    relaxed_min_y = max(0, relaxed_min_y - 28)
+                relaxed_min_y = self._contact_reacquire_min_y(
+                    contact_bounds, predicted_distance, motion_mean, motion_max
+                )
                 if (cx < contact_bounds["min_x"] or
                         cx > contact_bounds["max_x"] or
                         cy < relaxed_min_y):
@@ -1176,13 +1176,30 @@ class InteractiveBallAnalyzer:
         if recent_max_vel > 120:
             return None
 
+        upward_expand = 0.0
+        if (self.last_motion is not None and
+                self.last_motion.get('dy', 0.0) < -2.0 and
+                (self.ball_size is None or self.ball_size <= 18)):
+            upward_expand = min(28.0, max(0.0, -float(self.last_motion.get('dy', 0.0))))
+
         return {
             'max_dist': max(260, min(460, self.max_ball_speed + 40)),
-            'min_y': max(0, ref_y - 45),
+            'min_y': max(0, int(round(ref_y - 45 - upward_expand))),
             'max_y': min(frame_height - 1, ref_y + max(220, int(frame_height * 0.12))),
             'min_x': max(0, ref_x - max(420, int(frame_width * 0.12))),
             'max_x': min(frame_width - 1, ref_x + max(420, int(frame_width * 0.12))),
         }
+
+    def _contact_reacquire_min_y(self, contact_bounds, predicted_distance, motion_mean, motion_max):
+        """Allow a modest upward extension when motion strongly supports the predicted path."""
+        if contact_bounds is None:
+            return None
+
+        relaxed_min_y = contact_bounds["min_y"]
+        if (predicted_distance is not None and predicted_distance <= 40.0 and
+                motion_max >= 40.0 and motion_mean >= 10.0):
+            relaxed_min_y = max(0, relaxed_min_y - 28)
+        return relaxed_min_y
 
     def _get_lower_contact_launch_context(self, frame_shape):
         """Predict a launch window after a lower-court racket hit using ball-only motion."""
@@ -1612,12 +1629,17 @@ class InteractiveBallAnalyzer:
         return {
             'pos': (cx, cy),
             'area': area,
-            'hsv': hsv_at_point
+            'hsv': hsv_at_point,
+            'distance': distance,
+            'score': best_score,
+            'motion_mean': motion_mean,
+            'motion_max': motion_max,
+            'filter_key': filter_key,
         }
 
     def retrack_with_alt2_hsv(self, search_frame, x1, y1, prev_pos, predicted_point, prev_ball_size, allow_inactive,
                               lower=None, upper=None, frame_gray=None, filter_key="alt2", sparse_mode=False,
-                              ignore_false_points=False):
+                              ignore_false_points=False, prefer_predicted_path=False):
         """Re-run detection with alternative 2 HSV (H 46-72) when stuck."""
         debug_label = "Alt2" if filter_key == "alt2" else str(filter_key)
         hsv_lower = lower if lower is not None else self.alt2_hsv_lower
@@ -1716,6 +1738,7 @@ class InteractiveBallAnalyzer:
                     score += speed_diff * 1.5
                     align_bonus = dot / (lm_dist * distance)
                     score -= max(0.0, align_bonus) * 40
+            predicted_distance = None
             if predicted_point:
                 pdx = cx - predicted_point[0]
                 pdy = cy - predicted_point[1]
@@ -1727,13 +1750,24 @@ class InteractiveBallAnalyzer:
                 motion_mean = motion_metrics['mean']
                 motion_max = motion_metrics['max']
                 frame0_hotspot = self._find_frame0_background_hotspot((cx, cy))
-                if frame0_hotspot is not None and motion_mean < 8.0 and motion_max < 35.0:
+                trajectory_priority_candidate = False
+                if (prefer_predicted_path and predicted_distance is not None and prev_pos is not None and
+                        self.last_motion is not None):
+                    predicted_cap = max(14.0, min(34.0, self.last_motion.get('distance', 0.0) * 3.0 + 8.0))
+                    trajectory_priority_candidate = (
+                        predicted_distance <= predicted_cap and
+                        distance <= max(50.0, predicted_cap + 12.0) and
+                        (motion_mean >= 4.0 or motion_max >= 20.0 or area >= 3.0)
+                    )
+                    if trajectory_priority_candidate:
+                        score -= min(60.0, max(0.0, predicted_cap - predicted_distance) * 4.0)
+                if frame0_hotspot is not None and motion_mean < 8.0 and motion_max < 35.0 and not trajectory_priority_candidate:
                     score += 1800
                     print(f"  DEBUG: retrack_using_alt2 penalizing frame0 hotspot at ({cx},{cy}) "
                           f"motion_mean={motion_mean:.1f} motion_max={motion_max:.1f}")
                 static_hotspot = ((area <= 3 and motion_mean < 1.0 and motion_max < 5.0) or
                                   (cy < 100 and motion_mean < 2.5 and motion_max < 10.0))
-                if static_hotspot:
+                if static_hotspot and not trajectory_priority_candidate:
                     score += 1200
                     print(f"  DEBUG: retrack_using_alt2 penalizing static hotspot at ({cx},{cy}) "
                           f"motion_mean={motion_mean:.1f} motion_max={motion_max:.1f}")
@@ -1765,7 +1799,12 @@ class InteractiveBallAnalyzer:
         return {
             'pos': (cx, cy),
             'area': area,
-            'hsv': hsv_at_point
+            'hsv': hsv_at_point,
+            'distance': distance,
+            'score': best_score,
+            'motion_mean': motion_mean,
+            'motion_max': motion_max,
+            'filter_key': filter_key,
         }
 
     def _retrack_local_alts20_hsv(self, frame, frame_gray, predicted_point=None, radius=80):
@@ -3816,30 +3855,81 @@ class InteractiveBallAnalyzer:
                 if (upper_local_h10_retry and
                         self.h10_hsv_lower is not None and self.h10_hsv_upper is not None and
                         self._should_try_h10_recover(frame, predicted_point, allow_inactive)):
+                    preview_s30 = None
+                    if self.s30_hsv_lower is not None and self.s30_hsv_upper is not None:
+                        preview_s30 = self.retrack_with_alt2_hsv(
+                            search_frame, x1, y1, self.ball_center, predicted_point, self.ball_size, allow_inactive,
+                            lower=self.s30_hsv_lower, upper=self.s30_hsv_upper, frame_gray=frame_gray,
+                            filter_key="s_30", ignore_false_points=True, prefer_predicted_path=True
+                        )
                     retrack_h10 = self.retrack_with_alt2_hsv(
                         search_frame, x1, y1, self.ball_center, predicted_point, self.ball_size, allow_inactive,
-                        lower=self.h10_hsv_lower, upper=self.h10_hsv_upper, frame_gray=frame_gray,
-                        filter_key="h_10", ignore_false_points=True
-                    )
-                    if retrack_h10 is not None:
-                        h10_pos = retrack_h10['pos']
-                        prev_distance = math.hypot(
-                            h10_pos[0] - self.ball_center[0],
-                            h10_pos[1] - self.ball_center[1]
+                            lower=self.h10_hsv_lower, upper=self.h10_hsv_upper, frame_gray=frame_gray,
+                            filter_key="h_10", ignore_false_points=True, prefer_predicted_path=True
                         )
-                        predicted_distance = (
-                            math.hypot(h10_pos[0] - predicted_point[0], h10_pos[1] - predicted_point[1])
+                    local_cap = min(42.0, max(26.0, search_radius * 0.55))
+                    early_local_candidates = []
+                    for label, candidate, ignore_fp in (
+                        ("s_30", preview_s30, False),
+                        ("h_10", retrack_h10, True),
+                    ):
+                        if candidate is None:
+                            print(
+                                f"  DEBUG: [UPPER LOCAL PREVIEW] {label} candidate=None "
+                                f"ignore_false_points={ignore_fp}"
+                            )
+                            continue
+                        candidate_pos = candidate['pos']
+                        prev_distance = math.hypot(
+                            candidate_pos[0] - self.ball_center[0],
+                            candidate_pos[1] - self.ball_center[1]
+                        )
+                        candidate_pred_distance = (
+                            math.hypot(candidate_pos[0] - predicted_point[0], candidate_pos[1] - predicted_point[1])
                             if predicted_point is not None else prev_distance
                         )
-                        local_cap = min(42.0, max(26.0, search_radius * 0.55))
-                        if prev_distance <= local_cap and predicted_distance <= (local_cap + 10.0):
-                            self.ball_center = h10_pos
-                            self.ball_hsv = retrack_h10['hsv']
-                            self.ball_size = retrack_h10['area']
-                            self._activate_regular_hsv()
-                            self.stuck_frame_count = 0
-                            print(f"Frame {self.frame_count}: [H_10 EARLY LOCAL RECOVER] Ball at {h10_pos}")
-                            return self.ball_center
+                        print(
+                            f"  DEBUG: [UPPER LOCAL PREVIEW] {label} pos={candidate_pos} "
+                            f"area={candidate['area']:.1f}px score={candidate['score']:.1f} "
+                            f"prev_dist={prev_distance:.1f}px pred_dist={candidate_pred_distance:.1f}px "
+                            f"motion={candidate['motion_mean']:.1f}/{candidate['motion_max']:.1f} "
+                            f"local_cap={local_cap:.1f} ignore_false_points={ignore_fp}"
+                        )
+                        if prev_distance <= local_cap and candidate_pred_distance <= (local_cap + 10.0):
+                            trajectory_priority = (
+                                candidate_pred_distance <= max(12.0, local_cap * 0.45) and
+                                (candidate['motion_mean'] >= 4.0 or candidate['motion_max'] >= 18.0 or candidate['area'] >= 3.0)
+                            )
+                            early_local_candidates.append({
+                                'label': label,
+                                'candidate': candidate,
+                                'prev_distance': prev_distance,
+                                'pred_distance': candidate_pred_distance,
+                                'trajectory_priority': trajectory_priority,
+                            })
+                    if early_local_candidates:
+                        best_early_local = min(
+                            early_local_candidates,
+                            key=lambda item: (
+                                0 if item['trajectory_priority'] else 1,
+                                item['pred_distance'] if item['trajectory_priority'] else item['candidate']['score'],
+                                -item['candidate']['motion_max'],
+                                -item['candidate']['motion_mean'],
+                                item['candidate']['score'],
+                                item['prev_distance'],
+                                item['pred_distance'],
+                            )
+                        )
+                        best_label = best_early_local['label']
+                        best_candidate = best_early_local['candidate']
+                        best_pos = best_candidate['pos']
+                        self.ball_center = best_pos
+                        self.ball_hsv = best_candidate['hsv']
+                        self.ball_size = best_candidate['area']
+                        self._activate_regular_hsv()
+                        self.stuck_frame_count = 0
+                        print(f"Frame {self.frame_count}: [{best_label.upper()} EARLY LOCAL RECOVER] Ball at {best_pos}")
+                        return self.ball_center
                 contact_reference = self.ball_center if upper_post_bounce_recover else (predicted_point or self.ball_center)
                 contact_recover = self._recover_contact_phase_ball(
                     frame, contact_reference, frame_gray,
@@ -4195,6 +4285,7 @@ class InteractiveBallAnalyzer:
                 distance = np.sqrt((cx - self.ball_center[0])**2 + (cy - self.ball_center[1])**2)
             else:
                 distance = 0
+            predicted_distance = None
             
             # Calculate size difference (penalty for very different sizes)
             if self.ball_size and self.ball_size > 0:
@@ -4450,11 +4541,19 @@ class InteractiveBallAnalyzer:
                               f"max_y={contact_reacquire_bounds['max_y']}")
                         continue
                 else:
+                    relaxed_min_y = contact_reacquire_bounds['min_y']
+                    if motion_metrics is not None:
+                        relaxed_min_y = self._contact_reacquire_min_y(
+                            contact_reacquire_bounds,
+                            predicted_distance,
+                            motion_metrics['mean'],
+                            motion_metrics['max'],
+                        )
                     if (cx < contact_reacquire_bounds['min_x'] or cx > contact_reacquire_bounds['max_x'] or
-                            cy < contact_reacquire_bounds['min_y']):
+                            cy < relaxed_min_y):
                         print(f"  DEBUG: Contour {i} REJECTED - upper-contact bounds "
                               f"x={contact_reacquire_bounds['min_x']}-{contact_reacquire_bounds['max_x']} "
-                              f"min_y={contact_reacquire_bounds['min_y']}")
+                              f"min_y={relaxed_min_y}")
                         continue
             frame0_hotspot = self._find_frame0_background_hotspot((cx, cy)) if not allow_inactive else None
             if not allow_inactive and motion_metrics is not None:
@@ -4464,8 +4563,10 @@ class InteractiveBallAnalyzer:
                 if upper_exit_transition_context:
                     if motion_max >= 40.0:
                         score -= min(55.0, motion_max * 0.3)
-                    elif motion_mean < 1.0 and motion_max < 8.0:
-                        score += 80.0
+                    elif motion_mean < 1.5 and motion_max < 12.0:
+                        score += 220.0
+                    elif motion_mean < 3.0 and motion_max < 20.0:
+                        score += 100.0
                 if frame0_hotspot is not None and motion_mean < 8.0 and motion_max < 35.0:
                     score += 1800
                     print(f"  DEBUG: Contour {i} PENALIZED - frame0 hotspot at ({cx},{cy}) "
@@ -4582,6 +4683,16 @@ class InteractiveBallAnalyzer:
                 selected_motion = self._candidate_motion_metrics(frame_gray, cx, cy)
                 motion_mean = selected_motion['mean'] if selected_motion is not None else 0.0
                 motion_max = selected_motion['max'] if selected_motion is not None else 0.0
+                selected_predicted_distance = (
+                    math.hypot(cx - predicted_point[0], cy - predicted_point[1])
+                    if predicted_point is not None else None
+                )
+                relaxed_contact_min_y = self._contact_reacquire_min_y(
+                    contact_reacquire_bounds,
+                    selected_predicted_distance,
+                    motion_mean,
+                    motion_max,
+                ) if contact_reacquire_bounds is not None else None
                 selected_area = cv2.contourArea(best_contour)
                 static_hotspot = ((selected_area <= 3 and motion_mean < 1.0 and motion_max < 5.0) or
                                   (cy < 100 and motion_mean < 2.5 and motion_max < 10.0))
@@ -4595,7 +4706,7 @@ class InteractiveBallAnalyzer:
                     contact_reacquire_bounds is not None and (
                         cx < contact_reacquire_bounds['min_x'] or
                         cx > contact_reacquire_bounds['max_x'] or
-                        cy < contact_reacquire_bounds['min_y']
+                        cy < relaxed_contact_min_y
                     )
                 )
                 frame0_hotspot = self._find_frame0_background_hotspot((cx, cy))
@@ -4620,7 +4731,7 @@ class InteractiveBallAnalyzer:
                     if outside_contact_bounds:
                         reason = (
                             f"upper-contact bounds x={contact_reacquire_bounds['min_x']}-"
-                            f"{contact_reacquire_bounds['max_x']} min_y={contact_reacquire_bounds['min_y']}"
+                            f"{contact_reacquire_bounds['max_x']} min_y={relaxed_contact_min_y}"
                         )
                     elif suspicious_upper_static_jump:
                         reason = (
@@ -4647,7 +4758,7 @@ class InteractiveBallAnalyzer:
                         retrack_h10 = self.retrack_with_alt2_hsv(
                             search_frame, x1, y1, self.ball_center, predicted_point, self.ball_size, allow_inactive,
                             lower=self.h10_hsv_lower, upper=self.h10_hsv_upper, frame_gray=frame_gray,
-                            filter_key="h_10", ignore_false_points=True
+                            filter_key="h_10", ignore_false_points=True, prefer_predicted_path=True
                         )
                         if retrack_h10 is not None:
                             h10_pos = retrack_h10['pos']
@@ -4661,9 +4772,23 @@ class InteractiveBallAnalyzer:
                             )
                             local_cap = max(55.0, min(105.0, actual_distance * 0.6))
                             very_local_cap = max(28.0, local_cap * 0.35)
+                            trajectory_local_cap = max(16.0, very_local_cap)
+                            trajectory_priority = (
+                                predicted_point is not None and
+                                h10_pred_distance <= trajectory_local_cap and
+                                (retrack_h10['motion_mean'] >= 6.0 or retrack_h10['motion_max'] >= 24.0 or retrack_h10['area'] >= 3.0)
+                            )
+                            weak_off_path_h10 = (
+                                retrack_h10['area'] <= 1.5 and
+                                h10_pred_distance > trajectory_local_cap and
+                                h10_prev_distance > very_local_cap
+                            )
                             if (
-                                h10_prev_distance <= very_local_cap or
-                                (h10_prev_distance <= local_cap and h10_pred_distance <= (local_cap + 18.0))
+                                not weak_off_path_h10 and (
+                                    h10_prev_distance <= very_local_cap or
+                                    trajectory_priority or
+                                    (h10_prev_distance <= local_cap and h10_pred_distance <= (local_cap * 0.75))
+                                )
                             ):
                                 self.ball_center = h10_pos
                                 self.ball_hsv = retrack_h10['hsv']
@@ -4674,8 +4799,26 @@ class InteractiveBallAnalyzer:
                                 return self.ball_center
                             print(
                                 f"  DEBUG: Rejecting h_10 false-point recover at {h10_pos} - "
-                                f"too far from local track window ({h10_prev_distance:.1f}px/{h10_pred_distance:.1f}px > {local_cap:.1f}px)"
+                                f"off local/predicted path ({h10_prev_distance:.1f}px/{h10_pred_distance:.1f}px caps={very_local_cap:.1f}/{local_cap:.1f})"
                             )
+                    if (contact_reacquire_bounds is not None and self.ball_center is not None and
+                            self.ball_center[1] <= 260 and
+                            (self.ball_size is None or self.ball_size <= 35)):
+                        regular_single = self._find_single_standard_candidate(
+                            search_frame, x1, y1, self.ball_center, predicted_point, frame_gray
+                        )
+                        if self._should_use_single_regular_candidate(
+                                regular_single, predicted_point, search_radius):
+                            new_pos = regular_single['pos']
+                            hsv_full = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+                            self.ball_center = new_pos
+                            self.ball_hsv = hsv_full[new_pos[1], new_pos[0]]
+                            self.ball_size = regular_single['area']
+                            self._activate_regular_hsv()
+                            self.direction_change_streak = 0
+                            self.stuck_frame_count = 0
+                            print(f"Frame {self.frame_count}: [REGULAR FP RECOVER] Ball at {new_pos}")
+                            return self.ball_center
                     self.stuck_frame_count += 1
                     print(f"Frame {self.frame_count}: [TRACKING_FP_REJECT] holding {self.ball_center} "
                           f"instead of false hotspot ({cx},{cy}) motion_mean={motion_mean:.1f} motion_max={motion_max:.1f}")
@@ -5002,6 +5145,7 @@ class InteractiveBallAnalyzer:
                 prev_ball_size is not None and prev_ball_size <= 20
             )
             if soft_upper_contact_recover:
+                soft_recover_applied = False
                 contact_reference = self.ball_center
                 soft_recover = self._recover_contact_phase_ball(
                     frame, contact_reference, frame_gray,
@@ -5027,8 +5171,16 @@ class InteractiveBallAnalyzer:
                         )
                     current_upward = self.ball_center[1] - cy
                     recovered_upward = self.ball_center[1] - soft_recover['pos'][1]
-                    if (recovered_upward >= current_upward + 12 or
-                            recovered_predicted_distance + 10 < current_predicted_distance):
+                    soft_recover_motion_mean = soft_recover.get('motion_mean')
+                    soft_recover_motion_max = soft_recover.get('motion_max')
+                    soft_recover_strong = (
+                        soft_recover['area'] >= max(12.0, float(prev_ball_size or 0.0) * 2.0) or
+                        (soft_recover_motion_mean is not None and soft_recover_motion_mean >= 18.0) or
+                        (soft_recover_motion_max is not None and soft_recover_motion_max >= 100.0)
+                    )
+                    if (soft_recover_strong and (
+                            recovered_upward >= current_upward + 12 or
+                            recovered_predicted_distance + 10 < current_predicted_distance)):
                         cx, cy = soft_recover['pos']
                         hsv_values = soft_recover['hsv']
                         bulb_size = soft_recover['area']
@@ -5036,8 +5188,39 @@ class InteractiveBallAnalyzer:
                         dy = cy - self.ball_center[1]
                         velocity = math.hypot(dx, dy)
                         direction_deg = math.degrees(math.atan2(dy, dx)) if velocity > 0 else 0.0
+                        soft_recover_applied = True
                         print(f"Frame {self.frame_count}: [UPPER CONTACT SOFT RECOVER] Ball at ({cx}, {cy}) "
                               f"from {soft_recover.get('label', 'n/a')} mode={soft_recover.get('mode', 'n/a')}")
+                current_dx = 0.0
+                current_dy = 0.0
+                current_velocity = 0.0
+                if self.ball_center is not None:
+                    current_dx = cx - self.ball_center[0]
+                    current_dy = cy - self.ball_center[1]
+                    current_velocity = math.hypot(current_dx, current_dy)
+                current_candidate_tiny = (
+                    bulb_size <= max(2.0, float(prev_ball_size or 0.0) * 0.7)
+                )
+                current_candidate_far = (
+                    self.last_motion is not None and
+                    current_velocity >= max(22.0, self.last_motion.get('distance', 0.0) * 1.9)
+                )
+                soft_recover_weak = (
+                    soft_recover is not None and
+                    soft_recover['area'] <= max(10.0, float(prev_ball_size or 0.0) * 3.0) and
+                    ((soft_recover.get('motion_mean') is None or soft_recover.get('motion_mean') < 15.0)) and
+                    ((soft_recover.get('motion_max') is None or soft_recover.get('motion_max') < 80.0))
+                )
+                if (not soft_recover_applied and current_candidate_tiny and current_candidate_far and soft_recover_weak):
+                    print(f"Frame {self.frame_count}: [UPPER CONTACT HOLD] weak override/recover "
+                          f"area={bulb_size:.1f}px vel={current_velocity:.1f}px "
+                          f"soft_area={(soft_recover['area'] if soft_recover is not None else -1):.1f}")
+                    self._deferred_motion_anchor = {
+                        'frame': self.frame_count,
+                        'pos': soft_recover['pos'],
+                        'label': soft_recover.get('label', 'n/a'),
+                    }
+                    return self.ball_center
 
             upper_post_bounce_size_spike = (
                 not allow_inactive and
@@ -5067,6 +5250,25 @@ class InteractiveBallAnalyzer:
                         direction_deg = math.degrees(math.atan2(dy, dx)) if velocity > 0 else 0.0
                         print(f"Frame {self.frame_count}: [UPPER SIZE-SPIKE RECOVER] Ball at ({cx}, {cy}) "
                               f"from {spike_recover.get('label', 'n/a')} mode={spike_recover.get('mode', 'n/a')}")
+
+            deferred_motion_anchor = getattr(self, '_deferred_motion_anchor', None)
+            if deferred_motion_anchor is not None:
+                if (deferred_motion_anchor.get('frame') == self.frame_count - 1 and
+                        self.ball_center is not None):
+                    anchor_pos = deferred_motion_anchor.get('pos')
+                    if anchor_pos is not None:
+                        anchor_dx = cx - anchor_pos[0]
+                        anchor_dy = cy - anchor_pos[1]
+                        anchor_velocity = math.hypot(anchor_dx, anchor_dy)
+                        if velocity > 0 and anchor_velocity + 8.0 < velocity and anchor_velocity <= velocity * 0.8:
+                            dx = anchor_dx
+                            dy = anchor_dy
+                            velocity = anchor_velocity
+                            direction_deg = math.degrees(math.atan2(dy, dx)) if velocity > 0 else 0.0
+                            print(f"Frame {self.frame_count}: [DEFERRED MOTION ANCHOR] using "
+                                  f"{deferred_motion_anchor.get('label', 'n/a')} anchor at {anchor_pos} "
+                                  f"for motion ({velocity:.1f}px)")
+                self._deferred_motion_anchor = None
 
             if prev_ball_size and prev_ball_size > 30 and bulb_size < 5:
                 print(f"Frame {self.frame_count}: Ball size dropped {prev_ball_size:.0f}->{bulb_size:.0f}px - likely occluded by player")
