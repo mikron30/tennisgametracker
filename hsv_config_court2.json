@@ -130,7 +130,7 @@
     "serve_ball_size_min": 50,
     "serve_ball_size_max": 800,
     "ball_max_speed": 400,
-    "max_point_frames": 200,
+    "max_point_frames": 260,
     "tracking_ignore_hotspots": [
         {
             "pos": [

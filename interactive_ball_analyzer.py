@@ -129,6 +129,10 @@ class InteractiveBallAnalyzer:
         self._top_return_anchor = None
         self._top_return_origin_frame = -1
         self._top_return_reentry_grace_frames = 0
+        self._back_return_wait_frames = 0
+        self._back_return_anchor = None
+        self._back_return_origin_frame = -1
+        self._back_return_reentry_grace_frames = 0
         self.serve_width_ratio = None
         self._prev_serve_gray = None
         self._ignored_serve_positions = []
@@ -1262,6 +1266,71 @@ class InteractiveBallAnalyzer:
             return False, f"top-return y {cy} > max_reentry_y {max_reentry_y}"
         if not strong_motion:
             return False, f"top-return weak motion mean={motion_mean:.1f} max={motion_max:.1f} area={area:.1f}"
+        return True, None
+
+    def _should_start_back_return_wait(self, frame_shape):
+        """Return True for large lower-right exits that can re-enter from the right side later."""
+        if self.ball_center is None or self.last_motion is None:
+            return False
+        frame_height, frame_width = frame_shape[:2]
+        x_prev, y_prev = self.ball_center
+        if x_prev < int(frame_width * 0.84):
+            return False
+        if y_prev < frame_height - 160:
+            return False
+        if self.last_motion.get('dx', 0.0) < 8.0:
+            return False
+        if self.last_motion.get('dy', 0.0) < 35.0:
+            return False
+        if self.last_motion.get('distance', 0.0) < 70.0:
+            return False
+        if self.ball_size is None or self.ball_size < 250.0:
+            return False
+        return True
+
+    def _activate_back_return_wait(self):
+        """Arm a delayed lower-right return search after the large ball leaves frame."""
+        if self.ball_center is None:
+            return
+        self._back_return_wait_frames = max(self._back_return_wait_frames, 36)
+        self._back_return_anchor = tuple(self.ball_center)
+        self._back_return_origin_frame = self.frame_count
+
+    def _back_return_wait_active(self):
+        anchor = getattr(self, '_back_return_anchor', None)
+        return (
+            getattr(self, '_back_return_wait_frames', 0) > 0 and
+            anchor is not None and
+            self.ball_center is not None
+        )
+
+    def _back_return_reentry_ok(self, pos, area, motion_mean, motion_max, frame_shape):
+        """Validate a delayed re-entry from the right/back side after a lower-right exit."""
+        anchor = getattr(self, '_back_return_anchor', None)
+        if anchor is None:
+            return True, None
+
+        cx, cy = pos
+        frame_height, frame_width = frame_shape[:2]
+        elapsed = max(0, self.frame_count - getattr(self, '_back_return_origin_frame', self.frame_count))
+        x_floor = max(int(frame_width * 0.60), anchor[0] - 1000)
+        x_ceil = min(frame_width - 180, anchor[0] + 120)
+        min_reentry_y = max(int(frame_height * 0.12), anchor[1] - 1450)
+        max_reentry_y = min(int(frame_height * 0.82), anchor[1] - 120)
+        strong_motion = motion_max >= 35.0 or motion_mean >= 6.0 or area >= 8.0
+
+        if elapsed < 5:
+            return False, f"back-return blind wait elapsed={elapsed}f"
+        if cx < x_floor:
+            return False, f"back-return x {cx} < min_x {x_floor}"
+        if cx > x_ceil:
+            return False, f"back-return x {cx} > max_x {x_ceil}"
+        if cy < min_reentry_y:
+            return False, f"back-return y {cy} < min_y {min_reentry_y}"
+        if cy > max_reentry_y:
+            return False, f"back-return y {cy} > max_y {max_reentry_y}"
+        if not strong_motion:
+            return False, f"back-return weak motion mean={motion_mean:.1f} max={motion_max:.1f} area={area:.1f}"
         return True, None
 
     def _get_lower_contact_launch_context(self, frame_shape):
@@ -3467,6 +3536,7 @@ class InteractiveBallAnalyzer:
         rally_contact_grace = getattr(self, '_rally_contact_grace_frames', 0) > 0
         ground_bounce_grace = getattr(self, '_ground_bounce_grace_frames', 0) > 0
         top_return_reentry_grace = getattr(self, '_top_return_reentry_grace_frames', 0) > 0
+        back_return_reentry_grace = getattr(self, '_back_return_reentry_grace_frames', 0) > 0
         serve_contact_descending = (
             serve_contact_grace and (
                 self._is_descending_serve_contact_motion() or
@@ -3497,6 +3567,8 @@ class InteractiveBallAnalyzer:
             self._ground_bounce_grace_frames -= 1
         if top_return_reentry_grace:
             self._top_return_reentry_grace_frames -= 1
+        if back_return_reentry_grace:
+            self._back_return_reentry_grace_frames -= 1
         if contact_recovery_active:
             self._contact_recovery_frames -= 1
 
@@ -3510,6 +3582,7 @@ class InteractiveBallAnalyzer:
         self.edge_wait = False
         upper_exit_wait = getattr(self, '_upper_exit_wait_frames', 0) > 0
         top_return_wait = self._top_return_wait_active()
+        back_return_wait = self._back_return_wait_active()
 
         if self.ball_center:
             x_prev, y_prev = self.ball_center
@@ -3531,6 +3604,25 @@ class InteractiveBallAnalyzer:
                       f"frames_left={self._top_return_wait_frames}")
                 x, y = anchor_x, min(18, max(10, anchor_y))
                 search_radius = min(420, max(220, self.max_ball_speed * 3 + elapsed * 2))
+                self.edge_wait = True
+            elif back_return_wait:
+                self._back_return_wait_frames -= 1
+                anchor_x, anchor_y = self._back_return_anchor
+                elapsed = max(0, self.frame_count - self._back_return_origin_frame)
+                print(f"\n  DEBUG: [BACK-RETURN WAIT] holding near lower-right exit from ({anchor_x},{anchor_y}), "
+                      f"frames_left={self._back_return_wait_frames}")
+                x, y = anchor_x, anchor_y
+                search_radius = 1500
+                self.edge_wait = True
+            elif self._should_start_back_return_wait(frame.shape):
+                self._activate_back_return_wait()
+                back_return_wait = True
+                elapsed = 0
+                anchor_x, anchor_y = self._back_return_anchor
+                print(f"\n  DEBUG: Ball near lower-right exit ({anchor_x},{anchor_y}), may have gone off-screen")
+                print(f"  DEBUG: [BACK-RETURN WAIT] activated for delayed right-side re-entry search")
+                x, y = anchor_x, anchor_y
+                search_radius = 1500
                 self.edge_wait = True
             # Check if ball went off top edge
             elif y_prev < edge_margin:
@@ -3742,6 +3834,7 @@ class InteractiveBallAnalyzer:
             print(f"  DEBUG: Contact recovery active - checking BOTH HSV filters")
 
         top_return_search_context = self._top_return_wait_active()
+        back_return_search_context = self._back_return_wait_active()
         upper_wall_search_context = (
             not allow_inactive and
             self.ball_center is not None and
@@ -3818,10 +3911,10 @@ class InteractiveBallAnalyzer:
         else:
             # Normal single HSV filter search
             hsv_lower_use, hsv_upper_use, hsv_mode = self.select_hsv_for_position(search_anchor_y)
-            if top_return_search_context and self.primary_hsv_lower is not None and self.primary_hsv_upper is not None:
+            if (top_return_search_context or back_return_search_context) and self.primary_hsv_lower is not None and self.primary_hsv_upper is not None:
                 hsv_lower_use = self.primary_hsv_lower.copy()
                 hsv_upper_use = self.primary_hsv_upper.copy()
-                hsv_mode = "top_return_regular"
+                hsv_mode = "top_return_regular" if top_return_search_context else "back_return_regular"
             if allow_inactive and hasattr(self, 'serve_area_x_min'):
                 # Use full configured HSV for serve scan (do not cap H max)
                 hsv_lower_use = self.hsv_lower
@@ -3901,6 +3994,11 @@ class InteractiveBallAnalyzer:
                 print(f"  DEBUG:   - Fallen outside the current full-frame HSV search")
             print(f"  DEBUG:   - Be occluded by player/net")
             print(f"  DEBUG: Will continue searching in next frame at same position...")
+
+            if back_return_search_context and self.ball_center:
+                self.stuck_frame_count = min(self.stuck_frame_count, 4)
+                print(f"[BALL_LOST] f{self.frame_count}: back-return wait holding pos={self.ball_center} stuck={self.stuck_frame_count}")
+                return self.ball_center
 
             if upper_exit_wait and self.ball_center:
                 self.stuck_frame_count += 1
@@ -4339,7 +4437,15 @@ class InteractiveBallAnalyzer:
             # Size filter: tighter in inactive serve scan, looser when tracking.
             # Both limits are court-configurable via serve_ball_size_min/max so that
             # near-end servers (large ball) and far-end servers (tiny ball) both work.
-            ball_size_max_tracking = max(150, self.serve_ball_size_max)
+            # When we are already following a very large close ball, allow a modest
+            # growth margin so the next frame does not get dropped by a hard 800px cap.
+            large_ball_tracking_cap = 0
+            if (not allow_inactive and self.ball_size is not None and self.ball_size >= 200):
+                large_ball_tracking_cap = min(
+                    1100,
+                    int(max(self.ball_size * 1.45, self.ball_size + 120))
+                )
+            ball_size_max_tracking = max(150, self.serve_ball_size_max, large_ball_tracking_cap)
             if allow_inactive:
                 if area < self.serve_ball_size_min or area > self.serve_ball_size_max:
                     print(f"  DEBUG: Contour {i} REJECTED - area={area:.1f}px (serve scan outside {self.serve_ball_size_min}-{self.serve_ball_size_max})")
@@ -4352,6 +4458,7 @@ class InteractiveBallAnalyzer:
             # Reject extremely small candidates when we already have a valid previous ball size
             # to avoid picking spark/noise/racket edges with size 1-3px as the ball.
             if (not upper_exit_transition_context and
+                    not back_return_search_context and not back_return_reentry_grace and
                     self.ball_size and self.ball_size > 40 and
                     area < max(5, int(self.ball_size * 0.08))):
                 print(f"  DEBUG: Contour {i} REJECTED - area={area:.1f}px (too small relative to previous ball size {self.ball_size:.1f}px)")
@@ -4784,6 +4891,43 @@ class InteractiveBallAnalyzer:
                     f"source={top_meta['source']}"
                 )
 
+        if back_return_search_context and candidate_meta:
+            back_return_candidates = []
+            for meta in candidate_meta:
+                if meta['source'] not in ('primary', 'regular', 'alt'):
+                    continue
+                ok, _ = self._back_return_reentry_ok(
+                    meta['pos'],
+                    meta['area'],
+                    meta['motion_mean'],
+                    meta['motion_max'],
+                    frame.shape,
+                )
+                if not ok:
+                    continue
+                source_bias = -80.0 if meta['source'] in ('primary', 'regular') else -35.0
+                adjusted_score = (
+                    meta['score'] +
+                    source_bias -
+                    min(1100.0, meta['area'] * 4.0) -
+                    min(220.0, meta['motion_max'] * 1.3) -
+                    min(120.0, meta['motion_mean'] * 3.5)
+                )
+                back_return_candidates.append((adjusted_score, meta))
+
+            if back_return_candidates:
+                _, back_meta = min(back_return_candidates, key=lambda item: item[0])
+                best_contour = back_meta['contour']
+                best_source = back_meta['source']
+                best_score = back_meta['score']
+                print(
+                    f"  DEBUG: [BACK-RETURN WAIT] prioritizing re-entry candidate at "
+                    f"{back_meta['pos']} area={back_meta['area']:.1f}px "
+                    f"score={back_meta['score']:.1f} motion="
+                    f"{back_meta['motion_mean']:.1f}/{back_meta['motion_max']:.1f} "
+                    f"source={back_meta['source']}"
+                )
+
         # Early-serve bias: when starting and no previous ball, favor the highest (smallest y) valid contour
         if self.ball_center is None and self.frame_count <= self.start_frame + 10 and candidates:
             highest = min(candidates, key=lambda c: (c[3], c[4]))  # prioritize lowest y (higher on screen), then smaller area
@@ -4814,6 +4958,7 @@ class InteractiveBallAnalyzer:
                 self._find_frame0_background_hotspot((cx, cy)) is not None
             )
             accepted_top_return_reentry = False
+            accepted_back_return_reentry = False
             if should_guard_selected:
                 x_prev, y_prev = self.ball_center
                 actual_distance = np.sqrt((cx - x_prev)**2 + (cy - y_prev)**2)
@@ -4878,6 +5023,29 @@ class InteractiveBallAnalyzer:
                     accepted_top_return_reentry = True
                     self._top_return_reentry_grace_frames = max(
                         getattr(self, '_top_return_reentry_grace_frames', 0), 4
+                    )
+                if back_return_search_context:
+                    back_return_ok, back_return_reason = self._back_return_reentry_ok(
+                        (cx, cy), selected_area, motion_mean, motion_max, frame.shape
+                    )
+                    if not back_return_ok:
+                        self._record_rejected_contour_debug(
+                            best_contour,
+                            x1,
+                            y1,
+                            cx,
+                            cy,
+                            selected_area,
+                            back_return_reason,
+                            source=best_source,
+                        )
+                        self.stuck_frame_count = min(self.stuck_frame_count, 4)
+                        print(f"Frame {self.frame_count}: [BACK-RETURN WAIT] ignoring non-reentry blob ({cx},{cy}) "
+                              f"reason={back_return_reason}")
+                        return self.ball_center
+                    accepted_back_return_reentry = True
+                    self._back_return_reentry_grace_frames = max(
+                        getattr(self, '_back_return_reentry_grace_frames', 0), 4
                     )
                 static_hotspot = ((selected_area <= 3 and motion_mean < 1.0 and motion_max < 5.0) or
                                   (cy < 100 and motion_mean < 2.5 and motion_max < 10.0))
@@ -5621,6 +5789,10 @@ class InteractiveBallAnalyzer:
                 self._top_return_wait_frames = 0
                 self._top_return_anchor = None
                 self._top_return_origin_frame = -1
+            if back_return_search_context:
+                self._back_return_wait_frames = 0
+                self._back_return_anchor = None
+                self._back_return_origin_frame = -1
             if serve_direction_search:
                 # The first few frames after serve contact contain the biggest
                 # legitimate direction/speed change of the point.
@@ -5801,7 +5973,7 @@ class InteractiveBallAnalyzer:
             for source, contour in contours[:5]:  # Show first 5
                 rejected_sizes.append(f"{cv2.contourArea(contour):.1f}px")
             print(f"  DEBUG: Rejected sizes (first 5): {', '.join(rejected_sizes)}")
-            print(f"  DEBUG: REASON: Ball size changed outside 1-150px range")
+            print(f"  DEBUG: REASON: Ball size changed outside {size_cap}")
             print(f"  DEBUG:   - Ball may be too small (far away) or too large (very close)")
             print(f"  DEBUG:   - Consider adjusting size filter if ball is visible")
             if predicted_point:
@@ -6590,6 +6762,10 @@ class InteractiveBallAnalyzer:
             self._top_return_anchor = None
             self._top_return_origin_frame = -1
             self._top_return_reentry_grace_frames = 0
+            self._back_return_wait_frames = 0
+            self._back_return_anchor = None
+            self._back_return_origin_frame = -1
+            self._back_return_reentry_grace_frames = 0
             self._prev_serve_gray = None
             self._ignored_serve_positions = []
             self.waiting_serve_candidate = None
