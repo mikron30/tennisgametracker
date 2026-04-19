@@ -132,9 +132,13 @@ class InteractiveBallAnalyzer:
         self._top_return_mode = None
         self._top_return_exit_dx = 0.0
         self._back_return_wait_frames = 0
+        # Court-2 back-return re-entry shows up about 5 frames after the lower-right
+        # exit in the validated rally; allow a small cushion, then declare the ball lost.
+        self._back_return_timeout_frames = 8
         self._back_return_anchor = None
         self._back_return_origin_frame = -1
         self._back_return_reentry_grace_frames = 0
+        self._back_return_timed_out = False
         self.serve_width_ratio = None
         self._prev_serve_gray = None
         self._ignored_serve_positions = []
@@ -154,6 +158,8 @@ class InteractiveBallAnalyzer:
         self._debug_rejected_contours = []
         self._deferred_motion_anchor = None
         self.last_nonzero_motion = None
+        self._singles_sideline_model = None
+        self._singles_sideline_frame_shape = None
         
     def log_motion_metrics(self, dx, dy, distance, direction_deg):
         """Log per-frame motion and raise a focus-loss flag when movement spikes."""
@@ -270,7 +276,20 @@ class InteractiveBallAnalyzer:
 
         serve_height = max(1, self.serve_area_y_max - self.serve_area_y_min)
         contact_y = self.serve_area_y_min + int(serve_height * self.serve_contact_y_ratio)
-        if y < contact_y:
+        # On the final descending-contact frame, the ball can still be a little above the
+        # nominal contact band just before it launches back up/forward.  Allow a small
+        # early-entry margin here so we search the serve-direction wedge instead of
+        # forcing the generic continuation heuristic to keep following the downward toss.
+        contact_y_margin = 0
+        if (
+            getattr(self, '_serve_contact_grace_frames', 0) <= 1 and
+            self._is_descending_serve_contact_motion(self.last_motion)
+        ):
+            contact_y_margin = max(
+                20,
+                min(36, int(abs(float(self.last_motion.get('dy', 0.0) or 0.0)) * 0.6))
+            )
+        if y < (contact_y - contact_y_margin):
             return False
         if self.last_motion.get('dy', 0) < self.serve_contact_min_prev_dy:
             return False
@@ -1436,9 +1455,13 @@ class InteractiveBallAnalyzer:
         """Arm a delayed lower-right return search after the large ball leaves frame."""
         if self.ball_center is None:
             return
-        self._back_return_wait_frames = max(self._back_return_wait_frames, 36)
+        self._back_return_wait_frames = max(
+            self._back_return_wait_frames,
+            int(getattr(self, '_back_return_timeout_frames', 8)),
+        )
         self._back_return_anchor = tuple(self.ball_center)
         self._back_return_origin_frame = self.frame_count
+        self._back_return_timed_out = False
 
     def _back_return_wait_active(self):
         anchor = getattr(self, '_back_return_anchor', None)
@@ -5106,7 +5129,10 @@ class InteractiveBallAnalyzer:
                     f"source={back_meta['source']}"
                 )
 
-        if candidate_meta and not top_return_search_context and not back_return_search_context:
+        if (candidate_meta and
+                not top_return_search_context and
+                not back_return_search_context and
+                not serve_direction_search):
             continuation_meta = self._prefer_predicted_continuation_candidate(candidate_meta, predicted_point)
             if continuation_meta is not None:
                 best_contour = continuation_meta['contour']
@@ -6234,6 +6260,13 @@ class InteractiveBallAnalyzer:
             if predicted_point:
                 print(f"  DEBUG: Predicted point was {predicted_point}, consider widening search around it")
         if best_contour is None and back_return_search_context and self.ball_center is not None:
+            if getattr(self, '_back_return_wait_frames', 0) <= 0:
+                self._back_return_timed_out = True
+                self._back_return_anchor = None
+                self._back_return_origin_frame = -1
+                print(f"Frame {self.frame_count}: [BACK-RETURN WAIT] timed out after "
+                      f"{getattr(self, '_back_return_timeout_frames', 8)} frames with no re-entry")
+                return None
             self.stuck_frame_count = min(self.stuck_frame_count, 4)
             print(f"Frame {self.frame_count}: [BACK-RETURN WAIT] no valid re-entry candidate, holding {self.ball_center}")
             return self.ball_center
@@ -6729,6 +6762,15 @@ class InteractiveBallAnalyzer:
         # Check if ball is out of court bounds
         if x < 0 or x > width or y < 0 or y > height:
             return True, "Ball out of court bounds"
+
+        suppress_out_bounce = (
+            self._back_return_wait_active() or
+            getattr(self, '_back_return_reentry_grace_frames', 0) > 0
+        )
+        if not suppress_out_bounce:
+            out_bounce_detected, out_bounce_reason = self._detect_out_of_court_bounce(ball_position, frame)
+            if out_bounce_detected:
+                return True, out_bounce_reason
         
         # Check if ball is in or just above the marked net area.
         # A little extra top margin helps catch real tape clips when the marked
@@ -6823,6 +6865,163 @@ class InteractiveBallAnalyzer:
             return False, "Edge return grace"
         
         return False, "Point continues"
+
+    def _build_singles_sideline_model(self, frame):
+        frame_shape = frame.shape[:2]
+        if (self._singles_sideline_model is not None and
+                self._singles_sideline_frame_shape == frame_shape):
+            return self._singles_sideline_model
+
+        height, width = frame_shape
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        _, white_mask = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY)
+        min_line_length = max(250, int(width * 0.08))
+        lines = cv2.HoughLinesP(
+            white_mask,
+            1,
+            np.pi / 180,
+            threshold=120,
+            minLineLength=min_line_length,
+            maxLineGap=20,
+        )
+        if lines is None:
+            self._singles_sideline_model = None
+            self._singles_sideline_frame_shape = frame_shape
+            return None
+
+        y_ref = int(height * 0.74)
+        left_candidates = []
+        right_candidates = []
+        fallback_left = []
+        fallback_right = []
+
+        for raw in lines[:, 0, :]:
+            x1, y1, x2, y2 = [float(v) for v in raw]
+            dy = y2 - y1
+            if abs(dy) < 20.0:
+                continue
+            dx = x2 - x1
+            angle = math.degrees(math.atan2(dy, dx))
+            if not ((-75.0 < angle < -42.0) or (42.0 < angle < 75.0)):
+                continue
+
+            a = dx / dy
+            b = x1 - a * y1
+            x_ref = a * y_ref + b
+            length = math.hypot(dx, dy)
+            entry = {
+                'a': a,
+                'b': b,
+                'x_ref': x_ref,
+                'length': length,
+                'angle': angle,
+            }
+            if angle < 0:
+                if width * 0.14 <= x_ref <= width * 0.32:
+                    left_candidates.append(entry)
+                elif width * 0.06 <= x_ref <= width * 0.40:
+                    fallback_left.append(entry)
+            else:
+                if width * 0.68 <= x_ref <= width * 0.83:
+                    right_candidates.append(entry)
+                elif width * 0.60 <= x_ref <= width * 0.90:
+                    fallback_right.append(entry)
+
+        if not left_candidates and fallback_left:
+            left_candidates = sorted(fallback_left, key=lambda entry: entry['x_ref'], reverse=True)[:4]
+        if not right_candidates and fallback_right:
+            right_candidates = sorted(fallback_right, key=lambda entry: entry['x_ref'])[:4]
+
+        if not left_candidates or not right_candidates:
+            self._singles_sideline_model = None
+            self._singles_sideline_frame_shape = frame_shape
+            return None
+
+        left_best = max(left_candidates, key=lambda entry: entry['length'])
+        right_best = max(right_candidates, key=lambda entry: entry['length'])
+        self._singles_sideline_model = {
+            'left': left_best,
+            'right': right_best,
+            'margin': max(12.0, width * 0.0035),
+        }
+        self._singles_sideline_frame_shape = frame_shape
+        print(
+            f"  DEBUG: Singles sideline model built: "
+            f"left_x@{y_ref}={left_best['x_ref']:.1f} angle={left_best['angle']:.1f}, "
+            f"right_x@{y_ref}={right_best['x_ref']:.1f} angle={right_best['angle']:.1f}"
+        )
+        return self._singles_sideline_model
+
+    def _point_outside_singles_sidelines(self, point, frame):
+        model = self._build_singles_sideline_model(frame)
+        if model is None:
+            return False, None, None, None
+
+        x, y = point
+        height, _ = frame.shape[:2]
+        if not (int(height * 0.12) <= y <= int(height * 0.92)):
+            return False, None, None, None
+
+        left_x = model['left']['a'] * y + model['left']['b']
+        right_x = model['right']['a'] * y + model['right']['b']
+        margin = model['margin']
+        if x < left_x - margin:
+            return True, 'left', left_x, right_x
+        if x > right_x + margin:
+            return True, 'right', left_x, right_x
+        return False, None, left_x, right_x
+
+    def _detect_out_of_court_bounce(self, ball_position, frame):
+        if self.prev_motion is None or self.last_motion is None:
+            return False, None
+        if not hasattr(self, 'net_area_y_min'):
+            return False, None
+
+        x, y = ball_position
+        curr_dx = float(self.last_motion.get('dx', 0.0) or 0.0)
+        curr_dy = float(self.last_motion.get('dy', 0.0) or 0.0)
+        prev_dx = float(self.prev_motion.get('dx', 0.0) or 0.0)
+        prev_dy = float(self.prev_motion.get('dy', 0.0) or 0.0)
+        curr_speed = float(self.last_motion.get('distance', 0.0) or 0.0)
+        prev_speed = float(self.prev_motion.get('distance', 0.0) or 0.0)
+        if prev_speed < 20.0 or curr_speed < 12.0:
+            return False, None
+
+        prev_pos = (int(round(x - curr_dx)), int(round(y - curr_dy)))
+        prev_pos_outside, prev_side, prev_left_x, prev_right_x = self._point_outside_singles_sidelines(prev_pos, frame)
+        curr_pos_outside, curr_side, curr_left_x, curr_right_x = self._point_outside_singles_sidelines(ball_position, frame)
+        if not prev_pos_outside and not curr_pos_outside:
+            return False, None
+
+        near_side_min_y = int(self.net_area_y_min + 60)
+        if prev_pos[1] < near_side_min_y and y < near_side_min_y:
+            return False, None
+
+        prev_dir = self.prev_motion.get('direction_deg')
+        curr_dir = self.last_motion.get('direction_deg')
+        angle_diff = 0.0
+        if prev_dir is not None and curr_dir is not None:
+            delta = abs(curr_dir - prev_dir) % 360
+            angle_diff = min(delta, 360 - delta)
+
+        vertical_reversal = prev_dy >= 18.0 and curr_dy <= -12.0
+        sharp_turn = angle_diff >= 95.0
+        if not (vertical_reversal or sharp_turn):
+            return False, None
+
+        side = prev_side or curr_side
+        bounce_point = prev_pos if prev_pos_outside else ball_position
+        left_x = prev_left_x if prev_pos_outside else curr_left_x
+        right_x = prev_right_x if prev_pos_outside else curr_right_x
+        if left_x is None or right_x is None:
+            return False, None
+
+        print(
+            f"Frame {self.frame_count}: [OUT-BOUNCE] bounce_point={bounce_point} side={side} "
+            f"court_x={left_x:.1f}-{right_x:.1f} prev_motion=({prev_dx:.1f},{prev_dy:.1f}) "
+            f"curr_motion=({curr_dx:.1f},{curr_dy:.1f}) angle_diff={angle_diff:.1f}"
+        )
+        return True, f"Ball bounced out of court ({side} sideline)"
     
     def _open_serve_area_hsv_tuner(self, frame):
         """Open HSV tuner specifically for the serve area."""
@@ -7027,6 +7226,7 @@ class InteractiveBallAnalyzer:
             self._back_return_anchor = None
             self._back_return_origin_frame = -1
             self._back_return_reentry_grace_frames = 0
+            self._back_return_timed_out = False
             self._prev_serve_gray = None
             self._ignored_serve_positions = []
             self.waiting_serve_candidate = None
@@ -7377,6 +7577,15 @@ class InteractiveBallAnalyzer:
                             print(f"Frame {self.frame_count}: Ball tracking continued")
                 else:
                     # Ball lost - might be end of point
+                    if getattr(self, '_back_return_timed_out', False):
+                        point_end_frame = self.frame_count
+                        dur = point_end_frame - point_start_frame if point_start_frame else 0
+                        print(f"Frame {self.frame_count}: POINT ENDED - Ball lost after back-return timeout")
+                        print(f"Point duration: {dur} frames")
+                        print(f"[POINT_END] f{self.frame_count}: reason=BACK_RETURN_TIMEOUT duration={dur}f")
+                        game_state = "WAITING_FOR_SERVE"
+                        reset_tracking_state()
+                        continue
                     grace_limit = 45 if point_start_frame and self.frame_count <= (self.start_frame + 45) else 30
                     if point_start_frame and (self.frame_count - point_start_frame > grace_limit):
                         point_end_frame = self.frame_count
@@ -7658,6 +7867,16 @@ class InteractiveBallAnalyzer:
                             # Player is about to strike the ball just below the serve area.
                             # Start tracking from last known position — the 200px search radius
                             # will find the ball at the strike point.
+                            toss_complete_min_signed_total_dx = max(
+                                25,
+                                int((self.serve_area_x_max - self.serve_area_x_min) * 0.01),
+                            )
+                            if signed_total_dx < toss_complete_min_signed_total_dx or signed_last_dx < -2:
+                                print(f"[SERVE_EXIT_REJECT] f{self.frame_count}: toss-complete blocked "
+                                      f"signed_total_dx={signed_total_dx:.0f}px signed_last_dx={signed_last_dx:.0f}px "
+                                      f"(need total>={toss_complete_min_signed_total_dx}px and last>=-2px)")
+                                clear_waiting_serve_history()
+                                continue
                             p1 = serve_position_history[-2]
                             p2 = serve_position_history[-1]
                             _dx = p2[0] - p1[0]
