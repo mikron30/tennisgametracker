@@ -160,8 +160,26 @@ class InteractiveBallAnalyzer:
         self.last_nonzero_motion = None
         self._singles_sideline_model = None
         self._singles_sideline_frame_shape = None
-        
-    def log_motion_metrics(self, dx, dy, distance, direction_deg):
+        self._service_box_model = None
+        self._service_box_frame_shape = None
+        self._white_line_visual_model = None
+        self._white_line_visual_frame_shape = None
+        self.net_area_points = []
+        self.current_game_state = "WAITING_FOR_SERVE"
+        self.recent_bounce_markers = []
+        self._last_impact_marker_frame = -1000000
+        self._last_impact_marker_pos = None
+        self._last_impact_marker_kind = None
+        self._pending_rally_end_reason = None
+        self._pending_rally_end_frame = -1
+        self._awaiting_serve_bounce = False
+        self._point_serve_start_side = None
+        self._point_target_service_side = None
+        self.direction_change_min_degrees = 20.0
+        self.motion_debug_vectors = []
+        self.motion_debug_vector_limit = 8
+
+    def log_motion_metrics(self, prev_pos, dx, dy, distance, direction_deg):
         """Log per-frame motion and raise a focus-loss flag when movement spikes."""
         direction_text = f"{direction_deg:+.1f} deg" if direction_deg is not None else "N/A"
         print(f"Frame {self.frame_count}: Movement {distance:.1f}px (dx={dx}, dy={dy}) Direction: {direction_text}")
@@ -175,22 +193,57 @@ class InteractiveBallAnalyzer:
         }
         if distance >= 3.0:
             self.last_nonzero_motion = dict(self.last_motion)
+        angle_diff = None
+        forward_vertical_reversal = False
+        direction_change_detected = False
         if direction_deg is not None and distance > 5:
             if self.near_edge or getattr(self, 'edge_wait', False):
+                self._record_motion_vector(prev_pos, self.ball_center, direction_deg)
                 self.last_direction = direction_deg
                 return False
             if self.last_direction is not None:
+                threshold_deg = max(0.0, float(getattr(self, 'direction_change_min_degrees', 20.0)))
+                prev_dx = float(self.prev_motion.get('dx', 0.0)) if self.prev_motion is not None else 0.0
+                prev_dy = float(self.prev_motion.get('dy', 0.0)) if self.prev_motion is not None else 0.0
                 delta = abs(direction_deg - self.last_direction) % 360
                 angle_diff = min(delta, 360 - delta)
-                if angle_diff >= 110:
+                same_forward_x = abs(prev_dx) <= 3.0 or abs(dx) <= 3.0 or (prev_dx * dx) >= -6.0
+                forward_vertical_reversal = (
+                    prev_dy >= 4.0 and
+                    dy <= -4.0 and
+                    same_forward_x
+                )
+                direction_change_detected = forward_vertical_reversal or angle_diff >= threshold_deg
+                if direction_change_detected:
+                    change_point = prev_pos if prev_pos is not None else self.ball_center
                     if (getattr(self, 'ground_bounce_count', 0) > 0 and
                             (self.frame_count - getattr(self, 'last_ground_bounce_frame', -1000000)) > 2 and
-                            distance > 12):
+                            distance > 12 and
+                            (angle_diff >= 110.0 or (prev_dx * dx) < -12.0)):
                         print(f"Frame {self.frame_count}: Resetting bounce count after new shot direction change")
                         self.ground_bounce_count = 0
                         self.last_ground_bounce_frame = -1000000
-                    self.direction_change_points.append((self.ball_center[0], self.ball_center[1]))
-                    print(f"Frame {self.frame_count}: Direction change detected ({angle_diff:.1f} deg)")
+                    self.direction_change_points.append((change_point[0], change_point[1]))
+                    if getattr(self, '_last_impact_marker_frame', -1000000) != self.frame_count:
+                        self._add_impact_marker(
+                            change_point,
+                            kind="direction_change",
+                            ttl=7,
+                            label="direction change",
+                        )
+                    extra_tag = " vertical-reversal" if forward_vertical_reversal else ""
+                    print(
+                        f"Frame {self.frame_count}: Direction change detected "
+                        f"({angle_diff:.1f} deg, threshold={threshold_deg:.1f}{extra_tag})"
+                    )
+            self._record_motion_vector(
+                prev_pos,
+                self.ball_center,
+                direction_deg,
+                angle_diff=angle_diff,
+                changed=direction_change_detected,
+                vertical_reversal=forward_vertical_reversal,
+            )
             self.last_direction = direction_deg
         self.motion_history.append({
             'frame': self.frame_count,
@@ -224,6 +277,23 @@ class InteractiveBallAnalyzer:
                       f"starting from frame {self.start_frame}")
                 return True
         return False
+
+    def _record_motion_vector(self, prev_pos, curr_pos, direction_deg, angle_diff=None,
+                              changed=False, vertical_reversal=False):
+        if prev_pos is None or curr_pos is None or direction_deg is None:
+            return
+        self.motion_debug_vectors.append({
+            'frame': int(self.frame_count),
+            'from': (int(prev_pos[0]), int(prev_pos[1])),
+            'to': (int(curr_pos[0]), int(curr_pos[1])),
+            'direction_deg': float(direction_deg),
+            'angle_diff': float(angle_diff) if angle_diff is not None else None,
+            'changed': bool(changed),
+            'vertical_reversal': bool(vertical_reversal),
+        })
+        max_vectors = max(4, int(getattr(self, 'motion_debug_vector_limit', 8)))
+        if len(self.motion_debug_vectors) > max_vectors:
+            self.motion_debug_vectors = self.motion_debug_vectors[-max_vectors:]
 
     def serve_direction_label(self):
         horizontal = "right" if self.serve_direction_dx >= 0 else "left"
@@ -1431,6 +1501,259 @@ class InteractiveBallAnalyzer:
             return False, f"top-return weak motion mean={motion_mean:.1f} max={motion_max:.1f} area={area:.1f}"
         return True, None
 
+    def _build_top_return_search_region(self, frame_shape):
+        """Build a thin top-band/lane search region for delayed upper re-entry."""
+        frame_height, frame_width = frame_shape[:2]
+        anchor = getattr(self, '_top_return_anchor', None) or self.ball_center
+        if anchor is None:
+            anchor = (frame_width // 2, 0)
+        anchor_x, anchor_y = anchor
+        mode = getattr(self, '_top_return_mode', 'edge')
+        band_height = max(70, min(140, int(frame_height * 0.06)))
+
+        if mode == "upper_side":
+            y2 = min(
+                frame_height,
+                max(band_height, min(170, max(110, int(anchor_y) + 70))),
+            )
+            x1 = max(0, int(frame_width * 0.16))
+            x2 = min(frame_width, int(frame_width * 0.74))
+            center_x = (x1 + x2) // 2
+        else:
+            y2 = min(
+                frame_height,
+                max(band_height, min(130, max(90, int(anchor_y) + 60))),
+            )
+            half_width = int(max(240, min(560, self.max_ball_speed * 6.0)))
+            x1 = max(0, int(anchor_x) - half_width)
+            x2 = min(frame_width, int(anchor_x) + half_width)
+            center_x = int(max(x1, min(x2 - 1, int(anchor_x)))) if x2 > x1 else frame_width // 2
+
+        if x2 <= x1:
+            x1, x2 = 0, frame_width
+            center_x = frame_width // 2
+
+        y1 = 0
+        if y2 <= y1:
+            y2 = min(frame_height, band_height)
+        center_y = int(max(y1 + 10, min(y2 - 1, y1 + ((y2 - y1) // 2)))) if y2 > y1 else 10
+        return center_x, center_y, x1, y1, x2, y2
+
+    def _active_top_return_overlay_region(self, frame_shape):
+        if getattr(self, '_top_return_anchor', None) is None:
+            return None
+        if not (
+            self._top_return_wait_active() or
+            getattr(self, '_top_return_reentry_grace_frames', 0) > 0
+        ):
+            return None
+        _, _, x1, y1, x2, y2 = self._build_top_return_search_region(frame_shape)
+        return x1, y1, x2, y2
+
+    def _prune_bounce_markers(self):
+        self.recent_bounce_markers = [
+            marker for marker in getattr(self, 'recent_bounce_markers', [])
+            if marker.get('expires', -1) >= self.frame_count
+        ]
+
+    def _impact_marker_color(self, kind):
+        palette = {
+            'ground_bounce': (255, 0, 0),      # blue
+            'serve_bounce': (255, 80, 0),      # blue-orange
+            'racket_contact': (0, 165, 255),   # orange
+            'net_contact': (0, 0, 255),        # red
+            'fence_contact': (255, 0, 255),    # magenta
+            'direction_change': (0, 255, 255), # yellow
+        }
+        return palette.get(kind, (255, 255, 0))
+
+    def _add_impact_marker(self, point, kind="direction_change", ttl=7, color=None, label=None):
+        if point is None:
+            return False
+        self._prune_bounce_markers()
+        pos = (int(point[0]), int(point[1]))
+        last_pos = getattr(self, '_last_impact_marker_pos', None)
+        last_frame = getattr(self, '_last_impact_marker_frame', -1000000)
+        last_kind = getattr(self, '_last_impact_marker_kind', None)
+        if (
+            last_pos is not None and
+            last_kind == kind and
+            (self.frame_count - last_frame) <= 3 and
+            math.hypot(pos[0] - last_pos[0], pos[1] - last_pos[1]) <= 28
+        ):
+            return False
+        if color is None:
+            color = self._impact_marker_color(kind)
+        self.recent_bounce_markers.append({
+            'pos': pos,
+            'color': tuple(int(v) for v in color),
+            'kind': kind,
+            'label': label,
+            'start_frame': self.frame_count,
+            'ttl': max(1, int(ttl)),
+            'expires': self.frame_count + max(1, int(ttl)) - 1,
+        })
+        self._last_impact_marker_frame = self.frame_count
+        self._last_impact_marker_pos = pos
+        self._last_impact_marker_kind = kind
+        return True
+
+    def _add_bounce_marker(self, point, color, ttl=7):
+        self._add_impact_marker(point, kind="ground_bounce", ttl=ttl, color=color)
+
+    def _is_fence_contact_candidate(self, prev_pos, new_pos, frame_shape, dx, dy, angle_jump, speed_ratio):
+        if prev_pos is None or self.last_motion is None:
+            return False
+        frame_height, frame_width = frame_shape[:2]
+        prev_dx = float(self.last_motion.get('dx', 0.0))
+        prev_dy = float(self.last_motion.get('dy', 0.0))
+        px, py = prev_pos
+        nx, ny = new_pos
+        side_margin = max(35, int(frame_width * 0.025))
+        top_margin = max(60, int(frame_height * 0.10))
+        bottom_margin = max(45, int(frame_height * 0.06))
+
+        near_left = min(px, nx) <= side_margin
+        near_right = max(px, nx) >= (frame_width - side_margin)
+        near_top = min(py, ny) <= top_margin or py <= max(110, int(frame_height * 0.18))
+        near_bottom = max(py, ny) >= (frame_height - bottom_margin)
+
+        reversed_x = prev_dx * dx < -12 and abs(prev_dx) >= 6 and abs(dx) >= 6
+        reversed_y = prev_dy * dy < -12 and abs(prev_dy) >= 6 and abs(dy) >= 6
+        if (near_left or near_right) and reversed_x and angle_jump >= 45:
+            return True
+        if (near_top or near_bottom) and reversed_y and (angle_jump >= 35 or speed_ratio <= 0.95):
+            return True
+        return False
+
+    def _classify_direction_change_impact(
+        self,
+        new_pos,
+        frame_shape,
+        dx,
+        dy,
+        angle_jump,
+        speed_ratio,
+        serve_contact_grace=False,
+        predicted_turn_candidate=False,
+        predicted_continuation_candidate=False,
+        lower_contact_launch_candidate=False,
+        lower_contact_launch_context=None,
+        ground_bounce_candidate=False,
+        ground_bounce_context=None,
+    ):
+        prev_pos = self.ball_center
+        if ground_bounce_candidate and ground_bounce_context is not None:
+            return {
+                'kind': 'ground_bounce',
+                'point': ground_bounce_context['origin'],
+                'label': 'ground bounce',
+            }
+        if serve_contact_grace and self.last_motion is not None:
+            prev_dy = float(self.last_motion.get('dy', 0.0))
+            serve_launch_turn = (
+                prev_dy >= 12.0 and
+                dy <= -12.0 and
+                angle_jump >= 70.0
+            )
+            serve_launch_spike = angle_jump >= 110.0 or speed_ratio >= 1.8
+            if serve_launch_turn or serve_launch_spike:
+                return {
+                    'kind': 'racket_contact',
+                    'point': prev_pos or new_pos,
+                    'label': 'serve/racket contact',
+                }
+        if lower_contact_launch_candidate and lower_contact_launch_context is not None:
+            return {
+                'kind': 'racket_contact',
+                'point': lower_contact_launch_context['origin'],
+                'label': 'racket contact',
+            }
+
+        probe_points = [p for p in (prev_pos, new_pos) if p is not None]
+        for probe in probe_points:
+            net_geometry = self._net_contact_geometry(probe)
+            if net_geometry is None:
+                continue
+            direct_contact_zone = net_geometry['inside'] or net_geometry['near_top_tape']
+            if direct_contact_zone and (angle_jump >= 45 or speed_ratio <= 0.90):
+                return {
+                    'kind': 'net_contact',
+                    'point': probe,
+                    'label': 'net contact',
+                }
+
+        if self._is_fence_contact_candidate(prev_pos, new_pos, frame_shape, dx, dy, angle_jump, speed_ratio):
+            return {
+                'kind': 'fence_contact',
+                'point': prev_pos or new_pos,
+                'label': 'fence contact',
+            }
+
+        if predicted_turn_candidate or predicted_continuation_candidate:
+            return None
+        if angle_jump >= 75 or speed_ratio > 1.8 or speed_ratio < 0.55:
+            return {
+                'kind': 'direction_change',
+                'point': prev_pos or new_pos,
+                'label': 'direction change',
+            }
+        return None
+
+    def _start_point_context(self, origin_pos):
+        self._pending_rally_end_reason = None
+        self._pending_rally_end_frame = -1
+        self._awaiting_serve_bounce = False
+        self._point_serve_start_side = None
+        self._point_target_service_side = None
+        if origin_pos is None or not hasattr(self, 'serve_area_x_min'):
+            return
+        serve_mid_x = (self.serve_area_x_min + self.serve_area_x_max) / 2.0
+        start_side = "left" if origin_pos[0] < serve_mid_x else "right"
+        target_side = "right" if start_side == "left" else "left"
+        self._point_serve_start_side = start_side
+        self._point_target_service_side = target_side
+        self._awaiting_serve_bounce = True
+
+    def _classify_ground_bounce(self, point, frame):
+        outside_singles, side, _, _ = self._point_outside_singles_sidelines(point, frame)
+        if outside_singles:
+            return False, f"Ball bounce outside singles court ({side} sideline)", (255, 0, 0)
+
+        if getattr(self, '_awaiting_serve_bounce', False):
+            serve_bounce_window_active = (
+                self.point_start_frame_internal is not None and
+                (self.frame_count - self.point_start_frame_internal) <= 45
+            )
+            if not serve_bounce_window_active:
+                self._awaiting_serve_bounce = False
+                return True, "Bounce in singles court", (255, 0, 0)
+            target_side = getattr(self, '_point_target_service_side', None)
+            service_box_ok, service_box_reason = self._point_in_target_service_box(point, frame, target_side)
+            if service_box_ok is False:
+                return False, service_box_reason, (255, 0, 0)
+            return True, "Serve bounce in", (255, 0, 0)
+
+        return True, "Bounce in singles court", (255, 0, 0)
+
+    def _handle_ground_bounce_event(self, point, frame):
+        in_bounds, reason, color = self._classify_ground_bounce(point, frame)
+        serve_bounce_active = getattr(self, '_awaiting_serve_bounce', False)
+        bounce_kind = "serve_bounce" if getattr(self, '_awaiting_serve_bounce', False) else "ground_bounce"
+        self._add_impact_marker(point, kind=bounce_kind, color=color, label=reason)
+        if getattr(self, '_awaiting_serve_bounce', False):
+            self._awaiting_serve_bounce = False
+        if in_bounds:
+            if not serve_bounce_active and getattr(self, 'ground_bounce_count', 0) >= 2:
+                self._pending_rally_end_reason = "Ball bounced twice on court"
+                self._pending_rally_end_frame = self.frame_count
+                print(f"Frame {self.frame_count}: [DOUBLE BOUNCE] point will end at {point}")
+            print(f"Frame {self.frame_count}: [BOUNCE IN] {reason} at {point}")
+            return
+        self._pending_rally_end_reason = reason
+        self._pending_rally_end_frame = self.frame_count
+        print(f"Frame {self.frame_count}: [BOUNCE OUT] {reason} at {point}")
+
     def _should_start_back_return_wait(self, frame_shape):
         """Return True for large lower-right exits that can re-enter from the right side later."""
         if self.ball_center is None or self.last_motion is None:
@@ -2499,6 +2822,7 @@ class InteractiveBallAnalyzer:
                         self.pre_focus_hsv_behind_net['upper'][0] = min(self.pre_focus_hsv_behind_net['upper'][0], 73)
                         self.net_area_y_min = config.get("net_area_y_min", 250)
                         self.net_area_y_max = config.get("net_area_y_max", 350)
+                        self.net_area_points = config.get("net_area_points", [])
                         
                         # Load high/low net boundaries if available
                         if "high_net_y_min" in config:
@@ -2553,7 +2877,11 @@ class InteractiveBallAnalyzer:
                     self.serve_contact_min_dx = int(config.get('serve_contact_min_dx', 80))
                     self.serve_contact_min_dy = int(config.get('serve_contact_min_dy', 0))
                     self.serve_width_ratio = config.get('serve_width_ratio')
+                    self.direction_change_min_degrees = float(
+                        config.get('direction_change_min_degrees', self.direction_change_min_degrees)
+                    )
                     print(f"  Serve direction: {self.serve_direction_label()}")
+                    print(f"  Direction-change threshold: {self.direction_change_min_degrees:.1f} deg")
                     # Per-court ball size range for serve detection (defaults suit far-end small ball)
                     self.serve_ball_size_min = config.get('serve_ball_size_min', 3)
                     self.serve_ball_size_max = config.get('serve_ball_size_max', 80)
@@ -2849,6 +3177,7 @@ class InteractiveBallAnalyzer:
         cv2.destroyWindow(window_name)
         
         if len(points) == 6:
+            self.net_area_points = [list(map(int, pt)) for pt in points]
             # Points order: 0,1,2 = high net (left, middle, right)
             #               3,4,5 = low net (right, middle, left)
             high_net_y_coords = [points[0][1], points[1][1], points[2][1]]
@@ -2883,6 +3212,8 @@ class InteractiveBallAnalyzer:
             # Save overall net area
             config["net_area_y_min"] = int(self.net_area_y_min)
             config["net_area_y_max"] = int(self.net_area_y_max)
+            if getattr(self, "net_area_points", None):
+                config["net_area_points"] = self.net_area_points
             
             # Save detailed high/low net boundaries if available
             if hasattr(self, 'high_net_y_min'):
@@ -2895,9 +3226,343 @@ class InteractiveBallAnalyzer:
             with open(self.config_file, "w") as f:
                 json.dump(config, f, indent=4)
             
-            print(f"Net area boundaries saved to hsv_config.json")
+            print(f"Net area boundaries saved to {self.config_file}")
         except Exception as e:
             print(f"Error saving net area: {e}")
+
+    def _draw_net_area_overlay(self, result, scale=1.0):
+        """Draw the currently configured net area on the display frame.
+
+        If the exact 6-point net polygon is available, draw that. Otherwise,
+        fall back to the stored high/low Y bands so we can still see what the
+        tracker currently considers the net region.
+        """
+        if scale <= 0:
+            scale = 1.0
+
+        display_height, display_width = result.shape[:2]
+        orig_width = int(round(display_width / scale))
+
+        left_x = int(getattr(self, 'serve_area_x_min', 0))
+        right_x = int(getattr(self, 'serve_area_x_max', orig_width))
+        left_x = max(0, min(orig_width - 1, left_x)) if orig_width > 0 else 0
+        right_x = max(left_x + 1, min(orig_width, right_x)) if orig_width > 0 else display_width
+
+        net_points = getattr(self, 'net_area_points', None) or []
+        if len(net_points) >= 6:
+            pts = np.array([
+                net_points[0],
+                net_points[1],
+                net_points[2],
+                net_points[3],
+                net_points[4],
+                net_points[5],
+            ], dtype=np.int32)
+            pts_scaled = np.array(
+                [[int(round(px * scale)), int(round(py * scale))] for px, py in pts],
+                dtype=np.int32
+            )
+            overlay = result.copy()
+            cv2.fillPoly(overlay, [pts_scaled], (0, 220, 255))
+            result[:] = cv2.addWeighted(result, 0.82, overlay, 0.18, 0)
+            cv2.polylines(result, [pts_scaled], True, (0, 220, 255), 2)
+
+            cv2.polylines(result, [pts_scaled[:3]], False, (0, 255, 0), 2)
+            cv2.polylines(result, [pts_scaled[3:]], False, (255, 180, 0), 2)
+
+            label_x = int(min(pt[0] for pt in pts_scaled)) + 6
+            label_y = int(min(pt[1] for pt in pts_scaled)) + 22
+            cv2.putText(result, "NET AREA", (label_x, label_y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 220, 255), 2)
+            return
+
+        if hasattr(self, 'high_net_y_min') and hasattr(self, 'high_net_y_max'):
+            hx1 = int(round(left_x * scale))
+            hx2 = int(round(right_x * scale))
+            hy1 = int(round(self.high_net_y_min * scale))
+            hy2 = int(round(self.high_net_y_max * scale))
+            if hy2 > hy1:
+                overlay = result.copy()
+                cv2.rectangle(overlay, (hx1, hy1), (hx2, hy2), (0, 255, 0), -1)
+                result[:] = cv2.addWeighted(result, 0.90, overlay, 0.10, 0)
+                cv2.rectangle(result, (hx1, hy1), (hx2, hy2), (0, 255, 0), 2)
+                cv2.putText(result, "HIGH NET BAND", (hx1 + 6, hy1 + 20),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
+
+        if hasattr(self, 'low_net_y_min') and hasattr(self, 'low_net_y_max'):
+            lx1 = int(round(left_x * scale))
+            lx2 = int(round(right_x * scale))
+            ly1 = int(round(self.low_net_y_min * scale))
+            ly2 = int(round(self.low_net_y_max * scale))
+            if ly2 > ly1:
+                overlay = result.copy()
+                cv2.rectangle(overlay, (lx1, ly1), (lx2, ly2), (255, 180, 0), -1)
+                result[:] = cv2.addWeighted(result, 0.90, overlay, 0.10, 0)
+                cv2.rectangle(result, (lx1, ly1), (lx2, ly2), (255, 180, 0), 2)
+                cv2.putText(result, "LOW NET BAND", (lx1 + 6, ly2 - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 180, 0), 2)
+
+        if hasattr(self, 'net_area_y_min') and hasattr(self, 'net_area_y_max'):
+            nx1 = int(round(left_x * scale))
+            nx2 = int(round(right_x * scale))
+            ny1 = int(round(self.net_area_y_min * scale))
+            ny2 = int(round(self.net_area_y_max * scale))
+            if ny2 > ny1:
+                cv2.rectangle(result, (nx1, ny1), (nx2, ny2), (0, 220, 255), 1)
+                cv2.putText(result, "NET AREA", (nx1 + 6, ny1 + 44),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 220, 255), 2)
+
+    def _build_white_line_mask_hsv(self, frame):
+        """Detect painted white court features using an HSV white filter."""
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        lower = np.array([0, 0, 170], dtype=np.uint8)
+        upper = np.array([179, 70, 255], dtype=np.uint8)
+        mask = cv2.inRange(hsv, lower, upper)
+
+        height, width = mask.shape[:2]
+        # Ignore the timestamp / camera overlay zone in the upper-left.
+        mask[:int(height * 0.12), :int(width * 0.40)] = 0
+
+        kernel_small = np.ones((2, 2), np.uint8)
+        kernel_close = np.ones((3, 3), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel_small)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_close)
+        return mask
+
+    def _build_white_line_visual_model(self, frame):
+        """Build a display-only model of white court lines from HSV white filtering."""
+        frame_shape = frame.shape[:2]
+        if (self._white_line_visual_model is not None and
+                self._white_line_visual_frame_shape == frame_shape):
+            return self._white_line_visual_model
+
+        height, width = frame_shape
+        mask = self._build_white_line_mask_hsv(frame)
+        min_line_length = max(120, int(width * 0.06))
+        lines = cv2.HoughLinesP(
+            mask,
+            1,
+            np.pi / 180,
+            threshold=100,
+            minLineLength=min_line_length,
+            maxLineGap=24,
+        )
+        if lines is None:
+            self._white_line_visual_model = None
+            self._white_line_visual_frame_shape = frame_shape
+            return None
+
+        segments = []
+        horizontal_segments = []
+        left_candidates = []
+        right_candidates = []
+        y_ref = int(height * 0.74)
+
+        for raw in lines[:, 0, :]:
+            x1, y1, x2, y2 = [float(v) for v in raw]
+            dx = x2 - x1
+            dy = y2 - y1
+            length = math.hypot(dx, dy)
+            if length < min_line_length:
+                continue
+
+            angle = math.degrees(math.atan2(dy, dx))
+            seg = {
+                'p1': (x1, y1),
+                'p2': (x2, y2),
+                'length': length,
+                'angle': angle,
+                'x_mid': (x1 + x2) / 2.0,
+                'y_mid': (y1 + y2) / 2.0,
+            }
+            segments.append(seg)
+
+            if abs(angle) <= 18.0:
+                horizontal_segments.append(seg)
+
+            if abs(dy) >= 20.0:
+                a = dx / dy
+                b = x1 - a * y1
+                x_ref = a * y_ref + b
+                if -75.0 < angle < -42.0:
+                    entry = dict(seg)
+                    entry.update({'a': a, 'b': b, 'x_ref': x_ref})
+                    if width * 0.14 <= x_ref <= width * 0.32:
+                        left_candidates.append(entry)
+                elif 42.0 < angle < 75.0:
+                    entry = dict(seg)
+                    entry.update({'a': a, 'b': b, 'x_ref': x_ref})
+                    if width * 0.68 <= x_ref <= width * 0.83:
+                        right_candidates.append(entry)
+
+        if not segments:
+            self._white_line_visual_model = None
+            self._white_line_visual_frame_shape = frame_shape
+            return None
+
+        segments = sorted(segments, key=lambda seg: seg['length'], reverse=True)[:80]
+        left_sideline = max(left_candidates, key=lambda seg: seg['length']) if left_candidates else None
+        right_sideline = max(right_candidates, key=lambda seg: seg['length']) if right_candidates else None
+
+        net_y = None
+        if hasattr(self, 'high_net_y_min') and hasattr(self, 'high_net_y_max'):
+            net_y = float((self.high_net_y_min + self.high_net_y_max) / 2.0)
+        elif hasattr(self, 'net_area_y_min') and hasattr(self, 'net_area_y_max'):
+            net_y = float((self.net_area_y_min + self.net_area_y_max) / 2.0)
+
+        high_net_line = None
+        if horizontal_segments and hasattr(self, 'high_net_y_min') and hasattr(self, 'high_net_y_max'):
+            high_min = float(self.high_net_y_min) - 30.0
+            high_max = float(self.high_net_y_max) + 30.0
+            high_candidates = [
+                seg for seg in horizontal_segments
+                if high_min <= seg['y_mid'] <= high_max
+            ]
+            if high_candidates:
+                high_net_line = max(high_candidates, key=lambda seg: seg['length'])
+
+        service_line = None
+        if horizontal_segments and net_y is not None:
+            long_horiz = [seg for seg in horizontal_segments if seg['length'] >= max(250.0, width * 0.08)]
+            if self.serve_direction_dy < 0:
+                above_net = [
+                    seg for seg in long_horiz
+                    if height * 0.06 <= seg['y_mid'] <= (net_y - 40.0)
+                ]
+                if above_net:
+                    service_line = max(above_net, key=lambda seg: (seg['y_mid'], seg['length']))
+            elif self.serve_direction_dy > 0:
+                below_net = [
+                    seg for seg in long_horiz
+                    if (net_y + 40.0) <= seg['y_mid'] <= height * 0.94
+                ]
+                if below_net:
+                    service_line = min(below_net, key=lambda seg: (seg['y_mid'], -seg['length']))
+
+        service_area_polygon = None
+        if left_sideline is not None and right_sideline is not None and service_line is not None and net_y is not None:
+            service_y = float(service_line['y_mid'])
+            left_service_x = left_sideline['a'] * service_y + left_sideline['b']
+            right_service_x = right_sideline['a'] * service_y + right_sideline['b']
+            left_net_x = left_sideline['a'] * net_y + left_sideline['b']
+            right_net_x = right_sideline['a'] * net_y + right_sideline['b']
+            service_area_polygon = [
+                (left_service_x, service_y),
+                (right_service_x, service_y),
+                (right_net_x, net_y),
+                (left_net_x, net_y),
+            ]
+
+        self._white_line_visual_model = {
+            'mask': mask,
+            'segments': segments,
+            'left_sideline': left_sideline,
+            'right_sideline': right_sideline,
+            'service_line': service_line,
+            'high_net_line': high_net_line,
+            'service_area_polygon': service_area_polygon,
+            'white_hsv_lower': (0, 0, 170),
+            'white_hsv_upper': (179, 70, 255),
+        }
+        self._white_line_visual_frame_shape = frame_shape
+        print(
+            f"  DEBUG: White-line HSV model built: segments={len(segments)} "
+            f"sidelines={'yes' if left_sideline and right_sideline else 'no'} "
+            f"service_line={'yes' if service_line else 'no'} "
+            f"high_net={'yes' if high_net_line else 'no'}"
+        )
+        return self._white_line_visual_model
+
+    def _draw_white_line_visual_overlay(self, result, scale=1.0):
+        """Draw white-line HSV detection results for inspection."""
+        model = getattr(self, '_white_line_visual_model', None)
+        if model is None:
+            return
+
+        mask = model.get('mask')
+        if mask is not None:
+            if mask.shape[:2] != result.shape[:2]:
+                mask = cv2.resize(mask, (result.shape[1], result.shape[0]), interpolation=cv2.INTER_NEAREST)
+        if mask is not None and mask.shape[:2] == result.shape[:2]:
+            mask_overlay = result.copy()
+            mask_overlay[mask > 0] = (255, 255, 0)
+            result[:] = cv2.addWeighted(result, 0.84, mask_overlay, 0.16, 0)
+
+        overlay = result.copy()
+        for seg in model.get('segments', []):
+            p1 = (int(round(seg['p1'][0] * scale)), int(round(seg['p1'][1] * scale)))
+            p2 = (int(round(seg['p2'][0] * scale)), int(round(seg['p2'][1] * scale)))
+            cv2.line(overlay, p1, p2, (255, 255, 0), 1)
+        result[:] = cv2.addWeighted(result, 0.88, overlay, 0.12, 0)
+
+        for key, color, label in (
+            ('left_sideline', (255, 0, 255), "LEFT SIDELINE"),
+            ('right_sideline', (255, 0, 255), "RIGHT SIDELINE"),
+            ('service_line', (0, 165, 255), "SERVICE LINE"),
+            ('high_net_line', (0, 255, 255), "HIGH NET LINE"),
+        ):
+            seg = model.get(key)
+            if seg is None:
+                continue
+            p1 = (int(round(seg['p1'][0] * scale)), int(round(seg['p1'][1] * scale)))
+            p2 = (int(round(seg['p2'][0] * scale)), int(round(seg['p2'][1] * scale)))
+            cv2.line(result, p1, p2, color, 3)
+            label_x = int(round(((seg['p1'][0] + seg['p2'][0]) * 0.5) * scale))
+            label_y = int(round(((seg['p1'][1] + seg['p2'][1]) * 0.5) * scale)) - 8
+            cv2.putText(result, label, (label_x, label_y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 2)
+
+        service_poly = model.get('service_area_polygon')
+        if service_poly:
+            pts = np.array(
+                [[int(round(px * scale)), int(round(py * scale))] for px, py in service_poly],
+                dtype=np.int32
+            )
+            poly_overlay = result.copy()
+            cv2.fillPoly(poly_overlay, [pts], (0, 200, 120))
+            result[:] = cv2.addWeighted(result, 0.86, poly_overlay, 0.14, 0)
+            cv2.polylines(result, [pts], True, (0, 200, 120), 2)
+            px_min = min(pt[0] for pt in pts)
+            py_min = min(pt[1] for pt in pts)
+            cv2.putText(result, "WHITE SERVICE AREA", (px_min + 6, py_min + 18),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 200, 120), 2)
+
+        if hasattr(self, 'serve_area_x_min') and hasattr(self, 'serve_area_y_min'):
+            sx1 = int(round(self.serve_area_x_min * scale))
+            sy1 = int(round(self.serve_area_y_min * scale))
+            sx2 = int(round(self.serve_area_x_max * scale))
+            sy2 = int(round(self.serve_area_y_max * scale))
+            cv2.rectangle(result, (sx1, sy1), (sx2, sy2), (0, 128, 255), 2)
+            cv2.putText(result, "CONFIG SERVE AREA", (sx1 + 6, sy1 + 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 128, 255), 2)
+
+        net_points = getattr(self, 'net_area_points', None) or []
+        if len(net_points) >= 6:
+            pts = np.array(
+                [[int(round(px * scale)), int(round(py * scale))] for px, py in net_points[:6]],
+                dtype=np.int32
+            )
+            net_overlay = result.copy()
+            cv2.fillPoly(net_overlay, [pts], (0, 64, 255))
+            result[:] = cv2.addWeighted(result, 0.90, net_overlay, 0.10, 0)
+            cv2.polylines(result, [pts], True, (0, 64, 255), 3)
+            cv2.polylines(result, [pts[:3]], False, (0, 255, 255), 3)
+            cv2.putText(result, "CONFIG NET AREA", (int(min(pt[0] for pt in pts)) + 6, int(min(pt[1] for pt in pts)) + 18),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 64, 255), 2)
+            cv2.putText(result, "CONFIG HIGH NET", (int(min(pt[0] for pt in pts[:3])) + 6, int(min(pt[1] for pt in pts[:3])) + 38),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 2)
+
+        lower = model.get('white_hsv_lower', (0, 0, 170))
+        upper = model.get('white_hsv_upper', (179, 70, 255))
+        cv2.putText(
+            result,
+            f"WHITE HSV LINES H={lower[0]}-{upper[0]} S={lower[1]}-{upper[1]} V={lower[2]}-{upper[2]}",
+            (10, max(210, int(210 * scale))),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (255, 255, 0),
+            2,
+        )
 
     def print_click_hsv_neighborhood(self, frame, point, display_point=None, scale=None):
         """Print the clicked frame position plus a 3x3 HSV neighborhood."""
@@ -3766,6 +4431,7 @@ class InteractiveBallAnalyzer:
         upper_exit_wait = getattr(self, '_upper_exit_wait_frames', 0) > 0
         top_return_wait = self._top_return_wait_active()
         back_return_wait = self._back_return_wait_active()
+        custom_search_region = None
 
         if self.ball_center:
             x_prev, y_prev = self.ball_center
@@ -3786,13 +4452,9 @@ class InteractiveBallAnalyzer:
                 elapsed = max(0, self.frame_count - self._top_return_origin_frame)
                 print(f"\n  DEBUG: [TOP-RETURN WAIT] holding near top edge from ({anchor_x},{anchor_y}), "
                       f"frames_left={self._top_return_wait_frames}")
-                if getattr(self, '_top_return_mode', 'edge') == 'upper_side':
-                    x = frame_width // 2
-                    y = min(90, max(18, anchor_y))
-                    search_radius = max(1800, int(frame_width * 0.55))
-                else:
-                    x, y = anchor_x, min(18, max(10, anchor_y))
-                    search_radius = min(420, max(220, self.max_ball_speed * 3 + elapsed * 2))
+                x, y, x1_custom, y1_custom, x2_custom, y2_custom = self._build_top_return_search_region(frame.shape)
+                custom_search_region = (x1_custom, y1_custom, x2_custom, y2_custom)
+                search_radius = max((x2_custom - x1_custom) // 2, (y2_custom - y1_custom) // 2)
                 self.edge_wait = True
             elif back_return_wait:
                 self._back_return_wait_frames -= 1
@@ -3820,9 +4482,9 @@ class InteractiveBallAnalyzer:
                 anchor_x, anchor_y = self._top_return_anchor
                 print(f"\n  DEBUG: Ball likely exited through upper side from ({anchor_x},{anchor_y})")
                 print(f"  DEBUG: [TOP-RETURN WAIT] activated for delayed upper-side re-entry search")
-                x = frame_width // 2
-                y = min(90, max(18, anchor_y))
-                search_radius = max(1800, int(frame_width * 0.55))
+                x, y, x1_custom, y1_custom, x2_custom, y2_custom = self._build_top_return_search_region(frame.shape)
+                custom_search_region = (x1_custom, y1_custom, x2_custom, y2_custom)
+                search_radius = max((x2_custom - x1_custom) // 2, (y2_custom - y1_custom) // 2)
                 self.edge_wait = True
             # Check if ball went off top edge
             elif y_prev < edge_margin:
@@ -3832,8 +4494,9 @@ class InteractiveBallAnalyzer:
                     elapsed = 0
                     print(f"\n  DEBUG: Ball near TOP edge (y={y_prev}), may have gone off-screen")
                     print(f"  DEBUG: [TOP-RETURN WAIT] activated for delayed re-entry search")
-                    x, y = x_prev, min(18, max(10, y_prev))
-                    search_radius = min(420, max(220, self.max_ball_speed * 3 + elapsed * 2))
+                    x, y, x1_custom, y1_custom, x2_custom, y2_custom = self._build_top_return_search_region(frame.shape)
+                    custom_search_region = (x1_custom, y1_custom, x2_custom, y2_custom)
+                    search_radius = max((x2_custom - x1_custom) // 2, (y2_custom - y1_custom) // 2)
                     self.edge_wait = True
                 else:
                     print(f"\n  DEBUG: Ball near TOP edge (y={y_prev}), may have gone off-screen")
@@ -4001,6 +4664,8 @@ class InteractiveBallAnalyzer:
                 x1, y1, x2, y2 = self._build_serve_direction_region(
                     x, y, frame.shape, search_radius, descending_contact=serve_contact_descending
                 )
+            elif custom_search_region is not None:
+                x1, y1, x2, y2 = custom_search_region
             else:
                 x1 = max(0, x - search_radius)
                 y1 = max(0, y - search_radius)
@@ -5871,7 +6536,25 @@ class InteractiveBallAnalyzer:
 
                 angle_threshold = 90 if near_net else 70
                 speed_ratio = (velocity / lm_dist) if lm_dist else 1.0
-                change_detected = (angle_jump > angle_threshold) or (speed_ratio > 2.0) or (speed_ratio < 0.5)
+                prev_dx = float(self.last_motion.get('dx', 0.0)) if self.last_motion is not None else 0.0
+                prev_dy = float(self.last_motion.get('dy', 0.0)) if self.last_motion is not None else 0.0
+                angle_change_threshold = max(0.0, float(getattr(self, 'direction_change_min_degrees', 20.0)))
+                same_forward_x = abs(prev_dx) <= 3.0 or abs(dx) <= 3.0 or (prev_dx * dx) >= -6.0
+                forward_vertical_reversal = (
+                    prev_dy >= 4.0 and
+                    dy <= -4.0 and
+                    same_forward_x
+                )
+                hold_change_detected = (
+                    (angle_jump > angle_threshold) or
+                    (speed_ratio > 2.0) or
+                    (speed_ratio < 0.5)
+                )
+                change_detected = (
+                    hold_change_detected or
+                    forward_vertical_reversal or
+                    angle_jump >= angle_change_threshold
+                )
                 predicted_turn_candidate = False
                 predicted_continuation_candidate = False
                 small_ball_upper_flight = (
@@ -5939,7 +6622,8 @@ class InteractiveBallAnalyzer:
                             predicted_path_distance <= bounce_soft_cap
                         )
 
-                if (change_detected and not predicted_turn_candidate and not predicted_continuation_candidate
+                impact_event = None
+                if (hold_change_detected and not predicted_turn_candidate and not predicted_continuation_candidate
                         and not lower_contact_launch_candidate and not ground_bounce_candidate):
                     self.direction_change_streak += 1
                     max_hold = 2 if near_net else 3
@@ -5969,12 +6653,18 @@ class InteractiveBallAnalyzer:
                             cx - self._rally_contact_origin[0],
                             cy - self._rally_contact_origin[1],
                         )
+                        impact_event = {
+                            'kind': 'racket_contact',
+                            'point': lower_contact_launch_context['origin'],
+                            'label': 'racket contact',
+                        }
                         print(f"Frame {self.frame_count}: Allowing lower-racket contact launch")
                     elif change_detected and ground_bounce_candidate:
                         if (self.frame_count - getattr(self, 'last_ground_bounce_frame', -1000000)) > 3:
                             self.ground_bounce_count += 1
                             self.last_ground_bounce_frame = self.frame_count
                             print(f"Frame {self.frame_count}: Ground bounce #{self.ground_bounce_count} detected")
+                            self._handle_ground_bounce_event(ground_bounce_context['origin'], frame)
                         self._ground_bounce_grace_frames = max(getattr(self, '_ground_bounce_grace_frames', 0), 3)
                         self._ground_bounce_ref_size = max(8.0, min(max(float(bulb_size), ground_bounce_context['ref_size']), 90.0))
                         self._ground_bounce_origin = ground_bounce_context['origin']
@@ -5984,6 +6674,29 @@ class InteractiveBallAnalyzer:
                             cy - self._ground_bounce_origin[1],
                         )
                         print(f"Frame {self.frame_count}: Allowing ground-bounce continuation")
+                    elif change_detected:
+                        impact_event = self._classify_direction_change_impact(
+                            (cx, cy),
+                            frame.shape,
+                            dx,
+                            dy,
+                            angle_jump,
+                            speed_ratio,
+                            serve_contact_grace=serve_contact_grace,
+                            predicted_turn_candidate=predicted_turn_candidate,
+                            predicted_continuation_candidate=predicted_continuation_candidate,
+                            lower_contact_launch_candidate=lower_contact_launch_candidate,
+                            lower_contact_launch_context=lower_contact_launch_context,
+                            ground_bounce_candidate=ground_bounce_candidate,
+                            ground_bounce_context=ground_bounce_context,
+                        )
+                    if impact_event is not None:
+                        self._add_impact_marker(
+                            impact_event.get('point'),
+                            kind=impact_event.get('kind', 'direction_change'),
+                            ttl=7,
+                            label=impact_event.get('label'),
+                        )
                     self.direction_change_streak = 0
 
             # Update tracking data
@@ -6072,7 +6785,7 @@ class InteractiveBallAnalyzer:
             # Log motion metrics and detect focus loss spikes
             focus_loss_triggered = False
             if not allow_inactive:
-                focus_loss_triggered = self.log_motion_metrics(dx, dy, velocity, direction_deg)
+                focus_loss_triggered = self.log_motion_metrics(prev_pos, dx, dy, velocity, direction_deg)
                 if focus_loss_triggered and (serve_contact_grace or rally_contact_grace):
                     self.focus_loss_active = False
                     self.focus_loss_frame = None
@@ -6421,10 +7134,55 @@ class InteractiveBallAnalyzer:
                     (10, 240), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
         return result
 
-    def draw_analysis_info(self, frame, scale=1.0, show_paused_rejected=False):
+    def _draw_motion_debug_vectors(self, frame, scale=1.0):
+        vectors = getattr(self, 'motion_debug_vectors', [])
+        if not vectors:
+            return frame
+
+        result = frame
+        recent_vectors = vectors[-max(1, int(getattr(self, 'motion_debug_vector_limit', 8))):]
+        total = max(1, len(recent_vectors))
+        for idx, entry in enumerate(recent_vectors):
+            p0 = entry.get('from')
+            p1 = entry.get('to')
+            if p0 is None or p1 is None:
+                continue
+            fade = 0.35 + (0.65 * ((idx + 1) / float(total)))
+            base_color = (0, 255, 255) if entry.get('changed') else (180, 180, 180)
+            color = tuple(int(round(channel * fade)) for channel in base_color)
+            x0 = int(p0[0] * scale)
+            y0 = int(p0[1] * scale)
+            x1 = int(p1[0] * scale)
+            y1 = int(p1[1] * scale)
+            cv2.line(result, (x0, y0), (x1, y1), color, 2)
+
+            direction_deg = entry.get('direction_deg')
+            angle_diff = entry.get('angle_diff')
+            label = f"{direction_deg:+.0f}°" if direction_deg is not None else "N/A"
+            if angle_diff is not None:
+                label += f" / d{angle_diff:.0f}°"
+            if entry.get('vertical_reversal'):
+                label += " V"
+
+            label_x = int(((p0[0] + p1[0]) * 0.5) * scale) + 4
+            label_y = int(((p0[1] + p1[1]) * 0.5) * scale) - 4
+            cv2.putText(
+                result,
+                label,
+                (label_x, label_y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                color,
+                1,
+            )
+        return result
+
+    def draw_analysis_info(self, frame, scale=1.0, show_paused_rejected=False, game_state=None):
         """Draw analysis information on the frame with proper scaling."""
         result = frame.copy()
-        
+        if game_state is None:
+            game_state = getattr(self, 'current_game_state', None)
+
         if self.ball_center:
             # Scale ball coordinates for display
             x = int(self.ball_center[0] * scale)
@@ -6480,17 +7238,47 @@ class InteractiveBallAnalyzer:
                 px = int(point[0] * scale)
                 py = int(point[1] * scale)
                 cv2.circle(result, (px, py), 12, (0, 0, 255), 3)
-        
-        # Draw serve detection area (where toss detection watches) in WAITING_FOR_SERVE
-        if hasattr(self, 'serve_area_x_min') and hasattr(self, 'serve_area_y_min'):
-            sx1 = int(self.serve_area_x_min * scale)
-            sy1 = int(self.serve_area_y_min * scale)
-            sx2 = int(self.serve_area_x_max * scale)
-            sy2 = int(self.serve_area_y_max * scale)
-            # Orange dashed rectangle: draw as two overlapping rects for a dashed look
-            cv2.rectangle(result, (sx1, sy1), (sx2, sy2), (0, 128, 255), 2)
-            cv2.putText(result, "SERVE ZONE", (sx1 + 4, sy1 + 20),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 128, 255), 2)
+
+        self._prune_bounce_markers()
+        for marker in getattr(self, 'recent_bounce_markers', []):
+            point = marker.get('pos')
+            base_color = marker.get('color', (255, 0, 0))
+            if point is None:
+                continue
+            start_frame = int(marker.get('start_frame', self.frame_count))
+            ttl = max(1, int(marker.get('ttl', 7)))
+            age = max(0, self.frame_count - start_frame)
+            if ttl <= 1:
+                fade = 1.0
+            else:
+                fade = max(0.0, 1.0 - (age / float(ttl - 1)))
+            color = tuple(int(round(channel * fade)) for channel in base_color)
+            px = int(point[0] * scale)
+            py = int(point[1] * scale)
+            cv2.circle(result, (px, py), 12, color, 3)
+            cv2.circle(result, (px, py), 4, color, -1)
+
+        result = self._draw_motion_debug_vectors(result, scale=scale)
+
+        top_zone = self._active_top_return_overlay_region((frame.shape[0], frame.shape[1]))
+        if top_zone is not None:
+            tx1, ty1, tx2, ty2 = top_zone
+            cv2.rectangle(
+                result,
+                (int(tx1 * scale), int(ty1 * scale)),
+                (int(tx2 * scale), int(ty2 * scale)),
+                (0, 215, 255),
+                2,
+            )
+            cv2.putText(
+                result,
+                "TOP RETURN ZONE",
+                (int(tx1 * scale) + 4, int(ty1 * scale) + 20),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (0, 215, 255),
+                2,
+            )
 
         # Show motion metrics and focus-loss status
         if self.last_motion is not None:
@@ -6499,14 +7287,23 @@ class InteractiveBallAnalyzer:
             direction_text = f"{direction_deg:+.1f} deg" if direction_deg is not None else "N/A"
             motion_text = f"Ball Move: {distance:.1f}px | Dir: {direction_text}"
             cv2.putText(result, motion_text, (10, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+            cv2.putText(
+                result,
+                f"Dir Change Threshold: {self.direction_change_min_degrees:.0f} deg",
+                (10, 180),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (0, 220, 255),
+                2,
+            )
         if self.focus_loss_active:
-            cv2.putText(result, "FOCUS LOST", (10, 180), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+            cv2.putText(result, "FOCUS LOST", (10, 210), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
         elif self.using_alt6_hsv:
-            cv2.putText(result, "USING ALTERNATIVE 6 HSV", (10, 180), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            cv2.putText(result, "USING ALTERNATIVE 6 HSV", (10, 210), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         elif self.using_alt2_hsv:
-            cv2.putText(result, "USING ALTERNATIVE 2 HSV", (10, 180), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            cv2.putText(result, "USING ALTERNATIVE 2 HSV", (10, 210), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         elif self.using_alt_hsv:
-            cv2.putText(result, "USING ALTERNATIVE HSV", (10, 180), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+            cv2.putText(result, "USING ALTERNATIVE HSV", (10, 210), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
 
         if show_paused_rejected:
             result = self._draw_rejected_contour_debug(result, scale=scale)
@@ -6743,6 +7540,44 @@ class InteractiveBallAnalyzer:
             
         except Exception as e:
             print(f"Error saving serve area config: {e}")
+
+    def _get_net_polygon(self):
+        points = getattr(self, 'net_area_points', None) or []
+        if len(points) < 6:
+            return None
+        return np.array(points[:6], dtype=np.float32)
+
+    def _point_to_segment_distance(self, point, seg_start, seg_end):
+        px, py = float(point[0]), float(point[1])
+        x1, y1 = float(seg_start[0]), float(seg_start[1])
+        x2, y2 = float(seg_end[0]), float(seg_end[1])
+        dx = x2 - x1
+        dy = y2 - y1
+        if abs(dx) < 1e-6 and abs(dy) < 1e-6:
+            return math.hypot(px - x1, py - y1)
+        t = ((px - x1) * dx + (py - y1) * dy) / max(1e-6, dx * dx + dy * dy)
+        t = max(0.0, min(1.0, t))
+        proj_x = x1 + t * dx
+        proj_y = y1 + t * dy
+        return math.hypot(px - proj_x, py - proj_y)
+
+    def _net_contact_geometry(self, point):
+        polygon = self._get_net_polygon()
+        if polygon is None:
+            return None
+        signed_dist = cv2.pointPolygonTest(polygon, (float(point[0]), float(point[1])), True)
+        top_polyline = polygon[:3]
+        top_dist = min(
+            self._point_to_segment_distance(point, top_polyline[0], top_polyline[1]),
+            self._point_to_segment_distance(point, top_polyline[1], top_polyline[2]),
+        )
+        return {
+            'signed_dist': float(signed_dist),
+            'inside': signed_dist >= 0.0,
+            'near_polygon': signed_dist >= -18.0,
+            'near_top_tape': top_dist <= 26.0,
+            'top_dist': float(top_dist),
+        }
     
     def detect_point_end(self, ball_position, frame):
         """Detect if a point has ended based on ball position and behavior."""
@@ -6866,6 +7701,109 @@ class InteractiveBallAnalyzer:
         
         return False, "Point continues"
 
+    def detect_point_end(self, ball_position, frame):
+        """Detect if a point has ended based on ball position and behavior."""
+        height, width = frame.shape[:2]
+        x, y = ball_position
+        recent_ground_bounce = (self.frame_count - getattr(self, 'last_ground_bounce_frame', -1000000)) <= 2
+
+        if self.frame_count <= (self.start_frame + 15):
+            return False, "Early-serve grace"
+        if getattr(self, 'edge_wait', False):
+            return False, "Edge wait"
+        if getattr(self, 'ground_bounce_count', 0) >= 2:
+            return True, "Ball bounced twice on court"
+
+        if x < 0 or x > width or y < 0 or y > height:
+            return True, "Ball out of court bounds"
+
+        suppress_out_bounce = (
+            self._back_return_wait_active() or
+            getattr(self, '_back_return_reentry_grace_frames', 0) > 0
+        )
+        if not suppress_out_bounce:
+            out_bounce_detected, out_bounce_reason = self._detect_out_of_court_bounce(ball_position, frame)
+            if out_bounce_detected:
+                return True, out_bounce_reason
+
+        net_geometry = self._net_contact_geometry(ball_position)
+        if net_geometry is not None and not recent_ground_bounce:
+            net_zone_active = net_geometry['near_polygon'] or net_geometry['near_top_tape']
+            core_net_zone = net_geometry['inside']
+            if net_zone_active:
+                ball_is_fast = self.last_motion and self.last_motion['distance'] > 15
+                if core_net_zone and not ball_is_fast:
+                    if not hasattr(self, 'net_area_frames'):
+                        self.net_area_frames = 0
+                    self.net_area_frames += 1
+                else:
+                    self.net_area_frames = 0
+
+                net_linger_limit = 8 if ball_is_fast else 6
+                if getattr(self, 'net_area_frames', 0) > net_linger_limit:
+                    return True, "Ball hit the net"
+
+                if self.last_motion and self.last_motion['distance'] < 2.5:
+                    prev_was_slow = self.prev_motion and self.prev_motion['distance'] < 10
+                    if prev_was_slow and core_net_zone:
+                        return True, "Ball hit the net"
+
+                if self.prev_motion and self.last_motion:
+                    prev_dir = self.prev_motion.get('direction_deg')
+                    curr_dir = self.last_motion.get('direction_deg')
+                    prev_dist = self.prev_motion.get('distance', 0)
+                    curr_dist = self.last_motion.get('distance', 0)
+                    prev_dx = self.prev_motion.get('dx', 0)
+                    prev_dy = self.prev_motion.get('dy', 0)
+                    curr_dx = self.last_motion.get('dx', 0)
+                    curr_dy = self.last_motion.get('dy', 0)
+                    if prev_dir is not None and curr_dir is not None and prev_dist > 0:
+                        delta = abs(curr_dir - prev_dir) % 360
+                        angle_diff = min(delta, 360 - delta)
+                        speed_ratio = curr_dist / prev_dist if prev_dist else 1.0
+                        reversed_y = (
+                            prev_dy * curr_dy < 0
+                            and abs(prev_dy) >= 3
+                            and abs(curr_dy) >= 3
+                        )
+                        strong_x_reversal = (
+                            prev_dx * curr_dx < 0
+                            and abs(prev_dx) >= 6
+                            and abs(curr_dx) >= 6
+                        )
+                        direction_reversed = reversed_y or strong_x_reversal
+                        slowed_after_impact = curr_dist <= max(8.0, prev_dist * 0.80)
+                        direct_contact_zone = core_net_zone or net_geometry['near_top_tape']
+                        if direct_contact_zone and direction_reversed and slowed_after_impact:
+                            return True, "Ball hit the net"
+                        if direct_contact_zone and angle_diff >= 60 and slowed_after_impact:
+                            return True, "Ball hit the net"
+                        if direct_contact_zone and angle_diff >= 90 and speed_ratio < 0.6 and prev_dist < 30:
+                            return True, "Ball hit the net"
+            else:
+                if hasattr(self, 'net_area_frames'):
+                    self.net_area_frames = 0
+        elif hasattr(self, 'net_area_frames'):
+            self.net_area_frames = 0
+
+        if hasattr(self, 'ball_velocity_history') and len(self.ball_velocity_history) > 10:
+            recent_velocities = self.ball_velocity_history[-10:]
+            avg_velocity = sum(recent_velocities) / len(recent_velocities)
+            print(f"[BALL_STOPPED_CHECK] f{self.frame_count}: avg_vel={avg_velocity:.1f} hist={[round(v,1) for v in recent_velocities]}")
+            if avg_velocity < 5:
+                print(f"[BALL_STOPPED] f{self.frame_count}: avg_vel={avg_velocity:.1f} < 5 -> POINT ENDS")
+                return True, "Ball stopped (possible double bounce)"
+
+        edge_margin = 50
+        if (x < edge_margin or x > width - edge_margin or
+            y < edge_margin or y > height - edge_margin):
+            if getattr(self, 'edge_wait', False) or getattr(self, 'near_edge', False):
+                return False, "Edge return grace"
+            self.edge_wait = True
+            return False, "Edge return grace"
+
+        return False, "Point continues"
+
     def _build_singles_sideline_model(self, frame):
         frame_shape = frame.shape[:2]
         if (self._singles_sideline_model is not None and
@@ -6970,6 +7908,121 @@ class InteractiveBallAnalyzer:
         if x > right_x + margin:
             return True, 'right', left_x, right_x
         return False, None, left_x, right_x
+
+    def _build_service_box_model(self, frame):
+        frame_shape = frame.shape[:2]
+        if (self._service_box_model is not None and
+                self._service_box_frame_shape == frame_shape):
+            return self._service_box_model
+
+        if not hasattr(self, 'net_area_y_min') or not hasattr(self, 'net_area_y_max'):
+            self._service_box_model = None
+            self._service_box_frame_shape = frame_shape
+            return None
+
+        height, width = frame_shape
+        net_y = float((self.net_area_y_min + self.net_area_y_max) / 2.0)
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        _, white_mask = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY)
+        min_line_length = max(220, int(width * 0.10))
+        lines = cv2.HoughLinesP(
+            white_mask,
+            1,
+            np.pi / 180,
+            threshold=120,
+            minLineLength=min_line_length,
+            maxLineGap=24,
+        )
+        if lines is None:
+            self._service_box_model = None
+            self._service_box_frame_shape = frame_shape
+            return None
+
+        horizontal_candidates = []
+        for raw in lines[:, 0, :]:
+            x1, y1, x2, y2 = [float(v) for v in raw]
+            dx = x2 - x1
+            dy = y2 - y1
+            if abs(dx) < min_line_length or abs(dy) > 18.0:
+                continue
+            y_mid = (y1 + y2) / 2.0
+            if self.serve_direction_dy < 0:
+                if not (height * 0.06 <= y_mid <= net_y - 40.0):
+                    continue
+            elif self.serve_direction_dy > 0:
+                if not (net_y + 40.0 <= y_mid <= height * 0.94):
+                    continue
+            else:
+                continue
+            a = dy / dx if abs(dx) > 1e-6 else 0.0
+            b = y1 - a * x1
+            horizontal_candidates.append({
+                'a': a,
+                'b': b,
+                'length': math.hypot(dx, dy),
+                'y_mid': y_mid,
+            })
+
+        if not horizontal_candidates:
+            self._service_box_model = None
+            self._service_box_frame_shape = frame_shape
+            return None
+
+        top_long = sorted(horizontal_candidates, key=lambda entry: entry['length'], reverse=True)[:12]
+        if self.serve_direction_dy < 0:
+            service_line = max(top_long, key=lambda entry: entry['y_mid'])
+        else:
+            service_line = min(top_long, key=lambda entry: entry['y_mid'])
+
+        self._service_box_model = {
+            'net_y': net_y,
+            'service_line': service_line,
+            'service_margin': max(28.0, width * 0.0100),
+            'net_margin': max(24.0, width * 0.0080),
+        }
+        self._service_box_frame_shape = frame_shape
+        print(
+            f"  DEBUG: Service box model built: net_y={net_y:.1f} "
+            f"service_y_mid={service_line['y_mid']:.1f}"
+        )
+        return self._service_box_model
+
+    def _point_in_target_service_box(self, point, frame, target_side):
+        if target_side not in ("left", "right"):
+            return None, None
+
+        outside, side, left_x, right_x = self._point_outside_singles_sidelines(point, frame)
+        if outside:
+            return False, f"Serve bounce outside singles court ({side} sideline)"
+        if left_x is None or right_x is None:
+            return None, None
+
+        model = self._build_service_box_model(frame)
+        if model is None:
+            return None, None
+
+        x, y = point
+        center_x = (left_x + right_x) / 2.0
+        service_y = model['service_line']['a'] * x + model['service_line']['b']
+        service_margin = model['service_margin']
+        net_margin = model['net_margin']
+        net_y = model['net_y']
+
+        if self.serve_direction_dy < 0:
+            in_vertical = (service_y - service_margin) <= y <= (net_y + net_margin)
+        elif self.serve_direction_dy > 0:
+            in_vertical = (net_y - net_margin) <= y <= (service_y + service_margin)
+        else:
+            return None, None
+
+        if target_side == "left":
+            in_half = x <= center_x
+        else:
+            in_half = x >= center_x
+
+        if in_vertical and in_half:
+            return True, None
+        return False, f"Serve bounce outside {target_side} service box"
 
     def _detect_out_of_court_bounce(self, ball_position, frame):
         if self.prev_motion is None or self.last_motion is None:
@@ -7232,6 +8285,11 @@ class InteractiveBallAnalyzer:
             self.waiting_serve_candidate = None
             self.waiting_serve_candidate_frame = -1
             self._last_detected_serve_candidate = None
+            self._pending_rally_end_reason = None
+            self._pending_rally_end_frame = -1
+            self._awaiting_serve_bounce = False
+            self._point_serve_start_side = None
+            self._point_target_service_side = None
             if hasattr(self, 'net_area_frames'):
                 self.net_area_frames = 0
 
@@ -7366,6 +8424,7 @@ class InteractiveBallAnalyzer:
         
         _consecutive_read_failures = 0
         while True:
+            self.current_game_state = game_state
             ret, frame = self.cap.read()
             if not ret:
                 # H.265/HEVC videos sometimes have corrupt slices mid-file.
@@ -7411,6 +8470,7 @@ class InteractiveBallAnalyzer:
                         self.point_start_frame_internal = self.frame_count
                         self.tracking = True
                         self.ball_center = last_serve_candidate
+                        self._start_point_context(last_serve_candidate)
                         self.waiting_serve_candidate = None
                         self.waiting_serve_candidate_frame = -1
                         log_tracking_start_position()
@@ -7481,6 +8541,7 @@ class InteractiveBallAnalyzer:
                             self.ball_size = None
                             point_start_frame = self.frame_count
                             self.point_start_frame_internal = self.frame_count
+                            self._start_point_context(potential_serve)
                             scan_position_history = []
                             game_state = "TRACKING_POINT"
                             log_tracking_start_position()
@@ -7540,6 +8601,17 @@ class InteractiveBallAnalyzer:
                     vel_hist_tail = [round(v, 1) for v in getattr(self, 'ball_velocity_history', [])[-5:]]
                     print(f"Frame {self.frame_count}: Ball tracked at {tracked_position} - Size: {size_text}")
                     print(f"[TRACK] f{self.frame_count}: pos={tracked_position} vel={vel:.1f}px stuck={self.stuck_frame_count} vel_hist={vel_hist_tail}")
+
+                    pending_reason = getattr(self, '_pending_rally_end_reason', None)
+                    if pending_reason:
+                        point_end_frame = self.frame_count
+                        dur = point_end_frame - point_start_frame if point_start_frame else 0
+                        print(f"Frame {self.frame_count}: POINT ENDED - {pending_reason}")
+                        print(f"Point duration: {dur} frames")
+                        print(f"[POINT_END] f{self.frame_count}: reason={pending_reason} duration={dur}f pos={tracked_position} vel={vel:.1f}px vel_hist={vel_hist_tail}")
+                        game_state = "WAITING_FOR_SERVE"
+                        reset_tracking_state()
+                        continue
 
                     # Stuck-ball timeout: if ball hasn't moved for 15+ frames, end point
                     if self.stuck_frame_count >= 15 and not self._top_return_wait_active():
@@ -7756,6 +8828,7 @@ class InteractiveBallAnalyzer:
                             self.stuck_frame_count = 0
                             point_start_frame = self.frame_count
                             self.point_start_frame_internal = self.frame_count
+                            self._start_point_context(tracking_start)
                             self.waiting_serve_candidate = None
                             self.waiting_serve_candidate_frame = -1
                             game_state = "TRACKING_POINT"
@@ -7806,6 +8879,7 @@ class InteractiveBallAnalyzer:
                             self.stuck_frame_count = 0
                             point_start_frame = self.frame_count
                             self.point_start_frame_internal = self.frame_count
+                            self._start_point_context(potential_serve)
                             self.waiting_serve_candidate = None
                             self.waiting_serve_candidate_frame = -1
                             game_state = "TRACKING_POINT"
@@ -7858,6 +8932,7 @@ class InteractiveBallAnalyzer:
                             self.stuck_frame_count = 0
                             point_start_frame = self.frame_count
                             self.point_start_frame_internal = self.frame_count
+                            self._start_point_context(last_serve_candidate)
                             self.waiting_serve_candidate = None
                             self.waiting_serve_candidate_frame = -1
                             game_state = "TRACKING_POINT"
@@ -7898,6 +8973,7 @@ class InteractiveBallAnalyzer:
                             self.stuck_frame_count = 0
                             point_start_frame = self.frame_count
                             self.point_start_frame_internal = self.frame_count
+                            self._start_point_context(last_serve_candidate)
                             self.waiting_serve_candidate = None
                             self.waiting_serve_candidate_frame = -1
                             game_state = "TRACKING_POINT"
@@ -7920,6 +8996,7 @@ class InteractiveBallAnalyzer:
                     resized_frame,
                     scale=scale_factor,
                     show_paused_rejected=((not play_mode) or self.pause_requested),
+                    game_state=game_state,
                 )
 
                 # Show frame info

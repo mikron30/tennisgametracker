@@ -87,12 +87,12 @@
         "v_min": 80,
         "v_max": 255
     },
-    "net_area_y_min": 700,
-    "net_area_y_max": 950,
-    "high_net_y_min": 700,
-    "high_net_y_max": 850,
-    "low_net_y_min": 800,
-    "low_net_y_max": 950,
+    "net_area_y_min": 400,
+    "net_area_y_max": 585,
+    "high_net_y_min": 400,
+    "high_net_y_max": 468,
+    "low_net_y_min": 518,
+    "low_net_y_max": 585,
     "serve_area_points": [
         [
             760,
@@ -116,6 +116,7 @@
     "serve_area_y_min": 650,
     "serve_area_y_max": 1100,
     "serve_width_ratio": 0.8,
+    "direction_change_min_degrees": 30,
     "serve_player_position": "auto",
     "serve_direction_dx": -1,
     "serve_direction_dy": -1,
@@ -156,5 +157,31 @@
         "s_max": 30,
         "v_min": 130,
         "v_max": 250
-    }
+    },
+    "net_area_points": [
+        [
+            1164,
+            400
+        ],
+        [
+            1934,
+            420
+        ],
+        [
+            2709,
+            468
+        ],
+        [
+            1168,
+            518
+        ],
+        [
+            1936,
+            530
+        ],
+        [
+            2697,
+            585
+        ]
+    ]
 }
