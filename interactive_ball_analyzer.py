@@ -89,7 +89,8 @@ class InteractiveBallAnalyzer:
         # Set DISABLE_BEHIND_NET=0 to temporarily re-enable it if needed.
         self.disable_behind_net_mode = os.environ.get("DISABLE_BEHIND_NET", "1") == "1"
         self.direction_change_points = []
-        self.show_event_markers = False
+        self.direction_change_events = []
+        self.show_event_markers = True
         self.last_direction = None
         self.near_edge = False
         self.net_contact_points = []
@@ -175,6 +176,10 @@ class InteractiveBallAnalyzer:
         self._awaiting_serve_bounce = False
         self._point_serve_start_side = None
         self._point_target_service_side = None
+        self._last_direction_change_frame = -1000000
+        self._last_direction_change_point = None
+        self._last_direction_change_angle = 0.0
+        self._last_direction_change_vertical_reversal = False
         self.direction_change_min_degrees = 20.0
         self.motion_debug_vectors = []
         self.motion_debug_vector_limit = 8
@@ -224,6 +229,20 @@ class InteractiveBallAnalyzer:
                         self.ground_bounce_count = 0
                         self.last_ground_bounce_frame = -1000000
                     self.direction_change_points.append((change_point[0], change_point[1]))
+                    self._record_direction_change_event(
+                        change_point,
+                        prev_dx,
+                        prev_dy,
+                        dx,
+                        dy,
+                        float(self.prev_motion.get('distance', 0.0)) if self.prev_motion is not None else 0.0,
+                        distance,
+                        angle_diff,
+                    )
+                    self._last_direction_change_frame = self.frame_count
+                    self._last_direction_change_point = (int(change_point[0]), int(change_point[1]))
+                    self._last_direction_change_angle = float(angle_diff)
+                    self._last_direction_change_vertical_reversal = bool(forward_vertical_reversal)
                     if getattr(self, '_last_impact_marker_frame', -1000000) != self.frame_count:
                         self._add_impact_marker(
                             change_point,
@@ -294,6 +313,51 @@ class InteractiveBallAnalyzer:
         max_vectors = max(4, int(getattr(self, 'motion_debug_vector_limit', 8)))
         if len(self.motion_debug_vectors) > max_vectors:
             self.motion_debug_vectors = self.motion_debug_vectors[-max_vectors:]
+
+    def _classify_direction_change_review(self, point, prev_dx, prev_dy, dx, dy, prev_distance, distance):
+        serve_like = (
+            getattr(self, '_serve_contact_grace_frames', 0) > 0 or
+            self._serve_direction_search_active()
+        )
+        ground_like = prev_dy >= 4.0 and dy <= -4.0
+        racket_like = (prev_dx * dx) < -12.0 and max(abs(prev_dx), abs(dx)) >= 6.0
+        net_like = False
+        if point is not None:
+            net_geometry = self._net_contact_geometry(point)
+            if net_geometry is not None:
+                net_like = (
+                    net_geometry['inside'] or
+                    net_geometry['near_top_tape'] or
+                    (net_geometry['near_polygon'] and (dy >= 4.0 or prev_dy <= -4.0))
+                )
+        slow_suspect = min(prev_distance, distance) < 12.0
+
+        if serve_like:
+            return "good", "serve"
+        if ground_like:
+            return "good", "ground"
+        if racket_like:
+            return "good", "racket"
+        if net_like:
+            return "good", "net"
+        if slow_suspect:
+            return "problematic", "slow"
+        return "problematic", "other"
+
+    def _record_direction_change_event(self, point, prev_dx, prev_dy, dx, dy, prev_distance, distance, angle_diff):
+        if point is None:
+            return
+        status, reason = self._classify_direction_change_review(
+            point,
+            prev_dx, prev_dy, dx, dy, prev_distance, distance
+        )
+        self.direction_change_events.append({
+            'frame': int(self.frame_count),
+            'pos': (int(point[0]), int(point[1])),
+            'status': status,
+            'reason': reason,
+            'angle_diff': float(angle_diff) if angle_diff is not None else None,
+        })
 
     def serve_direction_label(self):
         horizontal = "right" if self.serve_direction_dx >= 0 else "left"
@@ -1718,7 +1782,7 @@ class InteractiveBallAnalyzer:
     def _classify_ground_bounce(self, point, frame):
         outside_singles, side, _, _ = self._point_outside_singles_sidelines(point, frame)
         if outside_singles:
-            return False, f"Ball bounce outside singles court ({side} sideline)", (255, 0, 0)
+            return False, f"Ball bounce outside singles court ({side} sideline)", (0, 0, 255)
 
         if getattr(self, '_awaiting_serve_bounce', False):
             serve_bounce_window_active = (
@@ -1731,7 +1795,7 @@ class InteractiveBallAnalyzer:
             target_side = getattr(self, '_point_target_service_side', None)
             service_box_ok, service_box_reason = self._point_in_target_service_box(point, frame, target_side)
             if service_box_ok is False:
-                return False, service_box_reason, (255, 0, 0)
+                return False, service_box_reason, (0, 0, 255)
             return True, "Serve bounce in", (255, 0, 0)
 
         return True, "Bounce in singles court", (255, 0, 0)
@@ -1880,7 +1944,7 @@ class InteractiveBallAnalyzer:
             'ref_size': max(35.0, min(self.ball_size * 0.30, 130.0)),
         }
 
-    def _get_ground_bounce_context(self, frame_shape):
+    def _get_ground_bounce_context(self, frame_shape, allow_near_net=False):
         """Predict a short upward continuation after a court bounce using ball-only motion."""
         if self.ball_center is None or self.last_motion is None or self.ball_size is None:
             return None
@@ -1900,7 +1964,11 @@ class InteractiveBallAnalyzer:
         if self.prev_motion is not None and self.prev_motion.get('dy', 0.0) < max(3.0, frame_height * 0.002):
             return None
         if hasattr(self, 'net_area_y_min') and hasattr(self, 'net_area_y_max'):
-            if (self.net_area_y_min - 60) <= origin_y <= (self.net_area_y_max + 80):
+            if allow_near_net:
+                net_geometry = self._net_contact_geometry((origin_x, origin_y))
+                if net_geometry is not None and (net_geometry['inside'] or net_geometry['near_top_tape']):
+                    return None
+            elif (self.net_area_y_min - 60) <= origin_y <= (self.net_area_y_max + 80):
                 return None
 
         expected_dx = incoming_dx * 0.9
@@ -1918,6 +1986,71 @@ class InteractiveBallAnalyzer:
             'expected_cap': max(28.0, min(85.0, incoming_dist * 2.2)),
             'ref_size': max(8.0, min(max(self.ball_size * 1.10, self.ball_size + 6.0), 90.0)),
         }
+
+    def _maybe_handle_reacquire_ground_bounce(self, reacq_pos, frame):
+        """Infer a missed ground bounce when reacquire finds the first post-bounce blob."""
+        if reacq_pos is None or frame is None or self.ball_center is None:
+            return False
+        if self._top_return_wait_active() or self._back_return_wait_active():
+            return False
+
+        ground_bounce_context = self._get_ground_bounce_context(frame.shape, allow_near_net=True)
+        if ground_bounce_context is None:
+            return False
+
+        cx, cy = int(reacq_pos[0]), int(reacq_pos[1])
+        origin_x, origin_y = ground_bounce_context['origin']
+        bounce_dist = math.hypot(cx - origin_x, cy - origin_y)
+        upward_progress = origin_y - cy
+        expected_distance = math.hypot(
+            cx - ground_bounce_context['expected'][0],
+            cy - ground_bounce_context['expected'][1],
+        )
+        lateral_dx = cx - origin_x
+        incoming_dx = ground_bounce_context['incoming_dx']
+        same_direction_x = abs(incoming_dx) <= 2.0 or (lateral_dx * incoming_dx) >= -8.0
+
+        min_launch_dist = max(8.0, ground_bounce_context['min_launch_dist'] * 0.75)
+        max_launch_dist = max(ground_bounce_context['max_launch_dist'], ground_bounce_context['max_launch_dist'] + 18.0)
+        min_upward = max(6.0, ground_bounce_context['min_upward'] * 0.75)
+        expected_cap = max(ground_bounce_context['expected_cap'], ground_bounce_context['expected_cap'] + 18.0)
+        candidate_not_tiny = (
+            self.ball_size is None or
+            self.ball_size <= 160.0
+        )
+
+        inferred_bounce = (
+            same_direction_x and
+            candidate_not_tiny and
+            upward_progress >= min_upward and
+            bounce_dist >= min_launch_dist and
+            bounce_dist <= max_launch_dist and
+            expected_distance <= expected_cap
+        )
+        if not inferred_bounce:
+            return False
+
+        if (self.frame_count - getattr(self, 'last_ground_bounce_frame', -1000000)) > 3:
+            self.ground_bounce_count += 1
+            self.last_ground_bounce_frame = self.frame_count
+            print(
+                f"Frame {self.frame_count}: [REACQ BOUNCE] inferred ground bounce at "
+                f"{ground_bounce_context['origin']} from reacquire {reacq_pos}"
+            )
+            self._handle_ground_bounce_event(ground_bounce_context['origin'], frame)
+
+        self._ground_bounce_grace_frames = max(getattr(self, '_ground_bounce_grace_frames', 0), 3)
+        self._ground_bounce_ref_size = max(
+            8.0,
+            min(max(float(self.ball_size or 0.0), ground_bounce_context['ref_size']), 90.0),
+        )
+        self._ground_bounce_origin = ground_bounce_context['origin']
+        self._ground_bounce_expected = ground_bounce_context['expected']
+        self._ground_bounce_progress = math.hypot(
+            cx - self._ground_bounce_origin[0],
+            cy - self._ground_bounce_origin[1],
+        )
+        return True
 
     def _recover_contact_phase_ball(self, frame, reference_pos, frame_gray, predicted_point=None,
                                     max_prev_speed=15.0, upper_stuck_mode=False):
@@ -4587,6 +4720,7 @@ class InteractiveBallAnalyzer:
                     reacq_pos = self._reacquire_ball_by_motion(frame)
                     if reacq_pos is not None:
                         print(f"Frame {self.frame_count}: [RE-ACQUIRED] Ball found at {reacq_pos} after {self.stuck_frame_count} stuck frames (motion-based)")
+                        self._maybe_handle_reacquire_ground_bounce(reacq_pos, frame)
                         self.ball_velocity_history = []
                         self.last_motion = None
                         self.last_direction = None
@@ -6703,6 +6837,7 @@ class InteractiveBallAnalyzer:
             # If re-acquiring after full-frame scan, reset velocity/direction state
             if self.stuck_frame_count >= 5:
                 print(f"Frame {self.frame_count}: [RE-ACQUIRED] Ball found at ({cx},{cy}) after {self.stuck_frame_count} stuck frames")
+                self._maybe_handle_reacquire_ground_bounce((cx, cy), frame)
                 self.ball_velocity_history = []
                 self.last_motion = None
                 self.last_direction = None
@@ -7222,22 +7357,57 @@ class InteractiveBallAnalyzer:
             cv2.putText(result, serve_pos_text, (10, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
         if getattr(self, 'show_event_markers', False):
-            # Draw historical direction-change points, but do not paint over the
-            # live ball marker or it looks like the current ball "stopped" there.
-            for point in self.direction_change_points:
+            good_events = []
+            problematic_events = []
+            for event in getattr(self, 'direction_change_events', []):
+                point = event.get('pos')
+                if point is None:
+                    continue
                 if self.ball_center is not None and math.hypot(
                     point[0] - self.ball_center[0],
                     point[1] - self.ball_center[1],
                 ) <= 12:
                     continue
+                is_good = event.get('status') == 'good'
+                color = (255, 0, 0) if is_good else (0, 0, 255)
                 px = int(point[0] * scale)
                 py = int(point[1] * scale)
-                cv2.circle(result, (px, py), 10, (0, 0, 255), 2)
+                cv2.circle(result, (px, py), 11, color, 2)
+                cv2.circle(result, (px, py), 3, color, -1)
+                frame_label = str(event.get('frame', '?'))
+                cv2.putText(
+                    result,
+                    frame_label,
+                    (px + 8, py - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.42,
+                    color,
+                    1,
+                )
+                if is_good:
+                    good_events.append(event)
+                else:
+                    problematic_events.append(event)
             # Draw net contact points
             for point in self.net_contact_points:
                 px = int(point[0] * scale)
                 py = int(point[1] * scale)
                 cv2.circle(result, (px, py), 12, (0, 0, 255), 3)
+
+            col_top = 240
+            col_x1 = 10
+            col_x2 = 190
+            line_h = 16
+            cv2.putText(result, "GOOD CHANGES", (col_x1, col_top), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
+            cv2.putText(result, "SUSPECT CHANGES", (col_x2, col_top), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+            for idx, event in enumerate(good_events[-18:]):
+                yy = col_top + 18 + idx * line_h
+                label = f"f{event.get('frame', '?')} {event.get('reason', '')}"
+                cv2.putText(result, label, (col_x1, yy), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 0, 0), 1)
+            for idx, event in enumerate(problematic_events[-18:]):
+                yy = col_top + 18 + idx * line_h
+                label = f"f{event.get('frame', '?')} {event.get('reason', '')}"
+                cv2.putText(result, label, (col_x2, yy), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 0, 255), 1)
 
         self._prune_bounce_markers()
         for marker in getattr(self, 'recent_bounce_markers', []):
@@ -7774,6 +7944,20 @@ class InteractiveBallAnalyzer:
                         direction_reversed = reversed_y or strong_x_reversal
                         slowed_after_impact = curr_dist <= max(8.0, prev_dist * 0.80)
                         direct_contact_zone = core_net_zone or net_geometry['near_top_tape']
+                        last_change_point = getattr(self, '_last_direction_change_point', None)
+                        last_change_geometry = (
+                            self._net_contact_geometry(last_change_point)
+                            if last_change_point is not None else None
+                        )
+                        recent_net_turn = (
+                            getattr(self, '_last_direction_change_frame', -1000000) == self.frame_count and
+                            last_change_geometry is not None and
+                            (last_change_geometry['inside'] or last_change_geometry['near_top_tape']) and
+                            curr_dy >= 4.0 and
+                            direct_contact_zone
+                        )
+                        if recent_net_turn:
+                            return True, "Ball hit the net"
                         if direct_contact_zone and direction_reversed and slowed_after_impact:
                             return True, "Ball hit the net"
                         if direct_contact_zone and angle_diff >= 60 and slowed_after_impact:
@@ -8290,6 +8474,10 @@ class InteractiveBallAnalyzer:
             self._awaiting_serve_bounce = False
             self._point_serve_start_side = None
             self._point_target_service_side = None
+            self._last_direction_change_frame = -1000000
+            self._last_direction_change_point = None
+            self._last_direction_change_angle = 0.0
+            self._last_direction_change_vertical_reversal = False
             if hasattr(self, 'net_area_frames'):
                 self.net_area_frames = 0
 
