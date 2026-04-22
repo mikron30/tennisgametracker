@@ -1364,6 +1364,28 @@ class InteractiveBallAnalyzer:
             )
             return False
 
+        override_area = float(override.get('area', 0.0) or 0.0)
+        tiny_highlight_override = (
+            label == "alt1" and
+            current_area is not None and current_area >= 30.0 and
+            override_area <= 1.5 and
+            current_pos is not None and current_pos[1] >= 500
+        )
+        override_clearly_closer_to_track = (
+            override_metrics['prev_distance'] + 12.0 < current_metrics['prev_distance']
+        )
+        if (predicted_point is not None and
+                current_metrics['predicted_distance'] is not None and
+                override_metrics['predicted_distance'] is not None and
+                override_metrics['predicted_distance'] + 12.0 < current_metrics['predicted_distance']):
+            override_clearly_closer_to_track = True
+        if tiny_highlight_override and current_dynamic and not override_clearly_closer_to_track:
+            print(
+                f"  DEBUG: Rejecting {label} override at {override['pos']} - "
+                f"tiny highlight {override_area:.1f}px vs current {current_area:.1f}px"
+            )
+            return False
+
         if label == "alts9_11":
             current_jump = current_metrics['prev_distance'] >= 55.0
             override_track_lock = override_metrics['prev_distance'] + 30.0 < current_metrics['prev_distance']
