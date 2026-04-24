@@ -163,6 +163,8 @@ class InteractiveBallAnalyzer:
         self.last_nonzero_motion = None
         self._singles_sideline_model = None
         self._singles_sideline_frame_shape = None
+        self._singles_court_model = None
+        self._singles_court_frame_shape = None
         self._service_box_model = None
         self._service_box_frame_shape = None
         self._white_line_visual_model = None
@@ -1807,6 +1809,23 @@ class InteractiveBallAnalyzer:
         if outside_singles:
             return False, f"Ball bounce outside singles court ({side} sideline)", (0, 0, 255)
 
+        upper_recent_return_bounce = (
+            not getattr(self, '_awaiting_serve_bounce', False) and
+            point[1] <= max(320, int(frame.shape[0] * 0.16)) and
+            (
+                self._recent_offscreen_return_hold_active(window_frames=12) or
+                self._recent_return_bounce_recover_active(window_frames=3)
+            )
+        )
+        if upper_recent_return_bounce:
+            outside_far_baseline, far_y = self._point_outside_top_singles_baseline(point, frame)
+            if outside_far_baseline:
+                print(
+                    f"Frame {self.frame_count}: [TOP BASELINE OUT] point={point} "
+                    f"far_baseline_y={far_y:.1f}"
+                )
+                return False, "Ball bounce outside singles court (far baseline)", (0, 0, 255)
+
         if getattr(self, '_awaiting_serve_bounce', False):
             serve_bounce_window_active = (
                 self.point_start_frame_internal is not None and
@@ -1840,6 +1859,18 @@ class InteractiveBallAnalyzer:
         self._pending_rally_end_reason = reason
         self._pending_rally_end_frame = self.frame_count
         print(f"Frame {self.frame_count}: [BOUNCE OUT] {reason} at {point}")
+
+    def _register_ground_bounce_from_context(self, ground_bounce_context, frame, source_label=None):
+        if ground_bounce_context is None or frame is None:
+            return False
+        if (self.frame_count - getattr(self, 'last_ground_bounce_frame', -1000000)) <= 3:
+            return False
+        self.ground_bounce_count += 1
+        self.last_ground_bounce_frame = self.frame_count
+        label_suffix = f" ({source_label})" if source_label else ""
+        print(f"Frame {self.frame_count}: Ground bounce #{self.ground_bounce_count} detected{label_suffix}")
+        self._handle_ground_bounce_event(ground_bounce_context['origin'], frame)
+        return True
 
     def _should_start_back_return_wait(self, frame_shape):
         """Return True for large lower-right exits that can re-enter from the right side later."""
@@ -2080,14 +2111,12 @@ class InteractiveBallAnalyzer:
         if not inferred_bounce:
             return False
 
-        if (self.frame_count - getattr(self, 'last_ground_bounce_frame', -1000000)) > 3:
-            self.ground_bounce_count += 1
-            self.last_ground_bounce_frame = self.frame_count
+        if self._register_ground_bounce_from_context(
+                ground_bounce_context, frame, source_label=f"reacquire from {reacq_pos}"):
             print(
                 f"Frame {self.frame_count}: [REACQ BOUNCE] inferred ground bounce at "
                 f"{ground_bounce_context['origin']} from reacquire {reacq_pos}"
             )
-            self._handle_ground_bounce_event(ground_bounce_context['origin'], frame)
 
         self._ground_bounce_grace_frames = max(getattr(self, '_ground_bounce_grace_frames', 0), 3)
         self._ground_bounce_ref_size = max(
@@ -7164,6 +7193,9 @@ class InteractiveBallAnalyzer:
                                 frame, frame_gray, predicted_point=predicted_point
                             )
                             if recent_bounce_continue is not None:
+                                self._register_ground_bounce_from_context(
+                                    ground_bounce_context, frame, source_label="recent bounce continue"
+                                )
                                 prev_pos = self.ball_center
                                 new_pos = recent_bounce_continue['pos']
                                 self.ball_center = new_pos
@@ -7194,9 +7226,15 @@ class InteractiveBallAnalyzer:
                     elif change_detected and predicted_continuation_candidate:
                         print(f"Frame {self.frame_count}: Allowing predicted-path continuation after speed drop")
                     elif change_detected and recent_bounce_regular_candidate:
+                        self._register_ground_bounce_from_context(
+                            ground_bounce_context, frame, source_label="recent bounce regular"
+                        )
                         self._recent_return_bounce_recover_frame = self.frame_count
                         print(f"Frame {self.frame_count}: Allowing recent bounce regular-candidate continuation")
                     elif change_detected and recent_bounce_reversal_candidate:
+                        self._register_ground_bounce_from_context(
+                            ground_bounce_context, frame, source_label="recent bounce rebound"
+                        )
                         self._recent_return_bounce_recover_frame = self.frame_count
                         print(f"Frame {self.frame_count}: Allowing recent bounce rebound continuation")
                     elif change_detected and lower_contact_launch_candidate:
@@ -7215,11 +7253,9 @@ class InteractiveBallAnalyzer:
                         }
                         print(f"Frame {self.frame_count}: Allowing lower-racket contact launch")
                     elif change_detected and ground_bounce_candidate:
-                        if (self.frame_count - getattr(self, 'last_ground_bounce_frame', -1000000)) > 3:
-                            self.ground_bounce_count += 1
-                            self.last_ground_bounce_frame = self.frame_count
-                            print(f"Frame {self.frame_count}: Ground bounce #{self.ground_bounce_count} detected")
-                            self._handle_ground_bounce_event(ground_bounce_context['origin'], frame)
+                        self._register_ground_bounce_from_context(
+                            ground_bounce_context, frame, source_label="predicted launch"
+                        )
                         self._ground_bounce_grace_frames = max(getattr(self, '_ground_bounce_grace_frames', 0), 3)
                         self._ground_bounce_ref_size = max(8.0, min(max(float(bulb_size), ground_bounce_context['ref_size']), 90.0))
                         self._ground_bounce_origin = ground_bounce_context['origin']
@@ -8514,6 +8550,212 @@ class InteractiveBallAnalyzer:
             return True, 'right', left_x, right_x
         return False, None, left_x, right_x
 
+    def _build_singles_court_model(self, frame):
+        frame_shape = frame.shape[:2]
+        if (self._singles_court_model is not None and
+                self._singles_court_frame_shape == frame_shape):
+            return self._singles_court_model
+
+        sideline_model = self._build_singles_sideline_model(frame)
+        if sideline_model is None:
+            self._singles_court_model = None
+            self._singles_court_frame_shape = frame_shape
+            return None
+
+        height, width = frame_shape
+        adjusted_points_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "adjusted_court_points.txt")
+        if os.path.exists(adjusted_points_path):
+            manual_points = {}
+            in_full_video_section = False
+            with open(adjusted_points_path, "r", encoding="utf-8") as handle:
+                for raw_line in handle:
+                    line = raw_line.strip()
+                    if line.startswith("Full Video Frame Coordinates"):
+                        in_full_video_section = True
+                        continue
+                    if in_full_video_section and line.startswith("Right Court Region Coordinates"):
+                        break
+                    if not in_full_video_section or not line.startswith("Point"):
+                        continue
+                    try:
+                        left_part, right_part = line.split(":", 1)
+                        point_num = int(left_part.split()[1])
+                        coords_text = right_part.strip().strip("()")
+                        x_text, y_text = coords_text.split(",", 1)
+                        manual_points[point_num] = (float(x_text), float(y_text))
+                    except (ValueError, IndexError):
+                        continue
+
+            if all(point_num in manual_points for point_num in (5, 6, 7, 8)):
+                top_left = manual_points[5]
+                top_right = manual_points[6]
+                bottom_left = manual_points[7]
+                bottom_right = manual_points[8]
+                max_x = max(top_left[0], top_right[0], bottom_left[0], bottom_right[0])
+                max_y = max(top_left[1], top_right[1], bottom_left[1], bottom_right[1])
+                if max_x <= width * 1.02 and max_y <= height * 1.02:
+                    far_dx = top_right[0] - top_left[0]
+                    near_dx = bottom_right[0] - bottom_left[0]
+                    left_dy = bottom_left[1] - top_left[1]
+                    right_dy = bottom_right[1] - top_right[1]
+                    far_baseline = {
+                        'a': ((top_right[1] - top_left[1]) / far_dx) if abs(far_dx) > 1e-6 else 0.0,
+                        'b': top_left[1] - (((top_right[1] - top_left[1]) / far_dx) if abs(far_dx) > 1e-6 else 0.0) * top_left[0],
+                        'length': math.hypot(top_right[0] - top_left[0], top_right[1] - top_left[1]),
+                        'y_mid': (top_left[1] + top_right[1]) / 2.0,
+                    }
+                    near_baseline = {
+                        'a': ((bottom_right[1] - bottom_left[1]) / near_dx) if abs(near_dx) > 1e-6 else 0.0,
+                        'b': bottom_left[1] - (((bottom_right[1] - bottom_left[1]) / near_dx) if abs(near_dx) > 1e-6 else 0.0) * bottom_left[0],
+                        'length': math.hypot(bottom_right[0] - bottom_left[0], bottom_right[1] - bottom_left[1]),
+                        'y_mid': (bottom_left[1] + bottom_right[1]) / 2.0,
+                    }
+                    left_sideline = {
+                        'a': ((bottom_left[0] - top_left[0]) / left_dy) if abs(left_dy) > 1e-6 else 0.0,
+                        'b': top_left[0] - (((bottom_left[0] - top_left[0]) / left_dy) if abs(left_dy) > 1e-6 else 0.0) * top_left[1],
+                    }
+                    right_sideline = {
+                        'a': ((bottom_right[0] - top_right[0]) / right_dy) if abs(right_dy) > 1e-6 else 0.0,
+                        'b': top_right[0] - (((bottom_right[0] - top_right[0]) / right_dy) if abs(right_dy) > 1e-6 else 0.0) * top_right[1],
+                    }
+                    self._singles_court_model = {
+                        'sidelines': sideline_model,
+                        'left_sideline_manual': left_sideline,
+                        'right_sideline_manual': right_sideline,
+                        'far_baseline': far_baseline,
+                        'near_baseline': near_baseline,
+                        'polygon': np.array([top_left, top_right, bottom_right, bottom_left], dtype=np.float32),
+                        'polygon_margin': max(12.0, width * 0.0035),
+                        'baseline_margin': max(18.0, width * 0.005),
+                    }
+                    self._singles_court_frame_shape = frame_shape
+                    print(
+                        f"  DEBUG: Singles court model built from adjusted points: "
+                        f"far_y={far_baseline['y_mid']:.1f} near_y={near_baseline['y_mid']:.1f}"
+                    )
+                    return self._singles_court_model
+
+        if not hasattr(self, 'net_area_y_min') or not hasattr(self, 'net_area_y_max'):
+            self._singles_court_model = None
+            self._singles_court_frame_shape = frame_shape
+            return None
+
+        net_y = float((self.net_area_y_min + self.net_area_y_max) / 2.0)
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        _, white_mask = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY)
+        min_line_length = max(260, int(width * 0.12))
+        lines = cv2.HoughLinesP(
+            white_mask,
+            1,
+            np.pi / 180,
+            threshold=120,
+            minLineLength=min_line_length,
+            maxLineGap=24,
+        )
+        if lines is None:
+            self._singles_court_model = None
+            self._singles_court_frame_shape = frame_shape
+            return None
+
+        upper_candidates = []
+        lower_candidates = []
+        for raw in lines[:, 0, :]:
+            x1, y1, x2, y2 = [float(v) for v in raw]
+            dx = x2 - x1
+            dy = y2 - y1
+            if abs(dx) < min_line_length or abs(dy) > 18.0:
+                continue
+            y_mid = (y1 + y2) / 2.0
+            a = dy / dx if abs(dx) > 1e-6 else 0.0
+            b = y1 - a * x1
+            entry = {
+                'a': a,
+                'b': b,
+                'length': math.hypot(dx, dy),
+                'y_mid': y_mid,
+            }
+            if height * 0.08 <= y_mid <= net_y - 55.0:
+                upper_candidates.append(entry)
+            elif net_y + 55.0 <= y_mid <= height * 0.95:
+                lower_candidates.append(entry)
+
+        if not upper_candidates or not lower_candidates:
+            self._singles_court_model = None
+            self._singles_court_frame_shape = frame_shape
+            return None
+
+        upper_long = sorted(upper_candidates, key=lambda entry: entry['length'], reverse=True)[:12]
+        lower_long = sorted(lower_candidates, key=lambda entry: entry['length'], reverse=True)[:12]
+        far_baseline = min(upper_long, key=lambda entry: entry['y_mid'])
+        near_baseline = max(lower_long, key=lambda entry: entry['y_mid'])
+
+        self._singles_court_model = {
+            'sidelines': sideline_model,
+            'far_baseline': far_baseline,
+            'near_baseline': near_baseline,
+            'baseline_margin': max(18.0, width * 0.005),
+        }
+        self._singles_court_frame_shape = frame_shape
+        print(
+            f"  DEBUG: Singles court model built: "
+            f"far_y={far_baseline['y_mid']:.1f} near_y={near_baseline['y_mid']:.1f}"
+        )
+        return self._singles_court_model
+
+    def _point_outside_singles_court(self, point, frame):
+        outside_side, side, left_x, right_x = self._point_outside_singles_sidelines(point, frame)
+        if outside_side:
+            return True, f"{side} sideline", left_x, right_x, None, None
+
+        model = self._build_singles_court_model(frame)
+        if model is None:
+            return False, None, left_x, right_x, None, None
+
+        x, y = point
+        polygon = model.get('polygon')
+        if polygon is not None:
+            signed_dist = cv2.pointPolygonTest(polygon, (float(x), float(y)), True)
+            far_y = model['far_baseline']['a'] * x + model['far_baseline']['b']
+            near_y = model['near_baseline']['a'] * x + model['near_baseline']['b']
+            left_manual = model.get('left_sideline_manual')
+            right_manual = model.get('right_sideline_manual')
+            if left_manual is not None:
+                left_x = left_manual['a'] * y + left_manual['b']
+            if right_manual is not None:
+                right_x = right_manual['a'] * y + right_manual['b']
+            if signed_dist >= -float(model.get('polygon_margin', 0.0)):
+                return False, None, left_x, right_x, far_y, near_y
+
+            edge_labels = (
+                ("far baseline", tuple(polygon[0]), tuple(polygon[1])),
+                ("right sideline", tuple(polygon[1]), tuple(polygon[2])),
+                ("near baseline", tuple(polygon[2]), tuple(polygon[3])),
+                ("left sideline", tuple(polygon[3]), tuple(polygon[0])),
+            )
+            boundary = min(
+                edge_labels,
+                key=lambda entry: self._point_to_segment_distance(point, entry[1], entry[2])
+            )[0]
+            return True, boundary, left_x, right_x, far_y, near_y
+
+        far_y = model['far_baseline']['a'] * x + model['far_baseline']['b']
+        near_y = model['near_baseline']['a'] * x + model['near_baseline']['b']
+        margin = model['baseline_margin']
+        if y < far_y - margin:
+            return True, "far baseline", left_x, right_x, far_y, near_y
+        if y > near_y + margin:
+            return True, "near baseline", left_x, right_x, far_y, near_y
+        return False, None, left_x, right_x, far_y, near_y
+
+    def _point_outside_top_singles_baseline(self, point, frame):
+        model = self._build_singles_court_model(frame)
+        if model is None or model.get('polygon') is None:
+            return False, None
+        x, y = point
+        far_y = model['far_baseline']['a'] * x + model['far_baseline']['b']
+        margin = max(14.0, float(model.get('baseline_margin', 0.0)))
+        return y < (far_y - margin), far_y
+
     def _build_service_box_model(self, frame):
         frame_shape = frame.shape[:2]
         if (self._service_box_model is not None and
@@ -8849,6 +9091,14 @@ class InteractiveBallAnalyzer:
             self.last_motion = None
             self.prev_motion = None
             self.last_direction = None
+            self.direction_change_points = []
+            self.direction_change_events = []
+            self.recent_bounce_markers = []
+            self.net_contact_points = []
+            self.motion_debug_vectors = []
+            self._last_impact_marker_frame = -1000000
+            self._last_impact_marker_pos = None
+            self._last_impact_marker_kind = None
             self.direction_change_streak = 0
             self.edge_wait = False
             self.near_edge = False
