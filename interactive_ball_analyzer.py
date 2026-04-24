@@ -133,6 +133,7 @@ class InteractiveBallAnalyzer:
         self._top_return_mode = None
         self._top_return_exit_dx = 0.0
         self._recent_offscreen_return_frame = -1000000
+        self._recent_return_bounce_recover_frame = -1000000
         self._back_return_wait_frames = 0
         # Court-2 back-return re-entry shows up about 5 frames after the lower-right
         # exit in the validated rally; allow a small cushion, then declare the ball lost.
@@ -960,10 +961,31 @@ class InteractiveBallAnalyzer:
                 "contour": contour,
             })
 
-        if len(valid) != 1:
+        if not valid:
             return None
 
-        candidate = valid[0]
+        if len(valid) > 1:
+            xs = [entry["pos"][0] for entry in valid]
+            ys = [entry["pos"][1] for entry in valid]
+            if (max(xs) - min(xs) <= 8) and (max(ys) - min(ys) <= 8):
+                candidate = min(
+                    valid,
+                    key=lambda entry: (
+                        -entry["area"],
+                        entry["score"],
+                        entry["distance"],
+                        entry["predicted_distance"] if entry["predicted_distance"] is not None else float("inf"),
+                    )
+                )
+                print(
+                    f"  DEBUG: Single regular candidate collapsing {len(valid)} adjacent components "
+                    f"-> {candidate['pos']} area={candidate['area']:.1f}"
+                )
+            else:
+                return None
+        else:
+            candidate = valid[0]
+
         print(
             f"  DEBUG: Single regular candidate -> {candidate['pos']} "
             f"area={candidate['area']:.1f} score={candidate['score']:.1f}"
@@ -1862,6 +1884,29 @@ class InteractiveBallAnalyzer:
     def _recent_offscreen_return_hold_active(self, window_frames=8):
         last_frame = int(getattr(self, '_recent_offscreen_return_frame', -1000000))
         return (self.frame_count - last_frame) <= max(1, int(window_frames))
+
+    def _recent_return_bounce_recover_active(self, window_frames=2):
+        last_frame = int(getattr(self, '_recent_return_bounce_recover_frame', -1000000))
+        return (self.frame_count - last_frame) <= max(1, int(window_frames))
+
+    def _update_recovered_motion(self, prev_pos, new_pos):
+        if prev_pos is None or new_pos is None:
+            return
+        new_dx = int(new_pos[0] - prev_pos[0])
+        new_dy = int(new_pos[1] - prev_pos[1])
+        new_velocity = math.hypot(new_dx, new_dy)
+        new_direction = math.degrees(math.atan2(new_dy, new_dx)) if new_velocity > 0 else 0.0
+        self.last_delta = (new_dx, new_dy)
+        self.last_motion = {
+            'distance': new_velocity,
+            'dx': new_dx,
+            'dy': new_dy,
+            'direction_deg': new_direction,
+        }
+        vel_hist = list(getattr(self, 'ball_velocity_history', []))
+        vel_hist.append(new_velocity)
+        self.ball_velocity_history = vel_hist[-5:]
+        self.last_direction = new_direction
 
     def _back_return_reentry_ok(self, pos, area, motion_mean, motion_max, frame_shape):
         """Validate a delayed re-entry from the right/back side after a lower-right exit."""
@@ -2850,6 +2895,141 @@ class InteractiveBallAnalyzer:
         best['hsv'] = hsv_local[local_y, local_x]
         print(
             f"  DEBUG: recent tiny-hue recover selected contour at {best['pos']} "
+            f"area={best['area']:.1f}px score={best['score']:.1f} "
+            f"motion={best['motion_mean']:.1f}/{best['motion_max']:.1f} "
+            f"filter={best['filter_key']}"
+        )
+        return best
+
+    def _retrack_recent_return_bounce_continue(self, frame, frame_gray, predicted_point=None):
+        """Recover the next bounce step after a recent-return rescue using a tiny local search."""
+        if self.ball_center is None or self.last_motion is None:
+            return None
+        if not self._recent_return_bounce_recover_active(window_frames=2):
+            return None
+
+        prev_pos = self.ball_center
+        prev_size = float(self.ball_size or 0.0)
+        last_distance = float(self.last_motion.get('distance', 0.0) or 0.0)
+        ref_x, ref_y = prev_pos
+        if prev_size > 24.0 or ref_y < 220 or ref_y > 320:
+            return None
+
+        x_radius = int(max(50, min(85, max(58.0, last_distance * 2.2))))
+        up_radius = 12
+        down_radius = 85
+        x1 = max(0, ref_x - x_radius)
+        y1 = max(0, ref_y - up_radius)
+        x2 = min(frame.shape[1], ref_x + x_radius + 1)
+        y2 = min(frame.shape[0], ref_y + down_radius + 1)
+        local_frame = frame[y1:y2, x1:x2]
+        if local_frame.size == 0:
+            return None
+
+        hsv_local = cv2.cvtColor(local_frame, cv2.COLOR_BGR2HSV)
+        expected_dx = float(self.last_motion.get('dx', 0.0) or 0.0)
+        expected_dy = max(14.0, min(42.0, float(self.last_motion.get('dy', 0.0) or 0.0) * 1.0))
+        default_predicted = (
+            int(round(ref_x + expected_dx)),
+            int(round(ref_y + expected_dy)),
+        )
+        active_predicted = predicted_point if predicted_point is not None else default_predicted
+        best = None
+        best_score = float('inf')
+
+        recover_specs = [
+            (
+                "recent_bounce_low_s",
+                np.array([20, 10, 80], dtype=np.uint8),
+                np.array([80, 110, 235], dtype=np.uint8),
+                True,
+                5.0,
+            ),
+            (
+                "recent_bounce_h10",
+                self.h10_hsv_lower,
+                self.h10_hsv_upper,
+                False,
+                0.0,
+            ),
+            (
+                "recent_bounce_s30",
+                self.s30_hsv_lower,
+                self.s30_hsv_upper,
+                False,
+                0.0,
+            ),
+        ]
+
+        for label, lower, upper, use_close, label_bonus in recover_specs:
+            if lower is None or upper is None:
+                continue
+            mask = cv2.inRange(hsv_local, lower, upper)
+            if use_close:
+                kernel = np.ones((2, 2), np.uint8)
+                mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+                mask = cv2.dilate(mask, kernel, iterations=1)
+            if cv2.countNonZero(mask) == 0:
+                continue
+
+            count, _, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
+            for idx in range(1, count):
+                area = int(stats[idx, cv2.CC_STAT_AREA])
+                if area < 1 or area > max(60.0, prev_size * 4.5):
+                    continue
+
+                comp_cx, comp_cy = centroids[idx]
+                cx = int(round(comp_cx)) + x1
+                cy = int(round(comp_cy)) + y1
+                if self._find_ignored_tracking_position((cx, cy)) is not None:
+                    continue
+
+                dx = cx - ref_x
+                dy = cy - ref_y
+                distance = math.hypot(dx, dy)
+                if dy < 6.0 or dy > 60.0:
+                    continue
+                if abs(dx) > 60.0:
+                    continue
+                if distance < 10.0 or distance > 90.0:
+                    continue
+
+                motion_metrics = self._candidate_motion_metrics(frame_gray, cx, cy)
+                motion_mean = motion_metrics['mean'] if motion_metrics is not None else 0.0
+                motion_max = motion_metrics['max'] if motion_metrics is not None else 0.0
+                frame0_hotspot = self._find_frame0_background_hotspot((cx, cy))
+                if frame0_hotspot is not None and motion_mean < 8.0 and motion_max < 35.0:
+                    continue
+
+                predicted_distance = math.hypot(cx - active_predicted[0], cy - active_predicted[1])
+                score = predicted_distance * 1.0
+                score += abs(dy - expected_dy) * 0.8
+                score += abs(dx - expected_dx) * 0.9
+                score += abs(dx) * 0.6
+                score -= min(40.0, area * 0.7)
+                score -= min(18.0, motion_mean * 0.7)
+                score -= min(22.0, motion_max * 0.12)
+                score -= label_bonus
+
+                if score < best_score:
+                    best_score = score
+                    best = {
+                        'pos': (cx, cy),
+                        'area': float(area),
+                        'score': score,
+                        'motion_mean': motion_mean,
+                        'motion_max': motion_max,
+                        'filter_key': label,
+                    }
+
+        if best is None:
+            return None
+
+        local_x = max(0, min(local_frame.shape[1] - 1, best['pos'][0] - x1))
+        local_y = max(0, min(local_frame.shape[0] - 1, best['pos'][1] - y1))
+        best['hsv'] = hsv_local[local_y, local_x]
+        print(
+            f"  DEBUG: recent bounce-continue recover selected contour at {best['pos']} "
             f"area={best['area']:.1f}px score={best['score']:.1f} "
             f"motion={best['motion_mean']:.1f}/{best['motion_max']:.1f} "
             f"filter={best['filter_key']}"
@@ -6251,11 +6431,14 @@ class InteractiveBallAnalyzer:
                     if recent_return_static_hold:
                         tiny_hue_recover = self._retrack_recent_return_tiny_hue(frame, frame_gray)
                         if tiny_hue_recover is not None:
+                            prev_pos = self.ball_center
                             new_pos = tiny_hue_recover['pos']
                             self.ball_center = new_pos
                             self.ball_hsv = tiny_hue_recover['hsv']
                             self.ball_size = tiny_hue_recover['area']
+                            self._update_recovered_motion(prev_pos, new_pos)
                             self._activate_regular_hsv()
+                            self._recent_return_bounce_recover_frame = self.frame_count
                             self.direction_change_streak = 0
                             self.stuck_frame_count = 0
                             print(f"Frame {self.frame_count}: [RECENT RETURN TINY-HUE RECOVER] Ball at {new_pos}")
@@ -6396,14 +6579,24 @@ class InteractiveBallAnalyzer:
                 selected_override['area'] if selected_override is not None else cv2.contourArea(best_contour)
             )
             current_filter_key = self._candidate_false_point_filter_key(best_source, hsv_mode)
-            if (not allow_inactive and best_source == "alt6"
-                    and self.ball_center is not None and contact_reacquire_bounds is not None
+            recent_regular_single = None
+            recent_bounce_regular_precedence_context = (
+                not allow_inactive and
+                self.ball_center is not None and
+                contact_reacquire_bounds is not None and
+                self.ball_center[1] <= 260 and
+                (self.ball_size is None or self.ball_size <= 35) and
+                self._recent_return_bounce_recover_active(window_frames=2)
+            )
+            if (not allow_inactive and self.ball_center is not None and contact_reacquire_bounds is not None
                     and self.ball_center[1] <= 260
-                    and (self.ball_size is None or self.ball_size <= 35)):
+                    and (self.ball_size is None or self.ball_size <= 35)
+                    and (best_source == "alt6" or recent_bounce_regular_precedence_context)):
                 regular_single = self._find_single_standard_candidate(
                     search_frame, x1, y1, self.ball_center, predicted_point, frame_gray
                 )
                 if regular_single is not None:
+                    recent_regular_single = regular_single
                     current_distance = math.hypot(cx - self.ball_center[0], cy - self.ball_center[1])
                     current_predicted_distance = (
                         math.hypot(cx - predicted_point[0], cy - predicted_point[1])
@@ -6416,13 +6609,48 @@ class InteractiveBallAnalyzer:
                             current_score=best_score,
                             current_distance=current_distance,
                             current_predicted_distance=current_predicted_distance):
+                        use_regular_precedence = True
+                    else:
+                        use_regular_precedence = False
+                    if (not use_regular_precedence and recent_bounce_regular_precedence_context):
+                        regular_predicted_distance = regular_single.get("predicted_distance")
+                        regular_expected_distance = None
+                        current_expected_distance = None
+                        if ground_bounce_context is not None:
+                            expected_x, expected_y = ground_bounce_context['expected']
+                            regular_expected_distance = math.hypot(
+                                regular_single["pos"][0] - expected_x,
+                                regular_single["pos"][1] - expected_y,
+                            )
+                            current_expected_distance = math.hypot(
+                                cx - expected_x,
+                                cy - expected_y,
+                            )
+                        use_regular_precedence = (
+                            regular_single["area"] >= max(4.0, selected_area_for_precedence * 2.0) and
+                            regular_single["pos"][1] <= cy - 14 and
+                            regular_single["distance"] <= max(
+                                60.0,
+                                (float(self.last_motion.get('distance', 0.0) or 0.0) * 1.8)
+                                if self.last_motion is not None else 60.0
+                            ) and
+                            (
+                                (regular_expected_distance is not None and current_expected_distance is not None and
+                                 regular_expected_distance + 8.0 <= current_expected_distance) or
+                                regular_predicted_distance is None or
+                                current_predicted_distance is None or
+                                regular_predicted_distance + 8.0 <= current_predicted_distance
+                            )
+                        )
+                    if use_regular_precedence:
+                        precedence_label = "REGULAR PRECEDENCE" if best_source == "alt6" else "RECENT BOUNCE REGULAR PRECEDENCE"
                         best_contour = regular_single["contour"]
                         best_source = "regular"
                         best_score = regular_single["score"]
                         cx, cy = regular_single["pos"]
                         self._activate_regular_hsv()
                         print(
-                            f"Frame {self.frame_count}: [REGULAR PRECEDENCE] "
+                            f"Frame {self.frame_count}: [{precedence_label}] "
                             f"Using single regular candidate at ({cx}, {cy})"
                         )
 
@@ -6897,19 +7125,64 @@ class InteractiveBallAnalyzer:
                             bounce_soft_speed and
                             predicted_path_distance <= bounce_soft_cap
                         )
+                recent_bounce_reversal_candidate = False
+                recent_bounce_continue_needed = self._recent_return_bounce_recover_active(window_frames=2)
+                if recent_bounce_continue_needed:
+                    recent_bounce_pred_distance = (
+                        math.hypot(cx - predicted_point[0], cy - predicted_point[1])
+                        if predicted_point is not None else velocity
+                    )
+                    recent_bounce_regular_candidate = (
+                        recent_regular_single is not None and
+                        (best_source in ("regular", "primary") or current_filter_key in ("regular_court", "primary"))
+                    )
+                    recent_bounce_reversal_candidate = (
+                        not recent_bounce_regular_candidate and
+                        velocity >= 18.0 and
+                        dy <= -18.0 and
+                        recent_bounce_pred_distance <= max(90, int(frame_width * 0.03)) and
+                        (motion_mean >= 10.0 or motion_max >= 60.0) and
+                        bulb_size >= max(4.0, min(max(float(prev_ball_size or 0.0), 4.0) * 0.55, 18.0))
+                    )
+                    recent_bounce_continue_needed = (
+                        not recent_bounce_reversal_candidate and
+                        not recent_bounce_regular_candidate and
+                        (velocity <= 16.0 or abs(dy) <= 12.0 or (motion_mean < 18.0 and motion_max < 90.0))
+                    )
+                else:
+                    recent_bounce_regular_candidate = False
 
                 impact_event = None
                 if (hold_change_detected and not predicted_turn_candidate and not predicted_continuation_candidate
-                        and not lower_contact_launch_candidate and not ground_bounce_candidate):
+                        and not lower_contact_launch_candidate and not ground_bounce_candidate
+                        and not recent_bounce_reversal_candidate and not recent_bounce_regular_candidate):
                     self.direction_change_streak += 1
                     max_hold = 2 if near_net else 3
                     if self.direction_change_streak < max_hold:
+                        if recent_bounce_continue_needed:
+                            recent_bounce_continue = self._retrack_recent_return_bounce_continue(
+                                frame, frame_gray, predicted_point=predicted_point
+                            )
+                            if recent_bounce_continue is not None:
+                                prev_pos = self.ball_center
+                                new_pos = recent_bounce_continue['pos']
+                                self.ball_center = new_pos
+                                self.ball_hsv = recent_bounce_continue['hsv']
+                                self.ball_size = recent_bounce_continue['area']
+                                self._update_recovered_motion(prev_pos, new_pos)
+                                self._activate_regular_hsv()
+                                self._recent_return_bounce_recover_frame = self.frame_count
+                                self.direction_change_streak = 0
+                                self.stuck_frame_count = 0
+                                print(f"Frame {self.frame_count}: [RECENT RETURN BOUNCE CONTINUE] Ball at {new_pos}")
+                                return self.ball_center
                         print(f"Frame {self.frame_count}: Direction change candidate (holding {self.direction_change_streak}/{max_hold}) angle_jump={angle_jump:.1f}")
                         self.stuck_frame_count += 1
                         return self.ball_center
                 else:
                     if (change_detected and not ground_bounce_candidate and not predicted_turn_candidate
-                            and not predicted_continuation_candidate):
+                            and not predicted_continuation_candidate and not recent_bounce_reversal_candidate
+                            and not recent_bounce_regular_candidate):
                         strong_x_reversal = (self.last_motion['dx'] * dx) < -12 if self.last_motion is not None else False
                         if lower_contact_launch_candidate or strong_x_reversal or angle_jump >= 120 or speed_ratio > 1.8:
                             if self.ground_bounce_count > 0:
@@ -6920,6 +7193,12 @@ class InteractiveBallAnalyzer:
                         print(f"Frame {self.frame_count}: Allowing upper-flight turn near predicted path")
                     elif change_detected and predicted_continuation_candidate:
                         print(f"Frame {self.frame_count}: Allowing predicted-path continuation after speed drop")
+                    elif change_detected and recent_bounce_regular_candidate:
+                        self._recent_return_bounce_recover_frame = self.frame_count
+                        print(f"Frame {self.frame_count}: Allowing recent bounce regular-candidate continuation")
+                    elif change_detected and recent_bounce_reversal_candidate:
+                        self._recent_return_bounce_recover_frame = self.frame_count
+                        print(f"Frame {self.frame_count}: Allowing recent bounce rebound continuation")
                     elif change_detected and lower_contact_launch_candidate:
                         self._rally_contact_grace_frames = max(getattr(self, '_rally_contact_grace_frames', 0), 3)
                         self._rally_contact_ref_size = max(40.0, min(float(bulb_size), 140.0))
@@ -8602,6 +8881,7 @@ class InteractiveBallAnalyzer:
             self._top_return_mode = None
             self._top_return_exit_dx = 0.0
             self._recent_offscreen_return_frame = -1000000
+            self._recent_return_bounce_recover_frame = -1000000
             self._back_return_wait_frames = 0
             self._back_return_anchor = None
             self._back_return_origin_frame = -1
@@ -8895,9 +9175,17 @@ class InteractiveBallAnalyzer:
                         getattr(self, '_back_return_reentry_grace_frames', 0) > 0
                     )
                     recent_return_hold = self._recent_offscreen_return_hold_active(window_frames=8)
-                    if top_timeout_hold or back_timeout_hold or recent_return_hold:
+                    recent_bounce_hold = self._recent_return_bounce_recover_active(window_frames=2)
+                    if top_timeout_hold or back_timeout_hold or recent_return_hold or recent_bounce_hold:
                         if top_timeout_hold or back_timeout_hold:
                             print(f"Frame {self.frame_count}: delaying point timeout while waiting for offscreen return")
+                        elif recent_bounce_hold:
+                            last_bounce_frame = getattr(self, '_recent_return_bounce_recover_frame', self.frame_count)
+                            frames_since_bounce = max(0, self.frame_count - last_bounce_frame)
+                            print(
+                                f"Frame {self.frame_count}: delaying point timeout after recent bounce recover "
+                                f"({frames_since_bounce}f ago)"
+                            )
                         else:
                             last_return_frame = getattr(self, '_recent_offscreen_return_frame', self.frame_count)
                             frames_since_return = max(0, self.frame_count - last_return_frame)
@@ -8999,6 +9287,7 @@ class InteractiveBallAnalyzer:
                         reset_tracking_state()
                         continue
                     recent_return_hold = self._recent_offscreen_return_hold_active(window_frames=8)
+                    recent_bounce_hold = self._recent_return_bounce_recover_active(window_frames=2)
                     grace_limit = 45 if point_start_frame and self.frame_count <= (self.start_frame + 45) else 30
                     if recent_return_hold:
                         last_return_frame = getattr(self, '_recent_offscreen_return_frame', self.frame_count)
@@ -9006,6 +9295,14 @@ class InteractiveBallAnalyzer:
                         print(
                             f"Frame {self.frame_count}: delaying lost-ball point end after recent offscreen return "
                             f"re-entry ({frames_since_return}f ago)"
+                        )
+                        continue
+                    if recent_bounce_hold:
+                        last_bounce_frame = getattr(self, '_recent_return_bounce_recover_frame', self.frame_count)
+                        frames_since_bounce = max(0, self.frame_count - last_bounce_frame)
+                        print(
+                            f"Frame {self.frame_count}: delaying lost-ball point end after recent bounce recover "
+                            f"({frames_since_bounce}f ago)"
                         )
                         continue
                     if point_start_frame and (self.frame_count - point_start_frame > grace_limit):
