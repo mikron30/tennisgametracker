@@ -132,6 +132,7 @@ class InteractiveBallAnalyzer:
         self._top_return_reentry_grace_frames = 0
         self._top_return_mode = None
         self._top_return_exit_dx = 0.0
+        self._recent_offscreen_return_frame = -1000000
         self._back_return_wait_frames = 0
         # Court-2 back-return re-entry shows up about 5 frames after the lower-right
         # exit in the validated rally; allow a small cushion, then declare the ball lost.
@@ -1858,6 +1859,10 @@ class InteractiveBallAnalyzer:
             self.ball_center is not None
         )
 
+    def _recent_offscreen_return_hold_active(self, window_frames=8):
+        last_frame = int(getattr(self, '_recent_offscreen_return_frame', -1000000))
+        return (self.frame_count - last_frame) <= max(1, int(window_frames))
+
     def _back_return_reentry_ok(self, pos, area, motion_mean, motion_max, frame_shape):
         """Validate a delayed re-entry from the right/back side after a lower-right exit."""
         anchor = getattr(self, '_back_return_anchor', None)
@@ -2742,6 +2747,113 @@ class InteractiveBallAnalyzer:
             print(f"  DEBUG: Upper-exit low-s fallback selected {best['pos']} via {best['label']} score={best_score:.1f}")
         else:
             print("  DEBUG: Upper-exit low-s fallback found no valid candidate")
+        return best
+
+    def _retrack_recent_return_tiny_hue(self, frame, frame_gray):
+        """Try a tiny local hue recover only for recent offscreen-return bounce frames."""
+        if self.ball_center is None or self.last_motion is None:
+            return None
+        if not self._recent_offscreen_return_hold_active(window_frames=8):
+            return None
+
+        prev_pos = self.ball_center
+        prev_size = float(self.ball_size or 0.0)
+        last_distance = float(self.last_motion.get('distance', 0.0) or 0.0)
+        ref_x, ref_y = prev_pos
+
+        if prev_size > 18.0 or last_distance < 35.0 or last_distance > 75.0:
+            return None
+        if ref_y < 150 or ref_y > 260:
+            return None
+
+        x_radius = 40
+        up_radius = 10
+        down_radius = 55
+        x1 = max(0, ref_x - x_radius)
+        y1 = max(0, ref_y - up_radius)
+        x2 = min(frame.shape[1], ref_x + x_radius + 1)
+        y2 = min(frame.shape[0], ref_y + down_radius + 1)
+        local_frame = frame[y1:y2, x1:x2]
+        if local_frame.size == 0:
+            return None
+
+        hsv_local = cv2.cvtColor(local_frame, cv2.COLOR_BGR2HSV)
+        hint_specs = [
+            (
+                "recent_tiny_center",
+                np.array([148, 10, 80], dtype=np.uint8),
+                np.array([160, 60, 255], dtype=np.uint8),
+                6.0,
+            ),
+            (
+                "recent_tiny_edge",
+                np.array([118, 12, 55], dtype=np.uint8),
+                np.array([122, 60, 245], dtype=np.uint8),
+                0.0,
+            ),
+        ]
+        expected_dy = max(18.0, min(36.0, last_distance * 0.55))
+        best = None
+        best_score = float('inf')
+
+        for label, lower, upper, label_bonus in hint_specs:
+            mask = cv2.inRange(hsv_local, lower, upper)
+            if cv2.countNonZero(mask) == 0:
+                continue
+
+            count, _, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
+            for idx in range(1, count):
+                area = int(stats[idx, cv2.CC_STAT_AREA])
+                if area < 1 or area > 18:
+                    continue
+
+                bbox_w = int(stats[idx, cv2.CC_STAT_WIDTH])
+                bbox_h = int(stats[idx, cv2.CC_STAT_HEIGHT])
+                comp_cx, comp_cy = centroids[idx]
+                cx = int(round(comp_cx)) + x1
+                cy = int(round(comp_cy)) + y1
+                if label == "recent_tiny_center" and area >= 5:
+                    cx = min(frame.shape[1] - 1, cx + min(6, max(0, bbox_w // 4)))
+                    cy = max(0, cy - min(6, max(3, bbox_h + 3)))
+                dx = cx - ref_x
+                dy = cy - ref_y
+                if dy < 8 or dy > 48:
+                    continue
+                if abs(dx) > 28:
+                    continue
+
+                motion_metrics = self._candidate_motion_metrics(frame_gray, cx, cy)
+                motion_mean = motion_metrics['mean'] if motion_metrics is not None else 0.0
+                motion_max = motion_metrics['max'] if motion_metrics is not None else 0.0
+                score = abs(dx) * 2.6
+                score += abs(dy - expected_dy) * 1.5
+                score -= min(12.0, area * 0.8)
+                score -= min(8.0, motion_max * 0.12)
+                score -= label_bonus
+
+                if score < best_score:
+                    best_score = score
+                    best = {
+                        'pos': (cx, cy),
+                        'area': float(area),
+                        'score': score,
+                        'motion_mean': motion_mean,
+                        'motion_max': motion_max,
+                        'filter_key': label,
+                    }
+
+        if best is None:
+            return None
+
+        local_x = max(0, min(local_frame.shape[1] - 1, best['pos'][0] - x1))
+        local_y = max(0, min(local_frame.shape[0] - 1, best['pos'][1] - y1))
+        best['hsv'] = hsv_local[local_y, local_x]
+        print(
+            f"  DEBUG: recent tiny-hue recover selected contour at {best['pos']} "
+            f"area={best['area']:.1f}px score={best['score']:.1f} "
+            f"motion={best['motion_mean']:.1f}/{best['motion_max']:.1f} "
+            f"filter={best['filter_key']}"
+        )
         return best
 
     def verify_ball_with_hsvs(self, frame, predicted_point):
@@ -6034,6 +6146,7 @@ class InteractiveBallAnalyzer:
                               f"reason={top_return_reason}")
                         return self.ball_center
                     accepted_top_return_reentry = True
+                    self._recent_offscreen_return_frame = self.frame_count
                     self._top_return_reentry_grace_frames = max(
                         getattr(self, '_top_return_reentry_grace_frames', 0), 4
                     )
@@ -6057,11 +6170,22 @@ class InteractiveBallAnalyzer:
                               f"reason={back_return_reason}")
                         return self.ball_center
                     accepted_back_return_reentry = True
+                    self._recent_offscreen_return_frame = self.frame_count
                     self._back_return_reentry_grace_frames = max(
                         getattr(self, '_back_return_reentry_grace_frames', 0), 4
                     )
                 static_hotspot = ((selected_area <= 3 and motion_mean < 1.0 and motion_max < 5.0) or
                                   (cy < 100 and motion_mean < 2.5 and motion_max < 10.0))
+                recent_return_static_hold = (
+                    self._recent_offscreen_return_hold_active(window_frames=8) and
+                    actual_distance >= max(
+                        26.0,
+                        (float(self.last_motion.get('distance', 0.0) or 0.0) * 0.40)
+                        if self.last_motion is not None else 26.0
+                    ) and
+                    motion_mean < 4.0 and
+                    motion_max < 18.0
+                )
                 suspicious_upper_static_jump = (
                     actual_distance > max(180.0, frame_width * 0.045) and
                     cy < max(220, int(frame_height * 0.11)) and
@@ -6092,12 +6216,18 @@ class InteractiveBallAnalyzer:
                     actual_distance <= max(90.0, frame_width * 0.025) and
                     cy >= (y_prev - 12)
                 )
-                if static_hotspot or suspicious_upper_static_jump or outside_contact_bounds or frame0_background:
+                if (static_hotspot or recent_return_static_hold or suspicious_upper_static_jump or
+                        outside_contact_bounds or frame0_background):
                     reason = f"static patch mean={motion_mean:.1f} max={motion_max:.1f}"
                     if outside_contact_bounds:
                         reason = (
                             f"upper-contact bounds x={contact_reacquire_bounds['min_x']}-"
                             f"{contact_reacquire_bounds['max_x']} min_y={relaxed_contact_min_y}"
+                        )
+                    elif recent_return_static_hold:
+                        reason = (
+                            f"recent-return static hold dist={actual_distance:.1f} "
+                            f"mean={motion_mean:.1f} max={motion_max:.1f}"
                         )
                     elif suspicious_upper_static_jump:
                         reason = (
@@ -6118,6 +6248,18 @@ class InteractiveBallAnalyzer:
                         reason,
                         source=best_source,
                     )
+                    if recent_return_static_hold:
+                        tiny_hue_recover = self._retrack_recent_return_tiny_hue(frame, frame_gray)
+                        if tiny_hue_recover is not None:
+                            new_pos = tiny_hue_recover['pos']
+                            self.ball_center = new_pos
+                            self.ball_hsv = tiny_hue_recover['hsv']
+                            self.ball_size = tiny_hue_recover['area']
+                            self._activate_regular_hsv()
+                            self.direction_change_streak = 0
+                            self.stuck_frame_count = 0
+                            print(f"Frame {self.frame_count}: [RECENT RETURN TINY-HUE RECOVER] Ball at {new_pos}")
+                            return self.ball_center
                     self._learn_ignored_tracking_position((cx, cy), radius=80, ttl=200, reason=reason)
                     if (self.h10_hsv_lower is not None and self.h10_hsv_upper is not None and
                             self._should_try_h10_recover(frame, predicted_point, allow_inactive)):
@@ -8459,6 +8601,7 @@ class InteractiveBallAnalyzer:
             self._top_return_reentry_grace_frames = 0
             self._top_return_mode = None
             self._top_return_exit_dx = 0.0
+            self._recent_offscreen_return_frame = -1000000
             self._back_return_wait_frames = 0
             self._back_return_anchor = None
             self._back_return_origin_frame = -1
@@ -8751,8 +8894,17 @@ class InteractiveBallAnalyzer:
                         self._back_return_wait_active() or
                         getattr(self, '_back_return_reentry_grace_frames', 0) > 0
                     )
-                    if top_timeout_hold or back_timeout_hold:
-                        print(f"Frame {self.frame_count}: delaying point timeout while waiting for offscreen return")
+                    recent_return_hold = self._recent_offscreen_return_hold_active(window_frames=8)
+                    if top_timeout_hold or back_timeout_hold or recent_return_hold:
+                        if top_timeout_hold or back_timeout_hold:
+                            print(f"Frame {self.frame_count}: delaying point timeout while waiting for offscreen return")
+                        else:
+                            last_return_frame = getattr(self, '_recent_offscreen_return_frame', self.frame_count)
+                            frames_since_return = max(0, self.frame_count - last_return_frame)
+                            print(
+                                f"Frame {self.frame_count}: delaying point timeout after recent offscreen return "
+                                f"re-entry ({frames_since_return}f ago)"
+                            )
                     else:
                         dur = self.frame_count - point_start_frame
                         print(f"[POINT_END] f{self.frame_count}: reason=POINT_TIMEOUT duration={dur}f — returning to serve detection")
@@ -8846,7 +8998,16 @@ class InteractiveBallAnalyzer:
                         game_state = "WAITING_FOR_SERVE"
                         reset_tracking_state()
                         continue
+                    recent_return_hold = self._recent_offscreen_return_hold_active(window_frames=8)
                     grace_limit = 45 if point_start_frame and self.frame_count <= (self.start_frame + 45) else 30
+                    if recent_return_hold:
+                        last_return_frame = getattr(self, '_recent_offscreen_return_frame', self.frame_count)
+                        frames_since_return = max(0, self.frame_count - last_return_frame)
+                        print(
+                            f"Frame {self.frame_count}: delaying lost-ball point end after recent offscreen return "
+                            f"re-entry ({frames_since_return}f ago)"
+                        )
+                        continue
                     if point_start_frame and (self.frame_count - point_start_frame > grace_limit):
                         point_end_frame = self.frame_count
                         print(f"Frame {self.frame_count}: POINT ENDED - Ball lost (likely out of court)")
