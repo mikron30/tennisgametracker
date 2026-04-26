@@ -173,6 +173,8 @@ class InteractiveBallAnalyzer:
         self._white_line_visual_frame_shape = None
         self.net_area_points = []
         self.current_game_state = "WAITING_FOR_SERVE"
+        self.point_end_marker_hold_frames = 10
+        self._ended_point_visual_snapshot = None
         self.recent_bounce_markers = []
         self._last_impact_marker_frame = -1000000
         self._last_impact_marker_pos = None
@@ -398,6 +400,13 @@ class InteractiveBallAnalyzer:
         if self.serve_direction_dy == 0:
             return dy > 12.0
         return self._signed_serve_dy(dy) < -12.0
+
+    def _min_area_for_previous_ball_size(self, prev_size, prev_pos=None, frame_shape=None):
+        """Reject tiny fragments while a close lower-court ball should still be large."""
+        if not prev_size or prev_size <= 40:
+            return 5
+
+        return max(5, int(prev_size * 0.08))
 
     def _serve_direction_search_active(self):
         if not self.serve_directional_search or self.ball_center is None or self.last_motion is None:
@@ -1692,6 +1701,49 @@ class InteractiveBallAnalyzer:
     def _add_bounce_marker(self, point, color, ttl=7):
         self._add_impact_marker(point, kind="ground_bounce", ttl=ttl, color=color)
 
+    def _capture_point_end_visuals(self, end_position=None, hold_frames=None):
+        hold = self.point_end_marker_hold_frames if hold_frames is None else hold_frames
+        hold = max(0, int(hold))
+        if hold <= 0:
+            self._ended_point_visual_snapshot = None
+            return
+
+        pos = end_position if end_position is not None else self.ball_center
+        ball_center = (int(pos[0]), int(pos[1])) if pos is not None else None
+        ball_hsv = self.ball_hsv.copy() if isinstance(self.ball_hsv, np.ndarray) else self.ball_hsv
+        hsv_lower = self.hsv_lower.copy() if isinstance(self.hsv_lower, np.ndarray) else self.hsv_lower
+        hsv_upper = self.hsv_upper.copy() if isinstance(self.hsv_upper, np.ndarray) else self.hsv_upper
+        expires_frame = self.frame_count + hold
+
+        held_markers = []
+        for marker in getattr(self, 'recent_bounce_markers', []):
+            held_marker = dict(marker)
+            held_marker['start_frame'] = self.frame_count
+            held_marker['ttl'] = hold + 1
+            held_marker['expires'] = expires_frame
+            held_markers.append(held_marker)
+
+        self._ended_point_visual_snapshot = {
+            'expires_frame': expires_frame,
+            'ball_center': ball_center,
+            'ball_size': self.ball_size,
+            'ball_hsv': ball_hsv,
+            'hsv_lower': hsv_lower,
+            'hsv_upper': hsv_upper,
+            'direction_change_events': [dict(event) for event in getattr(self, 'direction_change_events', [])],
+            'net_contact_points': [tuple(point) for point in getattr(self, 'net_contact_points', [])],
+            'recent_bounce_markers': held_markers,
+        }
+
+    def _active_point_end_visuals(self):
+        snapshot = getattr(self, '_ended_point_visual_snapshot', None)
+        if not snapshot:
+            return None
+        if self.frame_count <= snapshot.get('expires_frame', -1):
+            return snapshot
+        self._ended_point_visual_snapshot = None
+        return None
+
     def _is_fence_contact_candidate(self, prev_pos, new_pos, frame_shape, dx, dy, angle_jump, speed_ratio):
         if prev_pos is None or self.last_motion is None:
             return False
@@ -2026,6 +2078,44 @@ class InteractiveBallAnalyzer:
             'min_upward': max(85.0, incoming_dy * 0.95),
             'ref_size': max(35.0, min(self.ball_size * 0.30, 130.0)),
         }
+
+    def _large_lower_launch_candidate_ok(self, pos, area, frame_shape):
+        """Recognize the close-ball launch that follows a one-frame lower-court hold."""
+        if self.ball_center is None or self.last_motion is None or self.ball_size is None:
+            return False
+        if self.stuck_frame_count < 1:
+            return False
+
+        frame_height, frame_width = frame_shape[:2]
+        prev_size = float(self.ball_size)
+        origin_x, origin_y = self.ball_center
+        if not (145.0 <= prev_size <= 260.0):
+            return False
+        if not (int(frame_height * 0.48) <= origin_y <= int(frame_height * 0.56)):
+            return False
+
+        incoming_dy = float(self.last_motion.get('dy', 0.0))
+        incoming_dist = float(self.last_motion.get('distance', 0.0))
+        if incoming_dy < max(35.0, frame_height * 0.016) or incoming_dist < 35.0:
+            return False
+
+        cx, cy = pos
+        dx = cx - origin_x
+        dy = cy - origin_y
+        launch_dist = math.hypot(dx, dy)
+        upward_progress = origin_y - cy
+        min_area = max(95.0, min(155.0, prev_size * 0.50))
+        min_upward = max(120.0, incoming_dy * 2.2)
+        min_launch_dist = max(115.0, incoming_dist * 2.0)
+        max_launch_dist = max(360.0, incoming_dist * 6.0)
+        lateral_cap = max(180.0, frame_width * 0.05)
+
+        return (
+            area >= min_area and
+            upward_progress >= min_upward and
+            min_launch_dist <= launch_dist <= max_launch_dist and
+            abs(dx) <= lateral_cap
+        )
 
     def _get_ground_bounce_context(self, frame_shape, allow_near_net=False):
         """Predict a short upward continuation after a court bounce using ball-only motion."""
@@ -2365,9 +2455,11 @@ class InteractiveBallAnalyzer:
 
             # Reject tiny noise when ball was previously much larger.
             if self.ball_size and self.ball_size > 40:
-                min_area = max(5, int(self.ball_size * 0.08))
+                frame_shape = frame_gray.shape if frame_gray is not None else None
+                min_area = self._min_area_for_previous_ball_size(self.ball_size, prev_pos, frame_shape)
                 if area < min_area:
-                    print(f"  DEBUG: retrack_using_alt skipping too-small contour area={area:.1f} prev_ball_size={self.ball_size:.1f}")
+                    print(f"  DEBUG: retrack_using_alt skipping too-small contour area={area:.1f} "
+                          f"prev_ball_size={self.ball_size:.1f} min_area={min_area}")
                     continue
 
             M = cv2.moments(contour)
@@ -2523,9 +2615,11 @@ class InteractiveBallAnalyzer:
                     continue
 
             if self.ball_size and self.ball_size > 40:
-                min_area = max(5, int(self.ball_size * 0.08))
+                frame_shape = frame_gray.shape if frame_gray is not None else None
+                min_area = self._min_area_for_previous_ball_size(self.ball_size, prev_pos, frame_shape)
                 if area < min_area:
-                    print(f"  DEBUG: retrack_using_alt2 skipping too-small contour area={area:.1f} prev_ball_size={self.ball_size:.1f}")
+                    print(f"  DEBUG: retrack_using_alt2 skipping too-small contour area={area:.1f} "
+                          f"prev_ball_size={self.ball_size:.1f} min_area={min_area}")
                     continue
 
             M = cv2.moments(contour)
@@ -4724,15 +4818,11 @@ class InteractiveBallAnalyzer:
             # Skip candidates far outside the expected travel range — prevents jumping to
             # unrelated corners or edges that happen to match ball colour.
             if dist_from_stuck > _max_reacq_dist:
-                print(f"  DEBUG: [REACQ] SKIPPED distant blob at ({mx},{my}) dist={dist_from_stuck:.0f}px > cap={_max_reacq_dist:.0f}px")
                 continue
 
             if contact_bounds is not None:
                 if (mx < contact_bounds['min_x'] or mx > contact_bounds['max_x'] or
                         my < contact_bounds['min_y'] or my > contact_bounds['max_y']):
-                    print(f"  DEBUG: [REACQ] SKIPPED contact-phase blob at ({mx},{my}) outside "
-                          f"x={contact_bounds['min_x']}-{contact_bounds['max_x']} "
-                          f"y={contact_bounds['min_y']}-{contact_bounds['max_y']}")
                     continue
 
             # Hard-reject frame-edge artifacts: the tennis ball is always inside the court,
@@ -5736,6 +5826,7 @@ class InteractiveBallAnalyzer:
         best_contour = None
         best_score = float('inf')
         best_source = None
+        large_lower_launch_override = False
         candidates = []
         candidate_meta = []
         upper_exit_transition_context = (
@@ -5787,8 +5878,10 @@ class InteractiveBallAnalyzer:
                     not top_return_search_context and not top_return_reentry_grace and
                     not back_return_search_context and not back_return_reentry_grace and
                     self.ball_size and self.ball_size > 40 and
-                    area < max(5, int(self.ball_size * 0.08))):
-                print(f"  DEBUG: Contour {i} REJECTED - area={area:.1f}px (too small relative to previous ball size {self.ball_size:.1f}px)")
+                    area < self._min_area_for_previous_ball_size(self.ball_size, self.ball_center, frame.shape)):
+                min_area = self._min_area_for_previous_ball_size(self.ball_size, self.ball_center, frame.shape)
+                print(f"  DEBUG: Contour {i} REJECTED - area={area:.1f}px "
+                      f"(too small relative to previous ball size {self.ball_size:.1f}px, min_area={min_area})")
                 continue
 
             # Additional reject: belt-and-suspenders guard in case allow_inactive fell through
@@ -6264,6 +6357,26 @@ class InteractiveBallAnalyzer:
                 best_contour = continuation_meta['contour']
                 best_source = continuation_meta['source']
                 best_score = continuation_meta['score']
+            large_launch_candidates = [
+                meta for meta in candidate_meta
+                if self._large_lower_launch_candidate_ok(meta['pos'], meta['area'], frame.shape)
+            ]
+            if large_launch_candidates:
+                launch_meta = max(
+                    large_launch_candidates,
+                    key=lambda meta: (meta['area'], meta['motion_max'], -meta['score'])
+                )
+                best_contour = launch_meta['contour']
+                best_source = launch_meta['source']
+                best_score = launch_meta['score']
+                large_lower_launch_override = True
+                print(
+                    f"  DEBUG: [LARGE-LOWER-LAUNCH] prioritizing candidate at "
+                    f"{launch_meta['pos']} area={launch_meta['area']:.1f}px "
+                    f"score={launch_meta['score']:.1f} motion="
+                    f"{launch_meta['motion_mean']:.1f}/{launch_meta['motion_max']:.1f} "
+                    f"source={launch_meta['source']}"
+                )
 
         # Early-serve bias: when starting and no previous ball, favor the highest (smallest y) valid contour
         if self.ball_center is None and self.frame_count <= self.start_frame + 10 and candidates:
@@ -6714,6 +6827,7 @@ class InteractiveBallAnalyzer:
                         best_contour = regular_single["contour"]
                         best_source = "regular"
                         best_score = regular_single["score"]
+                        large_lower_launch_override = False
                         cx, cy = regular_single["pos"]
                         self._activate_regular_hsv()
                         print(
@@ -6767,6 +6881,7 @@ class InteractiveBallAnalyzer:
             if (not serve_contact_grace and not rally_contact_grace and not ground_bounce_grace and not serve_direction_search
                     and lower_contact_launch_context is None and not _in_post_reacq and self.last_motion
                     and not skip_upper_wall_override and not upper_contact_turn_commit
+                    and not large_lower_launch_override
                     and not accepted_top_return_reentry and not top_return_reentry_grace
                     and not accepted_back_return_reentry and not back_return_reentry_grace
                     and self.ball_center and self.stuck_frame_count < 5):
@@ -7150,6 +7265,9 @@ class InteractiveBallAnalyzer:
                         launch_dist <= lower_contact_launch_context['max_launch_dist'] and
                         expected_distance <= max(140, int(frame_width * 0.04))
                     )
+                large_lower_launch_candidate = self._large_lower_launch_candidate_ok(
+                    (cx, cy), bulb_size, frame.shape
+                )
                 ground_bounce_candidate = False
                 if ground_bounce_context is not None and self.ball_center is not None:
                     origin_x, origin_y = ground_bounce_context['origin']
@@ -7220,7 +7338,8 @@ class InteractiveBallAnalyzer:
 
                 impact_event = None
                 if (hold_change_detected and not predicted_turn_candidate and not predicted_continuation_candidate
-                        and not lower_contact_launch_candidate and not ground_bounce_candidate
+                        and not lower_contact_launch_candidate and not large_lower_launch_candidate
+                        and not ground_bounce_candidate
                         and not recent_bounce_reversal_candidate and not recent_bounce_regular_candidate):
                     self.direction_change_streak += 1
                     max_hold = 2 if near_net else 3
@@ -7253,7 +7372,8 @@ class InteractiveBallAnalyzer:
                             and not predicted_continuation_candidate and not recent_bounce_reversal_candidate
                             and not recent_bounce_regular_candidate):
                         strong_x_reversal = (self.last_motion['dx'] * dx) < -12 if self.last_motion is not None else False
-                        if lower_contact_launch_candidate or strong_x_reversal or angle_jump >= 120 or speed_ratio > 1.8:
+                        if (lower_contact_launch_candidate or large_lower_launch_candidate or
+                                strong_x_reversal or angle_jump >= 120 or speed_ratio > 1.8):
                             if self.ground_bounce_count > 0:
                                 print(f"Frame {self.frame_count}: Resetting bounce count after non-bounce shot change")
                             self.ground_bounce_count = 0
@@ -7289,6 +7409,22 @@ class InteractiveBallAnalyzer:
                             'label': 'racket contact',
                         }
                         print(f"Frame {self.frame_count}: Allowing lower-racket contact launch")
+                    elif change_detected and large_lower_launch_candidate:
+                        launch_origin = self.ball_center
+                        self._rally_contact_grace_frames = max(getattr(self, '_rally_contact_grace_frames', 0), 3)
+                        self._rally_contact_ref_size = max(40.0, min(float(bulb_size), 140.0))
+                        self._rally_contact_origin = launch_origin
+                        self._rally_contact_expected = (cx, cy)
+                        self._rally_contact_progress = math.hypot(
+                            cx - launch_origin[0],
+                            cy - launch_origin[1],
+                        )
+                        impact_event = {
+                            'kind': 'racket_contact',
+                            'point': launch_origin,
+                            'label': 'large lower-court launch',
+                        }
+                        print(f"Frame {self.frame_count}: Allowing large lower-court launch")
                     elif change_detected and ground_bounce_candidate:
                         self._register_ground_bounce_from_context(
                             ground_bounce_context, frame, source_label="predicted launch"
@@ -7812,31 +7948,46 @@ class InteractiveBallAnalyzer:
         if game_state is None:
             game_state = getattr(self, 'current_game_state', None)
 
-        if self.ball_center:
+        point_end_visuals = self._active_point_end_visuals()
+        use_point_end_visuals = point_end_visuals if self.ball_center is None else None
+        visual_ball_center = self.ball_center
+        visual_ball_hsv = self.ball_hsv
+        visual_ball_size = self.ball_size
+        visual_hsv_lower = self.hsv_lower
+        visual_hsv_upper = self.hsv_upper
+        if use_point_end_visuals is not None:
+            visual_ball_center = use_point_end_visuals.get('ball_center')
+            visual_ball_hsv = use_point_end_visuals.get('ball_hsv')
+            visual_ball_size = use_point_end_visuals.get('ball_size')
+            visual_hsv_lower = use_point_end_visuals.get('hsv_lower')
+            visual_hsv_upper = use_point_end_visuals.get('hsv_upper')
+
+        if visual_ball_center:
             # Scale ball coordinates for display
-            x = int(self.ball_center[0] * scale)
-            y = int(self.ball_center[1] * scale)
+            x = int(visual_ball_center[0] * scale)
+            y = int(visual_ball_center[1] * scale)
             
             # Draw green circle around the ball
             cv2.circle(result, (x, y), 10, (0, 255, 0), 2)  # Circle outline
             cv2.circle(result, (x, y), 2, (0, 255, 0), -1)  # Center dot
             
             # Draw info text at the top
-            if self.ball_hsv is not None and self.ball_size is not None:
+            if visual_ball_hsv is not None and visual_ball_size is not None:
                 # Show current HSV values at clicked point
-                hsv_text = f"Ball HSV: H={self.ball_hsv[0]}, S={self.ball_hsv[1]}, V={self.ball_hsv[2]}"
+                hsv_text = f"Ball HSV: H={visual_ball_hsv[0]}, S={visual_ball_hsv[1]}, V={visual_ball_hsv[2]}"
                 cv2.putText(result, hsv_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
                 
                 # Show HSV filter range
-                filter_text = f"Filter: H={self.hsv_lower[0]}-{self.hsv_upper[0]}, S={self.hsv_lower[1]}-{self.hsv_upper[1]}, V={self.hsv_lower[2]}-{self.hsv_upper[2]}"
-                cv2.putText(result, filter_text, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                if visual_hsv_lower is not None and visual_hsv_upper is not None:
+                    filter_text = f"Filter: H={visual_hsv_lower[0]}-{visual_hsv_upper[0]}, S={visual_hsv_lower[1]}-{visual_hsv_upper[1]}, V={visual_hsv_lower[2]}-{visual_hsv_upper[2]}"
+                    cv2.putText(result, filter_text, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
                 
                 # Show bulb size
-                size_text = f"Bulb Size: {self.ball_size:.0f}px"
+                size_text = f"Bulb Size: {visual_ball_size:.0f}px"
                 cv2.putText(result, size_text, (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
                 
                 # Show ball position
-                pos_text = f"Ball Pos: ({self.ball_center[0]}, {self.ball_center[1]})"
+                pos_text = f"Ball Pos: ({visual_ball_center[0]}, {visual_ball_center[1]})"
                 cv2.putText(result, pos_text, (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
         waiting_candidate = getattr(self, 'waiting_serve_candidate', None)
@@ -7853,13 +8004,18 @@ class InteractiveBallAnalyzer:
         if getattr(self, 'show_event_markers', False):
             good_events = []
             problematic_events = []
-            for event in getattr(self, 'direction_change_events', []):
+            direction_events = getattr(self, 'direction_change_events', [])
+            net_points = getattr(self, 'net_contact_points', [])
+            if use_point_end_visuals is not None:
+                direction_events = use_point_end_visuals.get('direction_change_events', [])
+                net_points = use_point_end_visuals.get('net_contact_points', [])
+            for event in direction_events:
                 point = event.get('pos')
                 if point is None:
                     continue
-                if self.ball_center is not None and math.hypot(
-                    point[0] - self.ball_center[0],
-                    point[1] - self.ball_center[1],
+                if visual_ball_center is not None and math.hypot(
+                    point[0] - visual_ball_center[0],
+                    point[1] - visual_ball_center[1],
                 ) <= 12:
                     continue
                 is_good = event.get('status') == 'good'
@@ -7883,7 +8039,7 @@ class InteractiveBallAnalyzer:
                 else:
                     problematic_events.append(event)
             # Draw net contact points
-            for point in self.net_contact_points:
+            for point in net_points:
                 px = int(point[0] * scale)
                 py = int(point[1] * scale)
                 cv2.circle(result, (px, py), 12, (0, 0, 255), 3)
@@ -7904,7 +8060,10 @@ class InteractiveBallAnalyzer:
                 cv2.putText(result, label, (col_x2, yy), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 0, 255), 1)
 
         self._prune_bounce_markers()
-        for marker in getattr(self, 'recent_bounce_markers', []):
+        bounce_markers = getattr(self, 'recent_bounce_markers', [])
+        if use_point_end_visuals is not None:
+            bounce_markers = use_point_end_visuals.get('recent_bounce_markers', [])
+        for marker in bounce_markers:
             point = marker.get('pos')
             base_color = marker.get('color', (255, 0, 0))
             if point is None:
@@ -9116,7 +9275,9 @@ class InteractiveBallAnalyzer:
         scale_factor = 1.0
         current_frame = None
         
-        def reset_tracking_state():
+        def reset_tracking_state(hold_end_marker=False, end_position=None):
+            if hold_end_marker:
+                self._capture_point_end_visuals(end_position=end_position)
             self.tracking = False
             self.ball_stopped = False
             self.ball_center = None
@@ -9486,7 +9647,7 @@ class InteractiveBallAnalyzer:
                         dur = self.frame_count - point_start_frame
                         print(f"[POINT_END] f{self.frame_count}: reason=POINT_TIMEOUT duration={dur}f — returning to serve detection")
                         game_state = "WAITING_FOR_SERVE"
-                        reset_tracking_state()
+                        reset_tracking_state(hold_end_marker=True)
 
                 # Track ball through the point
                 tracked_position = None
@@ -9532,7 +9693,7 @@ class InteractiveBallAnalyzer:
                         print(f"Point duration: {dur} frames")
                         print(f"[POINT_END] f{self.frame_count}: reason={pending_reason} duration={dur}f pos={tracked_position} vel={vel:.1f}px vel_hist={vel_hist_tail}")
                         game_state = "WAITING_FOR_SERVE"
-                        reset_tracking_state()
+                        reset_tracking_state(hold_end_marker=True, end_position=tracked_position)
                         continue
 
                     # Stuck-ball timeout: if ball hasn't moved for 15+ frames, end point
@@ -9543,7 +9704,7 @@ class InteractiveBallAnalyzer:
                         print(f"Point duration: {dur} frames")
                         print(f"[POINT_END] f{self.frame_count}: reason=STUCK_TIMEOUT stuck={self.stuck_frame_count} duration={dur}f pos={tracked_position}")
                         game_state = "WAITING_FOR_SERVE"
-                        reset_tracking_state()
+                        reset_tracking_state(hold_end_marker=True, end_position=tracked_position)
                     elif self.stuck_frame_count >= 15 and self._top_return_wait_active():
                         self.stuck_frame_count = 4
                         print(f"Frame {self.frame_count}: [TOP-RETURN WAIT] suppressing stuck timeout while waiting for delayed re-entry")
@@ -9566,7 +9727,7 @@ class InteractiveBallAnalyzer:
                                 game_state = "WAITING_FOR_SERVE"
                             else:
                                 game_state = "POINT_ENDED"
-                            reset_tracking_state()
+                            reset_tracking_state(hold_end_marker=True, end_position=tracked_position)
                         else:
                             print(f"Frame {self.frame_count}: Ball tracking continued")
                 else:
@@ -9578,7 +9739,7 @@ class InteractiveBallAnalyzer:
                         print(f"Point duration: {dur} frames")
                         print(f"[POINT_END] f{self.frame_count}: reason=BACK_RETURN_TIMEOUT duration={dur}f")
                         game_state = "WAITING_FOR_SERVE"
-                        reset_tracking_state()
+                        reset_tracking_state(hold_end_marker=True)
                         continue
                     recent_return_hold = self._recent_offscreen_return_hold_active(window_frames=8)
                     recent_bounce_hold = self._recent_return_bounce_recover_active(window_frames=2)
@@ -9610,7 +9771,7 @@ class InteractiveBallAnalyzer:
                                 self.open_predicted_hsv_debug_all(frame, predicted_point, self.frame_count)
                                 self.pause_requested = True
                         game_state = "WAITING_FOR_SERVE"
-                        reset_tracking_state()
+                        reset_tracking_state(hold_end_marker=True)
             
             elif game_state == "POINT_ENDED":
                 # Wait a few frames then start scanning for next serve
