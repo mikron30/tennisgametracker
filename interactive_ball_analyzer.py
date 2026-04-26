@@ -160,6 +160,8 @@ class InteractiveBallAnalyzer:
         self._debug_contour_candidates = []
         self._debug_rejected_contours = []
         self._deferred_motion_anchor = None
+        self._last_motion_reacq_frame = -1000000
+        self._last_motion_reacq_pos = None
         self.last_nonzero_motion = None
         self._singles_sideline_model = None
         self._singles_sideline_frame_shape = None
@@ -5049,6 +5051,8 @@ class InteractiveBallAnalyzer:
                         self.stuck_frame_count = 0
                         self._recent_max_ball_size = 0
                         self.ball_center = reacq_pos
+                        self._last_motion_reacq_frame = self.frame_count
+                        self._last_motion_reacq_pos = reacq_pos
                         self._prev_frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                         # After re-acquisition the serve hit may cause a large jump in the
                         # very next frames.  Arm a wide-search window so the tracker can
@@ -5333,19 +5337,21 @@ class InteractiveBallAnalyzer:
                     and self.stuck_frame_count < 5
                     and hasattr(self, '_prev_frame_gray') and self._prev_frame_gray is not None):
                 saved_prev_gray = self._prev_frame_gray.copy()
+                prev_reacq_center = self.ball_center
                 reacq_pos = self._reacquire_ball_by_motion(frame)
                 if reacq_pos is not None:
                     self.ball_center = reacq_pos
                     self.ball_size = None
                     hsv_full = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
                     self.ball_hsv = hsv_full[reacq_pos[1], reacq_pos[0]]
-                    self.ball_velocity_history = []
-                    self.last_motion = None
-                    self.last_direction = None
+                    self.prev_motion = self.last_motion
+                    self._update_recovered_motion(prev_reacq_center, reacq_pos)
                     self.direction_change_streak = 0
                     self.stuck_frame_count = 0
                     self._recent_max_ball_size = 0
                     self._post_reacq_frames = max(getattr(self, '_post_reacq_frames', 0), 3)
+                    self._last_motion_reacq_frame = self.frame_count
+                    self._last_motion_reacq_pos = reacq_pos
                     print(f"Frame {self.frame_count}: [EARLY MOTION REACQ] Ball at {reacq_pos}")
                     return self.ball_center
                 self._prev_frame_gray = saved_prev_gray
@@ -6617,10 +6623,23 @@ class InteractiveBallAnalyzer:
                 (self.ball_size is None or self.ball_size <= 35) and
                 self._recent_return_bounce_recover_active(window_frames=2)
             )
-            if (not allow_inactive and self.ball_center is not None and contact_reacquire_bounds is not None
-                    and self.ball_center[1] <= 260
-                    and (self.ball_size is None or self.ball_size <= 35)
-                    and (best_source == "alt6" or recent_bounce_regular_precedence_context)):
+            lower_bounce_regular_precedence_context = (
+                not allow_inactive and
+                self.ball_center is not None and
+                ground_bounce_context is not None and
+                self.ball_size is not None and
+                self.ball_size >= 60.0 and
+                self.last_motion is not None and
+                self.last_motion.get('dy', 0.0) >= max(35.0, frame.shape[0] * 0.018) and
+                self.ball_center[1] >= max(700, int(frame.shape[0] * 0.34)) and
+                selected_area_for_precedence <= max(30.0, float(self.ball_size) * 0.40)
+            )
+            if (not allow_inactive and self.ball_center is not None and
+                    ((contact_reacquire_bounds is not None and
+                      self.ball_center[1] <= 260 and
+                      (self.ball_size is None or self.ball_size <= 35) and
+                      (best_source == "alt6" or recent_bounce_regular_precedence_context)) or
+                     lower_bounce_regular_precedence_context)):
                 regular_single = self._find_single_standard_candidate(
                     search_frame, x1, y1, self.ball_center, predicted_point, frame_gray
                 )
@@ -6671,8 +6690,27 @@ class InteractiveBallAnalyzer:
                                 regular_predicted_distance + 8.0 <= current_predicted_distance
                             )
                         )
+                    if (not use_regular_precedence and lower_bounce_regular_precedence_context):
+                        last_distance = 0.0
+                        if self.last_motion is not None:
+                            last_distance = float(self.last_motion.get('distance', 0.0) or 0.0)
+                        regular_dx = regular_single["pos"][0] - self.ball_center[0]
+                        regular_dy = regular_single["pos"][1] - self.ball_center[1]
+                        current_dx = cx - self.ball_center[0]
+                        current_dy = cy - self.ball_center[1]
+                        use_regular_precedence = (
+                            regular_single["area"] >= max(18.0, selected_area_for_precedence * 3.0) and
+                            regular_dx <= min(-25.0, current_dx - 10.0) and
+                            regular_dy >= max(40.0, current_dy + 10.0) and
+                            regular_single["distance"] >= current_distance + 18.0 and
+                            regular_single["distance"] <= max(150.0, last_distance * 2.2) and
+                            regular_single["score"] <= best_score + 80.0
+                        )
                     if use_regular_precedence:
-                        precedence_label = "REGULAR PRECEDENCE" if best_source == "alt6" else "RECENT BOUNCE REGULAR PRECEDENCE"
+                        if lower_bounce_regular_precedence_context:
+                            precedence_label = "LOWER BOUNCE REGULAR PRECEDENCE"
+                        else:
+                            precedence_label = "REGULAR PRECEDENCE" if best_source == "alt6" else "RECENT BOUNCE REGULAR PRECEDENCE"
                         best_contour = regular_single["contour"]
                         best_source = "regular"
                         best_score = regular_single["score"]
@@ -6721,7 +6759,6 @@ class InteractiveBallAnalyzer:
                 direction_deg = math.degrees(math.atan2(dy, dx))
             else:
                 velocity = 0
-            
             # If direction/speed look wrong, try alternative HSV before committing
             # Skip this during full-frame scan recovery - ball direction changed after player hit.
             # Also skip during post-reacquire window: the serve contact can instantly reverse
@@ -8876,6 +8913,8 @@ class InteractiveBallAnalyzer:
             return False, None
         if not hasattr(self, 'net_area_y_min'):
             return False, None
+        if getattr(self, '_last_motion_reacq_frame', -1000000) == self.frame_count:
+            return False, None
 
         x, y = ball_position
         curr_dx = float(self.last_motion.get('dx', 0.0) or 0.0)
@@ -9463,11 +9502,16 @@ class InteractiveBallAnalyzer:
                     if tracked_position and prev_ball_center:
                         jump = math.hypot(tracked_position[0] - prev_ball_center[0],
                                           tracked_position[1] - prev_ball_center[1])
+                        motion_reacq_this_frame = (
+                            getattr(self, '_last_motion_reacq_frame', -1000000) == self.frame_count and
+                            getattr(self, '_last_motion_reacq_pos', None) == tracked_position
+                        )
                         # Allow a larger jump when re-acquiring after being stuck for 5+ frames:
                         # a racket hit can send the ball 800+ px in one frame, so we use 1500px
                         # to let motion-based re-acquisition recover across the full court.
                         max_jump = 1500 if (
-                            prev_stuck >= 5 or prev_top_return_wait or prev_back_return_wait
+                            prev_stuck >= 5 or prev_top_return_wait or prev_back_return_wait or
+                            motion_reacq_this_frame
                         ) else 400
                         if jump > max_jump:
                             print(f"[JUMP_REJECTED] f{self.frame_count}: jumped {jump:.0f}px from {prev_ball_center} to {tracked_position} (limit={max_jump}px, prev_stuck={prev_stuck}), keeping previous")
