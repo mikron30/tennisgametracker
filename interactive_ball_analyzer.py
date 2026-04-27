@@ -162,6 +162,8 @@ class InteractiveBallAnalyzer:
         self._deferred_motion_anchor = None
         self._last_motion_reacq_frame = -1000000
         self._last_motion_reacq_pos = None
+        self._upper_slow_arc_until_frame = -1
+        self._upper_fence_fall_frames = 0
         self.last_nonzero_motion = None
         self._singles_sideline_model = None
         self._singles_sideline_frame_shape = None
@@ -1399,6 +1401,19 @@ class InteractiveBallAnalyzer:
                 f"override area {override.get('area', 0.0):.1f}px too small vs current {current_area:.1f}px"
             )
             return False
+        if self._upper_slow_arc_active() and override_much_smaller and current_dynamic:
+            current_close_to_track = current_metrics['prev_distance'] <= 20.0
+            current_close_to_prediction = (
+                predicted_point is None or
+                current_metrics['predicted_distance'] is None or
+                current_metrics['predicted_distance'] <= 32.0
+            )
+            if current_close_to_track and current_close_to_prediction:
+                print(
+                    f"  DEBUG: Rejecting {label} override at {override['pos']} - "
+                    f"keeping dynamic same-track candidate {current_pos}"
+                )
+                return False
 
         if label == "alts9_11":
             current_jump = current_metrics['prev_distance'] >= 55.0
@@ -2117,6 +2132,87 @@ class InteractiveBallAnalyzer:
             abs(dx) <= lateral_cap
         )
 
+    def _upper_slow_arc_active(self):
+        return self.frame_count <= getattr(self, '_upper_slow_arc_until_frame', -1)
+
+    def _upper_fence_fall_end_candidate(self, ball_position, frame_shape):
+        if ball_position is None or self.last_motion is None:
+            self._upper_fence_fall_frames = 0
+            return False
+        if not self._upper_slow_arc_active():
+            self._upper_fence_fall_frames = 0
+            return False
+
+        frame_height, frame_width = frame_shape[:2]
+        x, y = ball_position
+        upper_fence_y_min = max(150, int(frame_height * 0.070))
+        upper_fence_y_max = max(205, int(frame_height * 0.095))
+        lane_min_x = int(frame_width * 0.35)
+        lane_max_x = int(frame_width * 0.70)
+
+        ball_size = float(self.ball_size or 0.0)
+        speed = float(self.last_motion.get('distance', 0.0) or 0.0)
+        dy = float(self.last_motion.get('dy', 0.0) or 0.0)
+        in_upper_fence_band = (
+            lane_min_x <= x <= lane_max_x and
+            upper_fence_y_min <= y <= upper_fence_y_max
+        )
+        tiny_visible_ball = 3.0 <= ball_size <= 16.0
+        settled_or_falling = (speed <= 6.5 and dy >= -3.0) or getattr(self, 'stuck_frame_count', 0) >= 1
+
+        if not (in_upper_fence_band and tiny_visible_ball and settled_or_falling):
+            self._upper_fence_fall_frames = 0
+            return False
+
+        self._upper_fence_fall_frames += 1
+        if self._upper_fence_fall_frames < 2:
+            return False
+
+        self._add_impact_marker(
+            ball_position,
+            kind="fence_contact",
+            ttl=12,
+            label="upper fence / ball fell down",
+        )
+        print(
+            f"Frame {self.frame_count}: [UPPER FENCE FALL] "
+            f"pos={ball_position} size={ball_size:.1f}px speed={speed:.1f}px dy={dy:.1f}"
+        )
+        return True
+
+    def _upper_slow_arc_candidate_ok(self, pos, area, velocity, predicted_point, frame_shape, frame_gray=None):
+        """Allow tiny upper-court flight changes near the visible apex without freezing."""
+        if not self._upper_slow_arc_active():
+            return False
+        if self.ball_center is None or self.last_motion is None or self.ball_size is None:
+            return False
+
+        frame_height, frame_width = frame_shape[:2]
+        origin_x, origin_y = self.ball_center
+        cx, cy = pos
+        if not (max(180, int(frame_height * 0.10)) <= origin_y <= max(360, int(frame_height * 0.18))):
+            return False
+        if not (max(180, int(frame_height * 0.10)) <= cy <= max(360, int(frame_height * 0.18))):
+            return False
+        if self.ball_size > 90 or area < max(5.0, min(float(self.ball_size) * 0.25, 12.0)):
+            return False
+
+        last_dist = float(self.last_motion.get('distance', 0.0) or 0.0)
+        if last_dist > 18.0 or velocity > 22.0:
+            return False
+        if abs(cx - origin_x) > max(18.0, frame_width * 0.006):
+            return False
+
+        if predicted_point is not None:
+            predicted_distance = math.hypot(cx - predicted_point[0], cy - predicted_point[1])
+            if predicted_distance > max(34.0, last_dist * 4.0 + 12.0):
+                return False
+
+        motion_metrics = self._candidate_motion_metrics(frame_gray, cx, cy)
+        if motion_metrics is None:
+            return True
+        return motion_metrics['max'] >= 35.0 or motion_metrics['mean'] >= 8.0
+
     def _get_ground_bounce_context(self, frame_shape, allow_near_net=False):
         """Predict a short upward continuation after a court bounce using ball-only motion."""
         if self.ball_center is None or self.last_motion is None or self.ball_size is None:
@@ -2130,8 +2226,24 @@ class InteractiveBallAnalyzer:
 
         if self.ball_size > 180:
             return None
-        if incoming_dy < max(6.0, frame_height * 0.0035):
-            return None
+        min_incoming_dy = max(6.0, frame_height * 0.0035)
+        if incoming_dy < min_incoming_dy:
+            prev_dy = float(self.prev_motion.get('dy', 0.0)) if self.prev_motion is not None else 0.0
+            prev_dx = float(self.prev_motion.get('dx', 0.0)) if self.prev_motion is not None else 0.0
+            prev_dist = float(self.prev_motion.get('distance', 0.0)) if self.prev_motion is not None else 0.0
+            upper_soft_bounce = (
+                self._upper_slow_arc_active() and
+                self.ball_size <= 90 and
+                origin_y <= max(360, int(frame_height * 0.18)) and
+                incoming_dy >= 1.0 and
+                prev_dy >= min_incoming_dy and
+                prev_dist >= min_incoming_dy
+            )
+            if not upper_soft_bounce:
+                return None
+            incoming_dx = (incoming_dx + prev_dx) * 0.5
+            incoming_dy = max(incoming_dy, prev_dy * 0.75)
+            incoming_dist = max(incoming_dist, prev_dist * 0.75)
         if incoming_dist < 6.0:
             return None
         if self.prev_motion is not None and self.prev_motion.get('dy', 0.0) < max(3.0, frame_height * 0.002):
@@ -6835,6 +6947,37 @@ class InteractiveBallAnalyzer:
                             f"Using single regular candidate at ({cx}, {cy})"
                         )
 
+            if (self._upper_slow_arc_active() and best_contour is not None and candidate_meta and
+                    self.ball_size is not None and self.ball_size <= 90):
+                selected_meta = None
+                for meta in candidate_meta:
+                    if meta['contour'] is best_contour:
+                        selected_meta = meta
+                        break
+                if selected_meta is not None and selected_meta['area'] <= max(3.0, float(self.ball_size) * 0.18):
+                    nearby_larger = [
+                        meta for meta in candidate_meta
+                        if (
+                            meta is not selected_meta and
+                            math.hypot(
+                                meta['pos'][0] - selected_meta['pos'][0],
+                                meta['pos'][1] - selected_meta['pos'][1],
+                            ) <= 8.0 and
+                            meta['distance'] <= selected_meta['distance'] + 8.0 and
+                            meta['area'] >= max(6.0, selected_meta['area'] * 4.0)
+                        )
+                    ]
+                    if nearby_larger:
+                        larger_meta = max(nearby_larger, key=lambda meta: (meta['area'], -meta['score']))
+                        best_contour = larger_meta['contour']
+                        best_source = larger_meta['source']
+                        best_score = larger_meta['score']
+                        cx, cy = larger_meta['pos']
+                        print(
+                            f"  DEBUG: [SAME-SPOT SIZE PREF] using larger candidate at ({cx},{cy}) "
+                            f"area={larger_meta['area']:.1f}px over {selected_meta['area']:.1f}px fragment"
+                        )
+
             # Get HSV values at new position
             hsv_values = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)[cy, cx]
             bulb_size = selected_override['area'] if selected_override is not None else cv2.contourArea(best_contour)
@@ -7268,6 +7411,9 @@ class InteractiveBallAnalyzer:
                 large_lower_launch_candidate = self._large_lower_launch_candidate_ok(
                     (cx, cy), bulb_size, frame.shape
                 )
+                upper_slow_arc_candidate = self._upper_slow_arc_candidate_ok(
+                    (cx, cy), bulb_size, velocity, predicted_point, frame.shape, frame_gray=frame_gray
+                )
                 ground_bounce_candidate = False
                 if ground_bounce_context is not None and self.ball_center is not None:
                     origin_x, origin_y = ground_bounce_context['origin']
@@ -7339,7 +7485,7 @@ class InteractiveBallAnalyzer:
                 impact_event = None
                 if (hold_change_detected and not predicted_turn_candidate and not predicted_continuation_candidate
                         and not lower_contact_launch_candidate and not large_lower_launch_candidate
-                        and not ground_bounce_candidate
+                        and not upper_slow_arc_candidate and not ground_bounce_candidate
                         and not recent_bounce_reversal_candidate and not recent_bounce_regular_candidate):
                     self.direction_change_streak += 1
                     max_hold = 2 if near_net else 3
@@ -7369,8 +7515,8 @@ class InteractiveBallAnalyzer:
                         return self.ball_center
                 else:
                     if (change_detected and not ground_bounce_candidate and not predicted_turn_candidate
-                            and not predicted_continuation_candidate and not recent_bounce_reversal_candidate
-                            and not recent_bounce_regular_candidate):
+                            and not predicted_continuation_candidate and not upper_slow_arc_candidate
+                            and not recent_bounce_reversal_candidate and not recent_bounce_regular_candidate):
                         strong_x_reversal = (self.last_motion['dx'] * dx) < -12 if self.last_motion is not None else False
                         if (lower_contact_launch_candidate or large_lower_launch_candidate or
                                 strong_x_reversal or angle_jump >= 120 or speed_ratio > 1.8):
@@ -7382,6 +7528,8 @@ class InteractiveBallAnalyzer:
                         print(f"Frame {self.frame_count}: Allowing upper-flight turn near predicted path")
                     elif change_detected and predicted_continuation_candidate:
                         print(f"Frame {self.frame_count}: Allowing predicted-path continuation after speed drop")
+                    elif change_detected and upper_slow_arc_candidate:
+                        print(f"Frame {self.frame_count}: Allowing upper slow-arc continuation")
                     elif change_detected and recent_bounce_regular_candidate:
                         self._register_ground_bounce_from_context(
                             ground_bounce_context, frame, source_label="recent bounce regular"
@@ -7424,6 +7572,10 @@ class InteractiveBallAnalyzer:
                             'point': launch_origin,
                             'label': 'large lower-court launch',
                         }
+                        self._upper_slow_arc_until_frame = max(
+                            getattr(self, '_upper_slow_arc_until_frame', -1),
+                            self.frame_count + 45,
+                        )
                         print(f"Frame {self.frame_count}: Allowing large lower-court launch")
                     elif change_detected and ground_bounce_candidate:
                         self._register_ground_bounce_from_context(
@@ -8421,6 +8573,9 @@ class InteractiveBallAnalyzer:
         if x < 0 or x > width or y < 0 or y > height:
             return True, "Ball out of court bounds"
 
+        if self._upper_fence_fall_end_candidate(ball_position, frame.shape):
+            return True, "Ball hit upper fence and fell down"
+
         suppress_out_bounce = (
             self._back_return_wait_active() or
             getattr(self, '_back_return_reentry_grace_frames', 0) > 0
@@ -8539,6 +8694,9 @@ class InteractiveBallAnalyzer:
 
         if x < 0 or x > width or y < 0 or y > height:
             return True, "Ball out of court bounds"
+
+        if self._upper_fence_fall_end_candidate(ball_position, frame.shape):
+            return True, "Ball hit upper fence and fell down"
 
         suppress_out_bounce = (
             self._back_return_wait_active() or
@@ -9337,6 +9495,8 @@ class InteractiveBallAnalyzer:
             self._back_return_origin_frame = -1
             self._back_return_reentry_grace_frames = 0
             self._back_return_timed_out = False
+            self._upper_slow_arc_until_frame = -1
+            self._upper_fence_fall_frames = 0
             self._prev_serve_gray = None
             self._ignored_serve_positions = []
             self.waiting_serve_candidate = None
@@ -9719,7 +9879,7 @@ class InteractiveBallAnalyzer:
                             print(f"[POINT_END] f{self.frame_count}: reason={reason} duration={dur}f pos={tracked_position} vel={vel:.1f}px vel_hist={vel_hist_tail}")
                             wait_for_next_serve = any(
                                 token in reason.lower()
-                                for token in ("net", "bounce", "stopped", "lost")
+                                for token in ("net", "bounce", "stopped", "lost", "fence")
                             )
                             if wait_for_next_serve:
                                 if "net" in reason.lower():
