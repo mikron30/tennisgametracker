@@ -117,6 +117,8 @@ class InteractiveBallAnalyzer:
         self._rally_contact_origin = None
         self._rally_contact_expected = None
         self._rally_contact_progress = 0.0
+        self._last_racket_contact_frame = -1000000
+        self._last_racket_contact_point = None
         self._ground_bounce_grace_frames = 0
         self._ground_bounce_ref_size = None
         self._ground_bounce_origin = None
@@ -1517,6 +1519,8 @@ class InteractiveBallAnalyzer:
             motion = getattr(self, 'last_nonzero_motion', None)
         if motion is None:
             return None
+        if getattr(self, '_top_return_reentry_grace_frames', 0) > 0:
+            return None
         frame_height, _ = frame_shape[:2]
         x_prev, y_prev = self.ball_center
         dy = float(motion.get('dy', 0.0) or 0.0)
@@ -1528,6 +1532,13 @@ class InteractiveBallAnalyzer:
         if y_prev <= 40 and dy < -14.0 and dist >= 20.0:
             if self.ground_bounce_count > 0 and (self.ball_size is None or self.ball_size <= 18.0):
                 return "edge"
+            if (
+                dy <= -35.0 and
+                dist >= 45.0 and
+                predicted_y < 8.0 and
+                (ball_size >= 60.0 or recent_vel >= 50.0)
+            ):
+                return "upper_side"
         upper_band_limit = max(120, int(frame_height * 0.11))
         strong_upper_exit = (
             y_prev <= upper_band_limit and
@@ -1576,22 +1587,37 @@ class InteractiveBallAnalyzer:
         if mode == "upper_side":
             exit_dx = float(getattr(self, '_top_return_exit_dx', 0.0) or 0.0)
             min_reentry_y = 50
+            partial_top_reentry_y = 14
             max_reentry_y = min(frame_height - 1, max(150, anchor[1] + 55))
-            strong_motion = motion_max >= 26.0 or motion_mean >= 5.0 or area >= 18.0
+            strong_motion = motion_max >= 45.0 or motion_mean >= 8.0
+            # True upper-edge returns can appear as a clipped sliver; ordinary re-entry
+            # must clear the top noise band before it can restart tracking.
+            partial_top_reentry = (
+                elapsed >= 30 and
+                0 <= cy < partial_top_reentry_y and
+                area >= 8.0 and
+                motion_mean >= 14.0 and
+                motion_max >= 120.0
+            )
             lane_min_x = int(frame_width * 0.18)
             lane_max_x = int(frame_width * 0.72)
             x_drift_cap = max(700.0, min(1100.0, max(abs(exit_dx) * 9.0, 900.0)))
-            if elapsed < 28:
+            min_directional_progress = max(260.0, min(520.0, abs(exit_dx) * 8.0))
+            if elapsed < 30:
                 return False, f"top-return blind wait elapsed={elapsed}f"
             if cx < lane_min_x or cx > lane_max_x:
                 return False, f"top-return x {cx} outside top-band lane"
             if abs(cx - anchor[0]) > x_drift_cap:
                 return False, f"top-return x drift {abs(cx - anchor[0]):.1f}px > {x_drift_cap:.1f}px"
+            if exit_dx >= 20.0 and cx < anchor[0] + min_directional_progress:
+                return False, f"top-return x {cx} lacks rightward reentry progress from {anchor[0]}"
+            if exit_dx <= -20.0 and cx > anchor[0] - min_directional_progress:
+                return False, f"top-return x {cx} lacks leftward reentry progress from {anchor[0]}"
             if exit_dx <= -40.0 and cx > anchor[0] + 120:
                 return False, f"top-return x {cx} opposes leftward exit from {anchor[0]}"
             if exit_dx >= 40.0 and cx < anchor[0] - 120:
                 return False, f"top-return x {cx} opposes rightward exit from {anchor[0]}"
-            if cy < min_reentry_y:
+            if cy < min_reentry_y and not partial_top_reentry:
                 return False, f"top-return y {cy} < min_reentry_y {min_reentry_y}"
             if cy > max_reentry_y:
                 return False, f"top-return y {cy} > max_reentry_y {max_reentry_y}"
@@ -1653,6 +1679,95 @@ class InteractiveBallAnalyzer:
             y2 = min(frame_height, band_height)
         center_y = int(max(y1 + 10, min(y2 - 1, y1 + ((y2 - y1) // 2)))) if y2 > y1 else 10
         return center_x, center_y, x1, y1, x2, y2
+
+    def _find_top_return_motion_reentry(self, frame, frame_gray):
+        """Find a delayed top re-entry by fresh motion when learned hotspots mask it."""
+        if frame is None or frame_gray is None or not self._top_return_wait_active():
+            return None
+        if getattr(self, '_top_return_mode', 'edge') != 'upper_side':
+            return None
+
+        _, _, x1, y1, x2, y2 = self._build_top_return_search_region(frame.shape)
+        if x2 <= x1 or y2 <= y1:
+            return None
+
+        search_frame = frame[y1:y2, x1:x2]
+        if search_frame.size == 0:
+            return None
+        hsv_frame = cv2.cvtColor(search_frame, cv2.COLOR_BGR2HSV)
+
+        filters = []
+        seen = set()
+
+        def add_filter(label, lower, upper):
+            if lower is None or upper is None:
+                return
+            key = (label, tuple(int(v) for v in lower), tuple(int(v) for v in upper))
+            if key in seen:
+                return
+            seen.add(key)
+            filters.append((label, lower, upper))
+
+        if self.primary_hsv_lower is not None and self.primary_hsv_upper is not None:
+            add_filter("primary", self.primary_hsv_lower, self.primary_hsv_upper)
+        if hasattr(self, 'hsv_regular') and self.hsv_regular is not None:
+            add_filter("regular", self.hsv_regular['lower'], self.hsv_regular['upper'])
+        add_filter("s_30", self.s30_hsv_lower, self.s30_hsv_upper)
+
+        best = None
+        best_score = float('inf')
+        kernel = np.ones((2, 2), np.uint8)
+
+        for label, lower, upper in filters:
+            mask = cv2.inRange(hsv_frame, lower, upper)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+            for contour in contours:
+                area = cv2.contourArea(contour)
+                if area < 4.0 or area > 90.0:
+                    continue
+                M = cv2.moments(contour)
+                if M["m00"] == 0:
+                    continue
+                cx = int(M["m10"] / M["m00"]) + x1
+                cy = int(M["m01"] / M["m00"]) + y1
+                if cy >= 14:
+                    continue
+                motion_metrics = self._candidate_motion_metrics(frame_gray, cx, cy)
+                if motion_metrics is None:
+                    continue
+                motion_mean = motion_metrics['mean']
+                motion_max = motion_metrics['max']
+                if motion_mean < 8.0 or motion_max < 60.0:
+                    continue
+                ok, reason = self._top_return_reentry_ok(
+                    (cx, cy), area, motion_mean, motion_max, frame.shape
+                )
+                if not ok:
+                    continue
+
+                score = abs(cy - 28) * 2.2
+                score += abs(cx - (self._top_return_anchor[0] + self._top_return_exit_dx * 13.0)) * 0.05
+                score -= min(220.0, motion_max * 1.2)
+                score -= min(120.0, motion_mean * 3.0)
+                score -= min(90.0, area * 4.0)
+                if score < best_score:
+                    local_x = max(0, min(search_frame.shape[1] - 1, cx - x1))
+                    local_y = max(0, min(search_frame.shape[0] - 1, cy - y1))
+                    best_score = score
+                    best = {
+                        'pos': (cx, cy),
+                        'area': area,
+                        'hsv': hsv_frame[local_y, local_x],
+                        'label': label,
+                        'motion_mean': motion_mean,
+                        'motion_max': motion_max,
+                        'score': score,
+                    }
+
+        return best
 
     def _active_top_return_overlay_region(self, frame_shape):
         if getattr(self, '_top_return_anchor', None) is None:
@@ -2132,6 +2247,87 @@ class InteractiveBallAnalyzer:
             abs(dx) <= lateral_cap
         )
 
+    def _lower_contact_launch_candidate_ok(self, pos, area, lower_contact_launch_context, frame_shape):
+        """Check whether a contour matches the predicted launch after a lower racket contact."""
+        if lower_contact_launch_context is None or self.ball_center is None:
+            return False
+
+        frame_height, frame_width = frame_shape[:2]
+        cx, cy = pos
+        origin_x, origin_y = lower_contact_launch_context['origin']
+        dx = cx - origin_x
+        dy = cy - origin_y
+        launch_upward = dy <= -max(45, int(frame_height * 0.02))
+        launch_dist = math.hypot(dx, dy)
+        expected_x, expected_y = lower_contact_launch_context['expected']
+        expected_distance = math.hypot(cx - expected_x, cy - expected_y)
+        candidate_not_tiny = area >= max(
+            20,
+            min(int(lower_contact_launch_context['ref_size'] * 0.50), 80)
+        )
+
+        return (
+            launch_upward and
+            candidate_not_tiny and
+            launch_dist >= lower_contact_launch_context['min_launch_dist'] and
+            launch_dist <= lower_contact_launch_context['max_launch_dist'] and
+            expected_distance <= max(140, int(frame_width * 0.04))
+        )
+
+    def _lower_racket_contact_turn_candidate_ok(
+        self,
+        pos,
+        area,
+        frame_shape,
+        dx,
+        dy,
+        angle_jump,
+        motion_mean=None,
+        motion_max=None,
+    ):
+        """Recognize the close lower-court turn at the racket before launch opens up."""
+        if self.ball_center is None or self.last_motion is None or self.ball_size is None:
+            return False
+        if self.stuck_frame_count < 1:
+            return False
+
+        frame_height, frame_width = frame_shape[:2]
+        origin_x, origin_y = self.ball_center
+        prev_size = float(self.ball_size)
+        prev_dx = float(self.last_motion.get('dx', 0.0))
+        prev_dy = float(self.last_motion.get('dy', 0.0))
+        prev_speed = float(self.last_motion.get('distance', 0.0))
+        cx, cy = pos
+        turn_dist = math.hypot(dx, dy)
+        upward_progress = origin_y - cy
+
+        if origin_y < int(frame_height * 0.56) or cy < int(frame_height * 0.50):
+            return False
+        if prev_dy < max(28.0, frame_height * 0.013) or prev_speed < 35.0:
+            return False
+        if prev_size > 300.0:
+            return False
+        if prev_size < 170.0 and area < 85.0:
+            return False
+        if area < max(35.0, min(prev_size * 0.25, 90.0)):
+            return False
+        if upward_progress < max(32.0, frame_height * 0.015):
+            return False
+        if dy > -max(30.0, frame_height * 0.014):
+            return False
+        if angle_jump < 95.0:
+            return False
+        if turn_dist > max(135.0, prev_speed * 1.45):
+            return False
+        if abs(dx) > max(105.0, frame_width * 0.035):
+            return False
+        if motion_mean is not None and motion_max is not None:
+            if motion_mean < 30.0 and motion_max < 100.0:
+                return False
+        if prev_dx * dx < -80.0 and abs(dx) > 55.0:
+            return False
+        return True
+
     def _upper_slow_arc_active(self):
         return self.frame_count <= getattr(self, '_upper_slow_arc_until_frame', -1)
 
@@ -2231,6 +2427,17 @@ class InteractiveBallAnalyzer:
             prev_dy = float(self.prev_motion.get('dy', 0.0)) if self.prev_motion is not None else 0.0
             prev_dx = float(self.prev_motion.get('dx', 0.0)) if self.prev_motion is not None else 0.0
             prev_dist = float(self.prev_motion.get('distance', 0.0)) if self.prev_motion is not None else 0.0
+            serve_soft_bounce = (
+                getattr(self, '_awaiting_serve_bounce', False) and
+                self.point_start_frame_internal is not None and
+                (self.frame_count - self.point_start_frame_internal) <= 45 and
+                6.0 <= self.ball_size <= 90 and
+                origin_y >= max(300, int(frame_height * 0.14)) and
+                incoming_dy >= max(3.0, frame_height * 0.0018) and
+                prev_dy >= max(3.0, frame_height * 0.0018) and
+                incoming_dist >= 6.0 and
+                prev_dist >= 6.0
+            )
             upper_soft_bounce = (
                 self._upper_slow_arc_active() and
                 self.ball_size <= 90 and
@@ -2239,7 +2446,7 @@ class InteractiveBallAnalyzer:
                 prev_dy >= min_incoming_dy and
                 prev_dist >= min_incoming_dy
             )
-            if not upper_soft_bounce:
+            if not (serve_soft_bounce or upper_soft_bounce):
                 return None
             incoming_dx = (incoming_dx + prev_dx) * 0.5
             incoming_dy = max(incoming_dy, prev_dy * 0.75)
@@ -6051,12 +6258,43 @@ class InteractiveBallAnalyzer:
                         print(f"  DEBUG: Contour {i} REJECTED - serve-direction dy={signed_dy:.1f}px < {serve_direction_min_dy}")
                         continue
 
+            pre_ignore_motion_metrics = None
+            if top_return_search_context and frame_gray is not None:
+                pre_ignore_motion_metrics = self._candidate_motion_metrics(frame_gray, cx, cy)
+
             if not allow_inactive:
                 ignored_entry = self._find_ignored_tracking_position((cx, cy), filter_key=candidate_filter_key)
                 if ignored_entry is not None:
-                    print(f"  DEBUG: Contour {i} REJECTED - learned hotspot at ({cx},{cy}) "
-                          f"reason={ignored_entry.get('reason', 'n/a')}")
-                    continue
+                    top_return_motion_override = False
+                    if (
+                        top_return_search_context and
+                        getattr(self, '_top_return_mode', 'edge') == 'upper_side' and
+                        source in ('primary', 'regular', 'alt') and
+                        pre_ignore_motion_metrics is not None
+                    ):
+                        motion_mean_for_override = pre_ignore_motion_metrics['mean']
+                        motion_max_for_override = pre_ignore_motion_metrics['max']
+                        top_return_ok, _ = self._top_return_reentry_ok(
+                            (cx, cy),
+                            area,
+                            motion_mean_for_override,
+                            motion_max_for_override,
+                            frame.shape,
+                        )
+                        top_return_motion_override = (
+                            top_return_ok and
+                            motion_mean_for_override >= 8.0 and
+                            motion_max_for_override >= 60.0
+                        )
+                    if not top_return_motion_override:
+                        print(f"  DEBUG: Contour {i} REJECTED - learned hotspot at ({cx},{cy}) "
+                              f"reason={ignored_entry.get('reason', 'n/a')}")
+                        continue
+                    print(
+                        f"  DEBUG: Contour {i} ALLOWED - top-return motion overrides learned hotspot "
+                        f"at ({cx},{cy}) motion={pre_ignore_motion_metrics['mean']:.1f}/"
+                        f"{pre_ignore_motion_metrics['max']:.1f}"
+                    )
                 if contact_recovery_active and self.ball_center:
                     contact_band = max(120, int(frame_height * 0.06))
                     if abs(cy - self.ball_center[1]) > contact_band:
@@ -6469,6 +6707,38 @@ class InteractiveBallAnalyzer:
                 best_contour = continuation_meta['contour']
                 best_source = continuation_meta['source']
                 best_score = continuation_meta['score']
+            lower_contact_launch_candidates = []
+            if lower_contact_launch_context is not None:
+                lower_contact_launch_candidates = [
+                    meta for meta in candidate_meta
+                    if self._lower_contact_launch_candidate_ok(
+                        meta['pos'],
+                        meta['area'],
+                        lower_contact_launch_context,
+                        frame.shape,
+                    )
+                ]
+            current_best_lower_launch_ok = False
+            if lower_contact_launch_candidates and best_contour is not None:
+                for meta in lower_contact_launch_candidates:
+                    if meta['contour'] is best_contour:
+                        current_best_lower_launch_ok = True
+                        break
+            if lower_contact_launch_candidates and not current_best_lower_launch_ok:
+                launch_meta = max(
+                    lower_contact_launch_candidates,
+                    key=lambda meta: (meta['area'], meta['motion_max'], -meta['score'])
+                )
+                best_contour = launch_meta['contour']
+                best_source = launch_meta['source']
+                best_score = launch_meta['score']
+                print(
+                    f"  DEBUG: [LOWER-RACKET-LAUNCH] prioritizing candidate at "
+                    f"{launch_meta['pos']} area={launch_meta['area']:.1f}px "
+                    f"score={launch_meta['score']:.1f} motion="
+                    f"{launch_meta['motion_mean']:.1f}/{launch_meta['motion_max']:.1f} "
+                    f"source={launch_meta['source']}"
+                )
             large_launch_candidates = [
                 meta for meta in candidate_meta
                 if self._large_lower_launch_candidate_ok(meta['pos'], meta['area'], frame.shape)
@@ -6567,10 +6837,42 @@ class InteractiveBallAnalyzer:
                 ) if contact_reacquire_bounds is not None else None
                 selected_area = cv2.contourArea(best_contour)
                 if top_return_search_context:
-                    top_return_ok, top_return_reason = self._top_return_reentry_ok(
-                        (cx, cy), selected_area, motion_mean, motion_max, frame.shape
-                    )
+                    if (
+                        getattr(self, '_top_return_mode', 'edge') == 'upper_side' and
+                        best_source not in ('primary', 'regular', 'alt')
+                    ):
+                        top_return_ok = False
+                        top_return_reason = f"top-return source {best_source} not allowed for upper-side reentry"
+                    else:
+                        top_return_ok, top_return_reason = self._top_return_reentry_ok(
+                            (cx, cy), selected_area, motion_mean, motion_max, frame.shape
+                        )
                     if not top_return_ok:
+                        motion_reentry = self._find_top_return_motion_reentry(frame, frame_gray)
+                        if motion_reentry is not None:
+                            prev_pos = self.ball_center
+                            new_pos = motion_reentry['pos']
+                            self.ball_center = new_pos
+                            self.ball_hsv = motion_reentry['hsv']
+                            self.ball_size = motion_reentry['area']
+                            self._update_recovered_motion(prev_pos, new_pos)
+                            self.stuck_frame_count = 0
+                            self._recent_offscreen_return_frame = self.frame_count
+                            self._top_return_reentry_grace_frames = max(
+                                getattr(self, '_top_return_reentry_grace_frames', 0), 4
+                            )
+                            self._top_return_wait_frames = 0
+                            self._top_return_anchor = None
+                            self._top_return_origin_frame = -1
+                            self._top_return_mode = None
+                            self._top_return_exit_dx = 0.0
+                            self.last_seen_frame = self.frame_count
+                            print(
+                                f"Frame {self.frame_count}: [TOP-RETURN MOTION REENTRY] Ball at {new_pos} "
+                                f"via {motion_reentry['label']} motion="
+                                f"{motion_reentry['motion_mean']:.1f}/{motion_reentry['motion_max']:.1f}"
+                            )
+                            return self.ball_center
                         self._record_rejected_contour_debug(
                             best_contour,
                             x1,
@@ -7395,19 +7697,22 @@ class InteractiveBallAnalyzer:
                     predicted_turn_candidate = predicted_turn_distance <= predicted_turn_cap
                 lower_contact_launch_candidate = False
                 if lower_contact_launch_context is not None and self.ball_center is not None:
-                    origin_x, origin_y = lower_contact_launch_context['origin']
-                    launch_upward = dy <= -max(45, int(frame_height * 0.02))
-                    launch_dist = math.hypot(cx - origin_x, cy - origin_y)
-                    expected_x, expected_y = lower_contact_launch_context['expected']
-                    expected_distance = math.hypot(cx - expected_x, cy - expected_y)
-                    candidate_not_tiny = bulb_size >= max(20, min(int(lower_contact_launch_context['ref_size'] * 0.50), 80))
-                    lower_contact_launch_candidate = (
-                        launch_upward and
-                        candidate_not_tiny and
-                        launch_dist >= lower_contact_launch_context['min_launch_dist'] and
-                        launch_dist <= lower_contact_launch_context['max_launch_dist'] and
-                        expected_distance <= max(140, int(frame_width * 0.04))
+                    lower_contact_launch_candidate = self._lower_contact_launch_candidate_ok(
+                        (cx, cy),
+                        bulb_size,
+                        lower_contact_launch_context,
+                        frame.shape,
                     )
+                lower_racket_contact_turn_candidate = self._lower_racket_contact_turn_candidate_ok(
+                    (cx, cy),
+                    bulb_size,
+                    frame.shape,
+                    dx,
+                    dy,
+                    angle_jump,
+                    motion_mean=motion_mean,
+                    motion_max=motion_max,
+                )
                 large_lower_launch_candidate = self._large_lower_launch_candidate_ok(
                     (cx, cy), bulb_size, frame.shape
                 )
@@ -7488,7 +7793,7 @@ class InteractiveBallAnalyzer:
                         and not upper_slow_arc_candidate and not ground_bounce_candidate
                         and not recent_bounce_reversal_candidate and not recent_bounce_regular_candidate):
                     self.direction_change_streak += 1
-                    max_hold = 2 if near_net else 3
+                    max_hold = 2 if (near_net or lower_racket_contact_turn_candidate) else 3
                     if self.direction_change_streak < max_hold:
                         if recent_bounce_continue_needed:
                             recent_bounce_continue = self._retrack_recent_return_bounce_continue(
@@ -7513,6 +7818,26 @@ class InteractiveBallAnalyzer:
                         print(f"Frame {self.frame_count}: Direction change candidate (holding {self.direction_change_streak}/{max_hold}) angle_jump={angle_jump:.1f}")
                         self.stuck_frame_count += 1
                         return self.ball_center
+                    if lower_racket_contact_turn_candidate:
+                        if self.ground_bounce_count > 0:
+                            print(f"Frame {self.frame_count}: Resetting bounce count after lower-racket contact turn")
+                        self.ground_bounce_count = 0
+                        self.last_ground_bounce_frame = -1000000
+                        contact_origin = self.ball_center
+                        self._rally_contact_grace_frames = max(getattr(self, '_rally_contact_grace_frames', 0), 3)
+                        self._rally_contact_ref_size = max(40.0, min(float(bulb_size), 140.0))
+                        self._rally_contact_origin = contact_origin
+                        self._rally_contact_expected = (cx, cy)
+                        self._rally_contact_progress = math.hypot(
+                            cx - contact_origin[0],
+                            cy - contact_origin[1],
+                        )
+                        impact_event = {
+                            'kind': 'racket_contact',
+                            'point': contact_origin,
+                            'label': 'racket contact',
+                        }
+                        print(f"Frame {self.frame_count}: Allowing lower-racket contact turn")
                 else:
                     if (change_detected and not ground_bounce_candidate and not predicted_turn_candidate
                             and not predicted_continuation_candidate and not upper_slow_arc_candidate
@@ -7607,6 +7932,9 @@ class InteractiveBallAnalyzer:
                             ground_bounce_context=ground_bounce_context,
                         )
                     if impact_event is not None:
+                        if impact_event.get('kind') == 'racket_contact':
+                            self._last_racket_contact_frame = self.frame_count
+                            self._last_racket_contact_point = impact_event.get('point')
                         self._add_impact_marker(
                             impact_event.get('point'),
                             kind=impact_event.get('kind', 'direction_change'),
@@ -9232,6 +9560,8 @@ class InteractiveBallAnalyzer:
             return False, None
         if getattr(self, '_last_motion_reacq_frame', -1000000) == self.frame_count:
             return False, None
+        if (self.frame_count - getattr(self, '_last_racket_contact_frame', -1000000)) <= 1:
+            return False, None
 
         x, y = ball_position
         curr_dx = float(self.last_motion.get('dx', 0.0) or 0.0)
@@ -9473,6 +9803,8 @@ class InteractiveBallAnalyzer:
             self._rally_contact_origin = None
             self._rally_contact_expected = None
             self._rally_contact_progress = 0.0
+            self._last_racket_contact_frame = -1000000
+            self._last_racket_contact_point = None
             self._ground_bounce_grace_frames = 0
             self._ground_bounce_ref_size = None
             self._ground_bounce_origin = None
@@ -10100,17 +10432,44 @@ class InteractiveBallAnalyzer:
                     # Require ALL consecutive pairs to move in the serve direction (not just first-to-last)
                     if len(serve_position_history) >= 4:
                         # Check last 3 consecutive pairs all move forward with signed dx > 15
-                        all_forward = True
-                        min_signed_dx = float('inf')
+                        recent_signed_dx = []
+                        recent_signed_dy = []
                         for i in range(-3, 0):
                             pair_dx = serve_position_history[i][0] - serve_position_history[i-1][0]
-                            signed_dx = self._signed_serve_dx(pair_dx)
-                            if signed_dx < 15:
-                                all_forward = False
-                                break
-                            min_signed_dx = min(min_signed_dx, signed_dx)
+                            pair_dy = serve_position_history[i][1] - serve_position_history[i-1][1]
+                            recent_signed_dx.append(self._signed_serve_dx(pair_dx))
+                            recent_signed_dy.append(self._signed_serve_dy(pair_dy))
+                        all_forward = all(signed_dx >= 15 for signed_dx in recent_signed_dx)
+                        min_signed_dx = min(recent_signed_dx) if recent_signed_dx else 0
                         avg_dx = min_signed_dx  # Use minimum signed dx as the threshold
-                        if all_forward and avg_dx >= 25:
+                        serve_height = max(1, self.serve_area_y_max - self.serve_area_y_min)
+                        serve_width = max(1, self.serve_area_x_max - self.serve_area_x_min)
+                        high_launch_y = self.serve_area_y_min + int(serve_height * 0.22)
+                        total_signed_dx = sum(recent_signed_dx)
+                        total_signed_dy = sum(recent_signed_dy)
+                        # A classic pre-contact serve launch has a compact burst that is
+                        # both forward and upward near the top of the serve area. This
+                        # catches f3372/f3373 where the first forward step is slightly
+                        # below the old fast-serve threshold, before a false high blob
+                        # can reset the serve history.
+                        precontact_toss_launch = (
+                            all_forward and
+                            self.serve_direction_dy != 0 and
+                            serve_tracking_frames <= 10 and
+                            potential_serve[1] <= high_launch_y and
+                            total_signed_dx >= max(120, int(serve_width * 0.055)) and
+                            total_signed_dy >= max(110, int(serve_height * 0.24)) and
+                            recent_signed_dx[-1] >= 45 and
+                            recent_signed_dx[-2] >= 45 and
+                            recent_signed_dy[-1] >= 40 and
+                            recent_signed_dy[-2] >= 40
+                        )
+                        if all_forward and (avg_dx >= 25 or precontact_toss_launch):
+                            serve_start_reason = (
+                                "precontact-toss-launch"
+                                if precontact_toss_launch and avg_dx < 25
+                                else "fast-serve"
+                            )
                             predicted_pos = potential_serve
                             if len(serve_position_history) >= 2:
                                 p1 = serve_position_history[-2]
@@ -10128,7 +10487,9 @@ class InteractiveBallAnalyzer:
                             print(f"SERVE IN PROGRESS at frame {self.frame_count}!")
                             print(f"Ball position: {potential_serve}, signed dx={avg_dx:.1f}px/frame")
                             print(f"{'='*70}\n")
-                            print(f"[TRACKING_START] f{self.frame_count}: fast-serve detected at {potential_serve} signed_dx={avg_dx:.1f}px")
+                            print(f"[TRACKING_START] f{self.frame_count}: {serve_start_reason} detected at {potential_serve} "
+                                  f"signed_dx={avg_dx:.1f}px total_dx={total_signed_dx:.1f}px "
+                                  f"total_dy={total_signed_dy:.1f}px")
                             self.ball_center = potential_serve
                             self.tracking = True
                             self.ball_stopped = False
