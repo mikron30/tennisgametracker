@@ -2106,6 +2106,28 @@ class InteractiveBallAnalyzer:
             return False
         return True
 
+    def _lower_right_edge_exit_out_reason(self, frame_shape):
+        """Return an out reason when a lower-right edge exit is no longer recoverable."""
+        if self.ball_center is None or self.last_motion is None:
+            return None
+        if self._back_return_wait_active() or self._should_start_back_return_wait(frame_shape):
+            return None
+        if self.point_start_frame_internal is not None and (self.frame_count - self.point_start_frame_internal) <= 20:
+            return None
+
+        frame_height, frame_width = frame_shape[:2]
+        x_prev, y_prev = self.ball_center
+        dx = float(self.last_motion.get('dx', 0.0) or 0.0)
+        dy = float(self.last_motion.get('dy', 0.0) or 0.0)
+        distance = float(self.last_motion.get('distance', 0.0) or 0.0)
+        near_right_edge = x_prev >= frame_width - 20
+        near_bottom_edge = y_prev >= frame_height - 20
+        moving_out = dx >= 8.0 and dy >= 35.0 and distance >= 45.0
+        partial_edge_blob = self.ball_size is None or self.ball_size <= 180.0
+        if near_right_edge and near_bottom_edge and moving_out and partial_edge_blob:
+            return "Ball bounce outside singles court (right sideline)"
+        return None
+
     def _activate_back_return_wait(self):
         """Arm a delayed lower-right return search after the large ball leaves frame."""
         if self.ball_center is None:
@@ -5283,6 +5305,29 @@ class InteractiveBallAnalyzer:
             if dist_from_stuck < 40:
                 continue
 
+            if (
+                self.stuck_frame_count <= 1 and
+                _recent_max_vel < 35 and
+                self.last_motion is not None and
+                stuck_y > max(120, int(frame_height * 0.06))
+            ):
+                last_dx = float(self.last_motion.get('dx', 0.0) or 0.0)
+                last_dy = float(self.last_motion.get('dy', 0.0) or 0.0)
+                if last_dy < -4.0:
+                    expected_x = stuck_x + last_dx
+                    expected_y = stuck_y + last_dy
+                    predicted_jump = math.hypot(mx - expected_x, my - expected_y)
+                    max_slow_jump = max(95.0, _recent_max_vel * 4.2)
+                    upward_leap = stuck_y - my
+                    max_upward_leap = max(120.0, abs(last_dy) * 5.0)
+                    if upward_leap > max_upward_leap and predicted_jump > max_slow_jump:
+                        print(
+                            f"  DEBUG: [REACQ] SKIPPED implausible upper leap at ({mx},{my}) "
+                            f"dy={-upward_leap:.0f}px pred_jump={predicted_jump:.1f}px "
+                            f"recent_vel={_recent_max_vel:.1f}"
+                        )
+                        continue
+
             # Skip candidates far outside the expected travel range — prevents jumping to
             # unrelated corners or edges that happen to match ball colour.
             if dist_from_stuck > _max_reacq_dist:
@@ -6281,6 +6326,13 @@ class InteractiveBallAnalyzer:
                     self.stuck_frame_count = 0
                     print(f"Frame {self.frame_count}: [H_10 HSV RECOVER] Ball at {new_pos}")
                     return self.ball_center
+
+            lower_right_exit_reason = None if allow_inactive else self._lower_right_edge_exit_out_reason(frame.shape)
+            if lower_right_exit_reason:
+                self._pending_rally_end_reason = lower_right_exit_reason
+                self._pending_rally_end_frame = self.frame_count
+                print(f"Frame {self.frame_count}: [LOWER-RIGHT EXIT OUT] {lower_right_exit_reason} at {self.ball_center}")
+                return self.ball_center
 
             if (not allow_inactive and self.ball_center and self.last_seen_frame == (self.frame_count - 1)
                     and not getattr(self, 'auto_play', False)):
