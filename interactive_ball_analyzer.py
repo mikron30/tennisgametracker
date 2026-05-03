@@ -139,9 +139,10 @@ class InteractiveBallAnalyzer:
         self._recent_return_bounce_recover_frame = -1000000
         self._recent_racket_rebound_bounce_frame = -1000000
         self._back_return_wait_frames = 0
-        # Court-2 back-return re-entry shows up about 5 frames after the lower-right
-        # exit in the validated rally; allow a small cushion, then declare the ball lost.
-        self._back_return_timeout_frames = 8
+        # Court-2 back/back-screen exits can be invisible for a while before returning.
+        # Keep a real offscreen wait active instead of dropping into normal lost-ball
+        # timeout as soon as the large close ball leaves the bottom edge.
+        self._back_return_timeout_frames = 90
         self._back_return_anchor = None
         self._back_return_origin_frame = -1
         self._back_return_reentry_grace_frames = 0
@@ -1678,6 +1679,12 @@ class InteractiveBallAnalyzer:
             partial_top_reentry_y = 14
             max_reentry_y = min(frame_height - 1, max(150, anchor[1] + 55))
             strong_motion = motion_max >= 45.0 or motion_mean >= 8.0
+            strong_visible_reentry = (
+                cy >= min_reentry_y and
+                area >= 14.0 and
+                motion_mean >= 18.0 and
+                motion_max >= 90.0
+            )
             # True upper-edge returns can appear as a clipped sliver; ordinary re-entry
             # must clear the top noise band before it can restart tracking.
             partial_top_reentry = (
@@ -1691,7 +1698,10 @@ class InteractiveBallAnalyzer:
             lane_max_x = int(frame_width * 0.72)
             x_drift_cap = max(700.0, min(1100.0, max(abs(exit_dx) * 9.0, 900.0)))
             min_directional_progress = max(260.0, min(520.0, abs(exit_dx) * 8.0))
-            if elapsed < 30:
+            blind_wait_frames = 20 if strong_visible_reentry else 30
+            if strong_visible_reentry:
+                min_directional_progress = min(min_directional_progress, 235.0)
+            if elapsed < blind_wait_frames:
                 return False, f"top-return blind wait elapsed={elapsed}f"
             if cx < lane_min_x or cx > lane_max_x:
                 return False, f"top-return x {cx} outside top-band lane"
@@ -2177,7 +2187,14 @@ class InteractiveBallAnalyzer:
             return False
         frame_height, frame_width = frame_shape[:2]
         x_prev, y_prev = self.ball_center
-        if x_prev < int(frame_width * 0.84):
+        large_bottom_exit = (
+            self.ball_size is not None and
+            self.ball_size >= 700.0 and
+            y_prev >= frame_height - max(90, int(frame_height * 0.04)) and
+            x_prev >= int(frame_width * 0.58)
+        )
+        lower_right_exit = x_prev >= int(frame_width * 0.84)
+        if not (lower_right_exit or large_bottom_exit):
             return False
         if y_prev < frame_height - 160:
             return False
@@ -5610,7 +5627,7 @@ class InteractiveBallAnalyzer:
                 self._back_return_wait_frames -= 1
                 anchor_x, anchor_y = self._back_return_anchor
                 elapsed = max(0, self.frame_count - self._back_return_origin_frame)
-                print(f"\n  DEBUG: [BACK-RETURN WAIT] holding near lower-right exit from ({anchor_x},{anchor_y}), "
+                print(f"\n  DEBUG: [BACK-RETURN WAIT] holding near back/bottom exit from ({anchor_x},{anchor_y}), "
                       f"frames_left={self._back_return_wait_frames}")
                 x, y = anchor_x, anchor_y
                 search_radius = 1500
@@ -5620,8 +5637,8 @@ class InteractiveBallAnalyzer:
                 back_return_wait = True
                 elapsed = 0
                 anchor_x, anchor_y = self._back_return_anchor
-                print(f"\n  DEBUG: Ball near lower-right exit ({anchor_x},{anchor_y}), may have gone off-screen")
-                print(f"  DEBUG: [BACK-RETURN WAIT] activated for delayed right-side re-entry search")
+                print(f"\n  DEBUG: Ball near back/bottom exit ({anchor_x},{anchor_y}), may have gone off-screen")
+                print(f"  DEBUG: [BACK-RETURN WAIT] activated for delayed back-screen re-entry search")
                 x, y = anchor_x, anchor_y
                 search_radius = 1500
                 self.edge_wait = True
@@ -6398,10 +6415,20 @@ class InteractiveBallAnalyzer:
                         retrack_s30.get('motion_mean', 0.0) < 2.0 and
                         retrack_s30.get('motion_max', 0.0) < 10.0
                     )
-                    if bottom_large_exit_false_s30:
+                    recent_back_return_false_s30 = (
+                        not allow_inactive and
+                        (
+                            self._back_return_wait_active() or
+                            getattr(self, '_back_return_reentry_grace_frames', 0) > 0 or
+                            self._recent_offscreen_return_hold_active(window_frames=24)
+                        ) and
+                        retrack_s30.get('motion_mean', 0.0) < 2.0 and
+                        retrack_s30.get('motion_max', 0.0) < 10.0
+                    )
+                    if bottom_large_exit_false_s30 or recent_back_return_false_s30:
                         print(
                             f"  DEBUG: Rejecting s_30 recover at {retrack_s30['pos']} - "
-                            f"large close ball is exiting bottom and candidate is tiny/low-motion"
+                            f"back-screen return candidate is low-motion/static"
                         )
                     else:
                         new_pos = retrack_s30['pos']
@@ -6435,6 +6462,21 @@ class InteractiveBallAnalyzer:
                 self._pending_rally_end_reason = lower_right_exit_reason
                 self._pending_rally_end_frame = self.frame_count
                 print(f"Frame {self.frame_count}: [LOWER-RIGHT EXIT OUT] {lower_right_exit_reason} at {self.ball_center}")
+                return self.ball_center
+
+            if back_return_search_context and self.ball_center:
+                self.stuck_frame_count = min(max(self.stuck_frame_count + 1, 1), 4)
+                print(f"[BALL_LOST] f{self.frame_count}: back-return wait holding pos={self.ball_center} stuck={self.stuck_frame_count}")
+                return self.ball_center
+            if (
+                not allow_inactive and self.ball_center and
+                (
+                    getattr(self, '_back_return_reentry_grace_frames', 0) > 0 or
+                    self._recent_offscreen_return_hold_active(window_frames=24)
+                )
+            ):
+                self.stuck_frame_count = min(max(self.stuck_frame_count + 1, 1), 4)
+                print(f"[BALL_LOST] f{self.frame_count}: back-return re-entry grace holding pos={self.ball_center} stuck={self.stuck_frame_count}")
                 return self.ball_center
 
             if (not allow_inactive and self.ball_center and self.last_seen_frame == (self.frame_count - 1)
@@ -7020,6 +7062,52 @@ class InteractiveBallAnalyzer:
                     f"source={back_meta['source']}"
                 )
 
+        if top_return_reentry_grace and candidate_meta and self.ball_center is not None:
+            motion = self.last_motion
+            if motion is None or motion.get('distance', 0.0) <= 0:
+                motion = getattr(self, 'last_nonzero_motion', None)
+            if motion is not None:
+                prev_x, prev_y = self.ball_center
+                expected_x = prev_x + float(motion.get('dx', 0.0) or 0.0)
+                expected_y = prev_y + float(motion.get('dy', 0.0) or 0.0)
+                continuing_candidates = []
+                for meta in candidate_meta:
+                    cx_meta, cy_meta = meta['pos']
+                    visible_ball = meta['area'] >= 4.0
+                    moving_ball = (
+                        meta['motion_max'] >= 70.0 or
+                        (meta['motion_mean'] >= 18.0 and meta['motion_max'] >= 45.0)
+                    )
+                    if not visible_ball or not moving_ball:
+                        continue
+                    if motion.get('dy', 0.0) >= 6.0 and cy_meta < prev_y - 10:
+                        continue
+                    predicted_gap = math.hypot(cx_meta - expected_x, cy_meta - expected_y)
+                    max_gap = max(70.0, min(150.0, float(motion.get('distance', 0.0) or 0.0) * 3.0))
+                    if predicted_gap > max_gap:
+                        continue
+                    size_ratio_meta = abs(meta['area'] - float(self.ball_size or meta['area'])) / max(float(self.ball_size or meta['area']), 1.0)
+                    adjusted_score = (
+                        predicted_gap * 1.5 +
+                        meta['distance'] * 0.12 +
+                        size_ratio_meta * 18.0 -
+                        min(80.0, meta['motion_max'] * 0.45) -
+                        min(40.0, meta['motion_mean'] * 0.9)
+                    )
+                    continuing_candidates.append((adjusted_score, meta))
+                if continuing_candidates:
+                    _, cont_meta = min(continuing_candidates, key=lambda item: item[0])
+                    best_contour = cont_meta['contour']
+                    best_source = cont_meta['source']
+                    best_score = cont_meta['score']
+                    print(
+                        f"  DEBUG: [TOP-RETURN GRACE] prioritizing continuation candidate at "
+                        f"{cont_meta['pos']} area={cont_meta['area']:.1f}px "
+                        f"score={cont_meta['score']:.1f} motion="
+                        f"{cont_meta['motion_mean']:.1f}/{cont_meta['motion_max']:.1f} "
+                        f"source={cont_meta['source']}"
+                    )
+
         if (candidate_meta and
                 not top_return_search_context and
                 not back_return_search_context and
@@ -7282,7 +7370,7 @@ class InteractiveBallAnalyzer:
                     accepted_back_return_reentry = True
                     self._recent_offscreen_return_frame = self.frame_count
                     self._back_return_reentry_grace_frames = max(
-                        getattr(self, '_back_return_reentry_grace_frames', 0), 4
+                        getattr(self, '_back_return_reentry_grace_frames', 0), 8
                     )
                 static_hotspot = ((selected_area <= 3 and motion_mean < 1.0 and motion_max < 5.0) or
                                   (cy < 100 and motion_mean < 2.5 and motion_max < 10.0))
@@ -9446,6 +9534,10 @@ class InteractiveBallAnalyzer:
         # If we're waiting near an edge, don't end the point
         if getattr(self, 'edge_wait', False):
             return False, "Edge wait"
+        if (self._back_return_wait_active() or
+                getattr(self, '_back_return_reentry_grace_frames', 0) > 0 or
+                self._recent_offscreen_return_hold_active(window_frames=24)):
+            return False, "Back-return wait"
         if getattr(self, 'ground_bounce_count', 0) >= 2:
             return True, "Ball bounced twice on court"
         
@@ -9569,6 +9661,10 @@ class InteractiveBallAnalyzer:
             return False, "Early-serve grace"
         if getattr(self, 'edge_wait', False):
             return False, "Edge wait"
+        if (self._back_return_wait_active() or
+                getattr(self, '_back_return_reentry_grace_frames', 0) > 0 or
+                self._recent_offscreen_return_hold_active(window_frames=24)):
+            return False, "Back-return wait"
         if getattr(self, 'ground_bounce_count', 0) >= 2:
             return True, "Ball bounced twice on court"
 
