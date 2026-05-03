@@ -2821,7 +2821,10 @@ class InteractiveBallAnalyzer:
             return None
 
         ref_x, ref_y = reference_pos
-        if ref_y > max(280, int(frame.shape[0] * 0.14)):
+        upper_limit = max(280, int(frame.shape[0] * 0.14))
+        if upper_stuck_mode:
+            upper_limit = max(340, int(frame.shape[0] * 0.17))
+        if ref_y > upper_limit:
             return None
         if self.last_motion.get('distance', 0) > max_prev_speed:
             return None
@@ -7955,6 +7958,10 @@ class InteractiveBallAnalyzer:
 
             # Detect sudden ball size drop (occlusion by player)
             # If ball was > 30px and now < 5px, it's being occluded — don't trust this detection
+            small_upper_flight_candidate = (
+                (prev_ball_size is not None and prev_ball_size <= 25) or
+                bulb_size <= 25
+            )
             soft_upper_contact_recover = (
                 not allow_inactive and
                 contact_reacquire_bounds is not None and
@@ -7962,7 +7969,7 @@ class InteractiveBallAnalyzer:
                 self.last_motion is not None and
                 self.last_motion.get('dy', 0.0) < -2.0 and
                 self.ground_bounce_count > 0 and
-                prev_ball_size is not None and prev_ball_size <= 20 and
+                small_upper_flight_candidate and
                 not accepted_top_return_reentry and not accepted_back_return_reentry
             )
             if soft_upper_contact_recover:
@@ -7999,9 +8006,16 @@ class InteractiveBallAnalyzer:
                         (soft_recover_motion_mean is not None and soft_recover_motion_mean >= 18.0) or
                         (soft_recover_motion_max is not None and soft_recover_motion_max >= 100.0)
                     )
+                    same_path_larger_recover = (
+                        soft_recover_strong and
+                        math.hypot(soft_recover['pos'][0] - cx, soft_recover['pos'][1] - cy) <= max(8.0, velocity * 0.35) and
+                        soft_recover['area'] >= max(bulb_size * 1.6, bulb_size + 8.0) and
+                        recovered_upward >= current_upward - 4.0
+                    )
                     if (soft_recover_strong and (
                             recovered_upward >= current_upward + 12 or
-                            recovered_predicted_distance + 10 < current_predicted_distance)):
+                            recovered_predicted_distance + 10 < current_predicted_distance or
+                            same_path_larger_recover)):
                         cx, cy = soft_recover['pos']
                         hsv_values = soft_recover['hsv']
                         bulb_size = soft_recover['area']
@@ -8010,8 +8024,10 @@ class InteractiveBallAnalyzer:
                         velocity = math.hypot(dx, dy)
                         direction_deg = math.degrees(math.atan2(dy, dx)) if velocity > 0 else 0.0
                         soft_recover_applied = True
+                        recover_reason = "same-path larger mask" if same_path_larger_recover else "predicted/upward"
                         print(f"Frame {self.frame_count}: [UPPER CONTACT SOFT RECOVER] Ball at ({cx}, {cy}) "
-                              f"from {soft_recover.get('label', 'n/a')} mode={soft_recover.get('mode', 'n/a')}")
+                              f"from {soft_recover.get('label', 'n/a')} mode={soft_recover.get('mode', 'n/a')} "
+                              f"reason={recover_reason}")
                 current_dx = 0.0
                 current_dy = 0.0
                 current_velocity = 0.0
