@@ -6388,14 +6388,30 @@ class InteractiveBallAnalyzer:
                     filter_key="s_30"
                 )
                 if retrack_s30 is not None:
-                    new_pos = retrack_s30['pos']
-                    self.ball_center = new_pos
-                    self.ball_hsv = retrack_s30['hsv']
-                    self.ball_size = retrack_s30['area']
-                    self._activate_regular_hsv()
-                    self.stuck_frame_count = 0
-                    print(f"Frame {self.frame_count}: [S_30 HSV RECOVER] Ball at {new_pos}")
-                    return self.ball_center
+                    bottom_large_exit_false_s30 = (
+                        not allow_inactive and
+                        self.ball_center is not None and
+                        self.ball_size is not None and
+                        self.ball_size >= 700 and
+                        self.ball_center[1] > frame.shape[0] - max(70, int(frame.shape[0] * 0.04)) and
+                        retrack_s30['area'] < max(220, self.ball_size * 0.22) and
+                        retrack_s30.get('motion_mean', 0.0) < 2.0 and
+                        retrack_s30.get('motion_max', 0.0) < 10.0
+                    )
+                    if bottom_large_exit_false_s30:
+                        print(
+                            f"  DEBUG: Rejecting s_30 recover at {retrack_s30['pos']} - "
+                            f"large close ball is exiting bottom and candidate is tiny/low-motion"
+                        )
+                    else:
+                        new_pos = retrack_s30['pos']
+                        self.ball_center = new_pos
+                        self.ball_hsv = retrack_s30['hsv']
+                        self.ball_size = retrack_s30['area']
+                        self._activate_regular_hsv()
+                        self.stuck_frame_count = 0
+                        print(f"Frame {self.frame_count}: [S_30 HSV RECOVER] Ball at {new_pos}")
+                        return self.ball_center
 
             if (self.h10_hsv_lower is not None and self.h10_hsv_upper is not None and
                     self._should_try_h10_recover(frame, predicted_point, allow_inactive)):
@@ -6456,13 +6472,28 @@ class InteractiveBallAnalyzer:
             self.ball_size >= 35 and
             self.ball_center[1] < max(220, int(frame.shape[0] * 0.12))
         )
+        large_ball_tracking_cap = 0
+        large_ball_bg_threshold = 0
+        if not allow_inactive and self.ball_size is not None and self.ball_size >= 200:
+            if self.ball_size >= 700:
+                large_ball_tracking_cap = min(
+                    1800,
+                    int(max(self.ball_size * 1.70, self.ball_size + 450))
+                )
+                large_ball_bg_threshold = int(max(self.ball_size * 1.65, self.ball_size + 450))
+            else:
+                large_ball_tracking_cap = min(
+                    1100,
+                    int(max(self.ball_size * 1.45, self.ball_size + 120))
+                )
+        ball_size_max_tracking = max(150, self.serve_ball_size_max, large_ball_tracking_cap)
+        bg_threshold = max(500, int(self.serve_ball_size_max * 1.5), large_ball_bg_threshold)
         for i, (source, contour) in enumerate(contours):
             area = cv2.contourArea(contour)
             
             # Reject huge background regions first.
             # Upper limit scales with serve_ball_size_max so near-end large balls aren't
             # incorrectly classified as background (e.g. court 2 ball area ~280-360px²).
-            bg_threshold = max(500, int(self.serve_ball_size_max * 1.5))
             if area > bg_threshold:
                 if i < 3:  # Only print first few to avoid spam
                     print(f"  DEBUG: Contour {i} REJECTED - area={area:.1f}px (background region)")
@@ -6471,15 +6502,8 @@ class InteractiveBallAnalyzer:
             # Size filter: tighter in inactive serve scan, looser when tracking.
             # Both limits are court-configurable via serve_ball_size_min/max so that
             # near-end servers (large ball) and far-end servers (tiny ball) both work.
-            # When we are already following a very large close ball, allow a modest
-            # growth margin so the next frame does not get dropped by a hard 800px cap.
-            large_ball_tracking_cap = 0
-            if (not allow_inactive and self.ball_size is not None and self.ball_size >= 200):
-                large_ball_tracking_cap = min(
-                    1100,
-                    int(max(self.ball_size * 1.45, self.ball_size + 120))
-                )
-            ball_size_max_tracking = max(150, self.serve_ball_size_max, large_ball_tracking_cap)
+            # When a close ball is already large, keep expanding the cap with it so
+            # the next frame is not dropped by the old fixed 800/1100px ceilings.
             if allow_inactive:
                 if area < self.serve_ball_size_min or area > self.serve_ball_size_max:
                     print(f"  DEBUG: Contour {i} REJECTED - area={area:.1f}px (serve scan outside {self.serve_ball_size_min}-{self.serve_ball_size_max})")
@@ -8642,7 +8666,10 @@ class InteractiveBallAnalyzer:
         print(f"  DEBUG: [PROBLEM] No valid candidate found!")
         print(f"  DEBUG: Total contours: {len(contours)}, Valid candidates: {len(candidates)}")
         if len(contours) > 0 and len(candidates) == 0:
-            size_cap = f"{self.serve_ball_size_min}-{self.serve_ball_size_max}px (serve scan)" if allow_inactive else f"1-{max(150, self.serve_ball_size_max)}px"
+            tracking_size_cap = max(150, self.serve_ball_size_max)
+            if 'ball_size_max_tracking' in locals():
+                tracking_size_cap = ball_size_max_tracking
+            size_cap = f"{self.serve_ball_size_min}-{self.serve_ball_size_max}px (serve scan)" if allow_inactive else f"1-{tracking_size_cap}px"
             print(f"  DEBUG: All {len(contours)} contours were rejected by size filter ({size_cap})")
             # Show the actual sizes that were rejected
             rejected_sizes = []
