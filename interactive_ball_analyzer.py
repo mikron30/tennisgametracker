@@ -1723,22 +1723,23 @@ class InteractiveBallAnalyzer:
         else:
             x_cap = max(320.0, min(520.0, abs(exit_dx) * 12.0))
         strong_motion = motion_max >= 40.0 or motion_mean >= 8.0 or area >= 8.0
-        strong_partial_reentry = (
-            elapsed >= 30 and
-            cy >= max(24, anchor[1] - 10) and
-            cy < min_reentry_y and
+        strong_visible_reentry = (
+            elapsed >= 24 and
+            cy >= max(20, anchor[1] - 10) and
             area >= 70.0 and
             motion_mean >= 25.0 and
             motion_max >= 120.0
         )
+        strong_partial_reentry = strong_visible_reentry and cy < min_reentry_y
+        reentry_x_cap = max(x_cap, 420.0) if strong_visible_reentry else x_cap
 
         if elapsed < 24:
             return False, f"top-return blind wait elapsed={elapsed}f"
-        if abs(cx - anchor[0]) > x_cap:
-            return False, f"top-return x drift {abs(cx - anchor[0]):.1f}px > {x_cap:.1f}px"
-        if exit_dx >= 12.0 and cx < anchor[0] - max(150.0, x_cap * 0.45):
+        if abs(cx - anchor[0]) > reentry_x_cap:
+            return False, f"top-return x drift {abs(cx - anchor[0]):.1f}px > {reentry_x_cap:.1f}px"
+        if exit_dx >= 12.0 and cx < anchor[0] - max(150.0, reentry_x_cap * 0.45):
             return False, f"top-return x {cx} opposes rightward exit from {anchor[0]}"
-        if exit_dx <= -12.0 and cx > anchor[0] + max(150.0, x_cap * 0.45):
+        if exit_dx <= -12.0 and cx > anchor[0] + max(150.0, reentry_x_cap * 0.45):
             return False, f"top-return x {cx} opposes leftward exit from {anchor[0]}"
         if cy < min_reentry_y and not strong_partial_reentry:
             return False, f"top-return y {cy} < min_reentry_y {min_reentry_y}"
