@@ -678,6 +678,12 @@ class InteractiveBallAnalyzer:
         normalized_key = self._normalize_false_point_filter_key(filter_key)
         if normalized_key is None:
             return None
+        if int(getattr(self, 'start_frame', 0) or 0) > 0:
+            print(
+                f"[FALSE_POINT_LEARN_SKIPPED] f{self.frame_count}: partial-run false point "
+                f"at {pos} filter={normalized_key} reason={reason}"
+            )
+            return None
 
         for entry in self._persistent_false_points:
             dist = math.hypot(pos[0] - entry["pos"][0], pos[1] - entry["pos"][1])
@@ -3079,10 +3085,17 @@ class InteractiveBallAnalyzer:
         if (self.frame_count - getattr(self, 'last_ground_bounce_frame', -1000000)) <= 3:
             return False
         origin_y = ground_bounce_context['origin'][1]
+        late_contact_until = int(getattr(self, '_late_contact_prior_bounce_until_frame', -1000000))
+        late_contact_saved_frame = late_contact_until - 90
+        post_preserve_contact = (
+            late_contact_until > -1000000 and
+            int(getattr(self, '_last_racket_contact_frame', -1000000)) >= late_contact_saved_frame
+        )
         carried_prior_bounce = (
             self.ground_bounce_count == 0 and
             self._late_contact_prior_bounce_active() and
-            origin_y <= max(360, int(frame.shape[0] * 0.18))
+            origin_y <= max(360, int(frame.shape[0] * 0.18)) and
+            not post_preserve_contact
         )
         if carried_prior_bounce:
             self.ground_bounce_count = int(getattr(self, '_late_contact_prior_bounce_count', 0))
