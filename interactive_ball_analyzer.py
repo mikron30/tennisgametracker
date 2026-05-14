@@ -342,7 +342,18 @@ class InteractiveBallAnalyzer:
             getattr(self, '_serve_contact_grace_frames', 0) > 0 or
             self._serve_direction_search_active()
         )
-        ground_like = prev_dy >= 4.0 and dy <= -4.0
+        ground_reversal_like = prev_dy >= 4.0 and dy <= -4.0
+        # Some real court bounces are first visible as a strong downward path
+        # flattening at court level before the next frame clearly moves upward.
+        ground_flatten_like = (
+            point is not None and
+            int(point[1]) >= 420 and
+            prev_dy >= 18.0 and
+            -4.0 <= dy <= max(8.0, prev_dy * 0.35) and
+            prev_distance >= 18.0 and
+            distance >= 12.0
+        )
+        ground_like = ground_reversal_like or ground_flatten_like
         racket_like = (prev_dx * dx) < -12.0 and max(abs(prev_dx), abs(dx)) >= 6.0
         net_like = False
         if point is not None:
@@ -367,6 +378,33 @@ class InteractiveBallAnalyzer:
             return "problematic", "slow"
         return "problematic", "other"
 
+    def _append_direction_change_review_event(self, point, status, reason, angle_diff=None, frame=None):
+        if point is None:
+            return
+        event_frame = int(self.frame_count if frame is None else frame)
+        pos = (int(point[0]), int(point[1]))
+        for existing in reversed(self.direction_change_events[-8:]):
+            if existing.get('frame') != event_frame:
+                continue
+            existing_pos = existing.get('pos')
+            if existing_pos is None:
+                continue
+            if math.hypot(existing_pos[0] - pos[0], existing_pos[1] - pos[1]) > 18:
+                continue
+            if existing.get('status') != 'good' and status == 'good':
+                existing['status'] = status
+                existing['reason'] = reason
+                if angle_diff is not None:
+                    existing['angle_diff'] = float(angle_diff)
+            return
+        self.direction_change_events.append({
+            'frame': event_frame,
+            'pos': pos,
+            'status': status,
+            'reason': reason,
+            'angle_diff': float(angle_diff) if angle_diff is not None else None,
+        })
+
     def _record_direction_change_event(self, point, prev_dx, prev_dy, dx, dy, prev_distance, distance, angle_diff):
         if point is None:
             return
@@ -374,13 +412,7 @@ class InteractiveBallAnalyzer:
             point,
             prev_dx, prev_dy, dx, dy, prev_distance, distance
         )
-        self.direction_change_events.append({
-            'frame': int(self.frame_count),
-            'pos': (int(point[0]), int(point[1])),
-            'status': status,
-            'reason': reason,
-            'angle_diff': float(angle_diff) if angle_diff is not None else None,
-        })
+        self._append_direction_change_review_event(point, status, reason, angle_diff=angle_diff)
 
     def serve_direction_label(self):
         horizontal = "right" if self.serve_direction_dx >= 0 else "left"
@@ -2964,6 +2996,8 @@ class InteractiveBallAnalyzer:
         if getattr(self, '_awaiting_serve_bounce', False):
             self._awaiting_serve_bounce = False
         if in_bounds:
+            review_reason = "serve" if serve_bounce_active else "ground"
+            self._append_direction_change_review_event(point, "good", review_reason, frame=self.frame_count)
             if not serve_bounce_active and getattr(self, 'ground_bounce_count', 0) >= 2:
                 self._pending_rally_end_reason = "Ball bounced twice on court"
                 self._pending_rally_end_frame = self.frame_count
