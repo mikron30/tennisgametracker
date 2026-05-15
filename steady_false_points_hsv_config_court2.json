@@ -11257,6 +11257,30 @@
       "filter_keys": [
         "alt2"
       ]
+    },
+    {
+      "pos": [
+        2117,
+        264
+      ],
+      "radius": 22,
+      "count": 3,
+      "reason": "steady repeated false point",
+      "filter_keys": [
+        "alt2"
+      ]
+    },
+    {
+      "pos": [
+        2729,
+        601
+      ],
+      "radius": 22,
+      "count": 3,
+      "reason": "steady repeated false point",
+      "filter_keys": [
+        "alt2"
+      ]
     }
   ]
 }

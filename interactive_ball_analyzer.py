@@ -3760,6 +3760,9 @@ class InteractiveBallAnalyzer:
         if not outside_far_baseline:
             return False, None
 
+        if self.frame_count <= int(getattr(self, '_top_far_out_defer_until_frame', -1000000)):
+            return False, None
+
         recent_top_origin_frame = int(getattr(self, '_top_return_origin_frame', -1000000))
         recent_top_wait_context = 0 <= (self.frame_count - recent_top_origin_frame) <= 110
         upper_arc_recently_active = (
@@ -4725,6 +4728,8 @@ class InteractiveBallAnalyzer:
         best_score = float('inf')
 
         for label, lower, upper, label_bonus in hint_specs:
+            if lower is None or upper is None:
+                continue
             mask = cv2.inRange(hsv_local, lower, upper)
             if cv2.countNonZero(mask) == 0:
                 continue
@@ -9187,6 +9192,8 @@ class InteractiveBallAnalyzer:
                 direction_deg = math.degrees(math.atan2(dy, dx))
             else:
                 velocity = 0
+            hsv_override_applied = False
+
             # If direction/speed look wrong, try alternative HSV before committing
             # Skip this during full-frame scan recovery - ball direction changed after player hit.
             # Also skip during post-reacquire window: the serve contact can instantly reverse
@@ -9235,6 +9242,7 @@ class InteractiveBallAnalyzer:
                             self.hsv_upper = self.alt_focus_hsv_upper
                         print(f"Frame {self.frame_count}: [ALT HSV OVERRIDE] Ball at ({cx}, {cy})")
                         override_applied = True
+                        hsv_override_applied = True
                     if (not override_applied and self.alt2_hsv_lower is not None and
                             self.alt2_hsv_upper is not None):
                         retrack2 = self.retrack_with_alt2_hsv(
@@ -9255,6 +9263,7 @@ class InteractiveBallAnalyzer:
                             self.hsv_upper = self.alt2_hsv_upper
                             print(f"Frame {self.frame_count}: [ALT2 HSV OVERRIDE] Ball at ({cx}, {cy})")
                             override_applied = True
+                            hsv_override_applied = True
                             if self.last_motion and self.alt3_hsv_lower is not None and self.alt3_hsv_upper is not None:
                                 lm_dist = self.last_motion['distance']
                                 mv_dx = cx - self.ball_center[0]
@@ -9307,6 +9316,7 @@ class InteractiveBallAnalyzer:
                             self.hsv_upper = self.alt4_hsv_upper
                             print(f"Frame {self.frame_count}: [ALT4 HSV OVERRIDE] Ball at ({cx}, {cy})")
                             override_applied = True
+                            hsv_override_applied = True
                     if (not override_applied and self.alt6_hsv_lower is not None and
                             self.alt6_hsv_upper is not None):
                         retrack6 = self.retrack_with_alt2_hsv(
@@ -9328,6 +9338,7 @@ class InteractiveBallAnalyzer:
                             self.hsv_upper = self.alt6_hsv_upper
                             print(f"Frame {self.frame_count}: [ALT6 HSV OVERRIDE] Ball at ({cx}, {cy})")
                             override_applied = True
+                            hsv_override_applied = True
                     if self._should_try_alts9_11_override(frame.shape, allow_inactive):
                         specialist_current_pos = (cx, cy)
                         specialist_current_area = bulb_size
@@ -9345,6 +9356,7 @@ class InteractiveBallAnalyzer:
                             bulb_size = retrack_s911['area']
                             print(f"Frame {self.frame_count}: [ALTS9_11 HSV OVERRIDE] Ball at ({cx}, {cy})")
                             override_applied = True
+                            hsv_override_applied = True
                     if (not override_applied and
                             (self.alt6_hsv_lower is None or self.alt6_hsv_upper is None) and
                             self.alt3_hsv_lower is not None and self.alt3_hsv_upper is not None):
@@ -9366,6 +9378,40 @@ class InteractiveBallAnalyzer:
                             self.hsv_lower = self.alt3_hsv_lower
                             self.hsv_upper = self.alt3_hsv_upper
                             print(f"Frame {self.frame_count}: [ALT3 HSV OVERRIDE] Ball at ({cx}, {cy})")
+
+            # HSV overrides can replace a stale contour with the real ball during
+            # top-screen return recovery. Keep that narrow path aligned with the
+            # final candidate, or it may hold the old marker because it is still
+            # scoring the pre-override fragment.
+            recent_top_return_override = (
+                hsv_override_applied and
+                self._recent_offscreen_return_hold_active(window_frames=12)
+            )
+            if recent_top_return_override:
+                current_pos = (cx, cy)
+                current_area = bulb_size
+                dx = dy = 0
+                direction_deg = None
+                if prev_pos:
+                    dx = cx - prev_pos[0]
+                    dy = cy - prev_pos[1]
+                    velocity = math.hypot(dx, dy)
+                    direction_deg = math.degrees(math.atan2(dy, dx)) if velocity > 0 else 0.0
+                else:
+                    velocity = 0
+                if (
+                        prev_pos is not None and
+                        dy >= max(8.0, frame_height * 0.004) and
+                        velocity <= max(70.0, float(self.last_motion.get('distance', 0.0) or 0.0) * 1.25)
+                        and bulb_size <= max(14.0, float(prev_ball_size or 0.0) * 3.5)
+                        and max(175, int(frame_height * 0.081)) <= cy <= max(270, int(frame_height * 0.13))):
+                    existing_defer = int(getattr(self, '_top_far_out_defer_until_frame', -1000000))
+                    if self.frame_count > existing_defer:
+                        self._top_far_out_defer_until_frame = self.frame_count + 3
+                        print(
+                            f"Frame {self.frame_count}: [TOP-FAR-OUT DEFER] "
+                            f"smooth HSV return continuation at ({cx},{cy})"
+                        )
 
             # Detect sudden ball size drop (occlusion by player)
             # If ball was > 30px and now < 5px, it's being occluded — don't trust this detection
