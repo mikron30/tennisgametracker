@@ -12885,17 +12885,102 @@ class InteractiveBallAnalyzer:
         prev_dy = float(self.prev_motion.get('dy', 0.0) or 0.0)
         curr_speed = float(self.last_motion.get('distance', 0.0) or 0.0)
         prev_speed = float(self.prev_motion.get('distance', 0.0) or 0.0)
-        if prev_speed < 20.0 or curr_speed < 12.0:
-            return False, None
 
         prev_pos = (int(round(x - curr_dx)), int(round(y - curr_dy)))
+        recent_motion = [
+            entry
+            for entry in getattr(self, 'motion_history', [])
+            if 0 <= self.frame_count - int(entry.get('frame', -1000000)) <= 5
+            and entry.get('prev_pos') is not None
+            and entry.get('pos') is not None
+        ]
+        recent_dys = [
+            float(entry['pos'][1] - entry['prev_pos'][1])
+            for entry in recent_motion
+        ]
+        recent_descending = (
+            sum(1 for recent_dy in recent_dys[-4:] if recent_dy >= 3.0) >= 2 and
+            max(recent_dys[-4:] or [0.0]) >= 5.0
+        )
+        soft_turn_motion = (
+            recent_descending and
+            prev_dy >= -2.0 and
+            curr_dy <= -12.0 and
+            curr_speed >= 18.0
+        )
+
         prev_pos_outside, prev_side, prev_left_x, prev_right_x = self._point_outside_singles_sidelines(prev_pos, frame)
         curr_pos_outside, curr_side, curr_left_x, curr_right_x = self._point_outside_singles_sidelines(ball_position, frame)
+        near_side_min_y = int(self.net_area_y_min + 60)
+        soft_out_near_sideline = False
+        if (
+            not prev_pos_outside and
+            not curr_pos_outside and
+            soft_turn_motion and
+            prev_pos[1] < near_side_min_y and
+            y < near_side_min_y and
+            curr_left_x is not None and
+            curr_right_x is not None
+        ):
+            cached_model = self._build_singles_sideline_model(frame)
+            sideline_margin = float(cached_model['margin']) if cached_model is not None else 12.0
+            left_gap = float(x) - float(curr_left_x)
+            right_gap = float(curr_right_x) - float(x)
+            near_band = max(24.0, sideline_margin * 2.0)
+            if 0.0 <= left_gap <= near_band and curr_dx <= -4.0:
+                soft_out_near_sideline = True
+                curr_side = 'left'
+            elif 0.0 <= right_gap <= near_band and curr_dx >= 4.0:
+                soft_out_near_sideline = True
+                curr_side = 'right'
+            if soft_out_near_sideline:
+                print(
+                    f"Frame {self.frame_count}: [SOFT OUT SIDELINE BAND] "
+                    f"pos={ball_position} side={curr_side} "
+                    f"left_gap={left_gap:.1f} right_gap={right_gap:.1f} "
+                    f"band={near_band:.1f}"
+                )
         if not prev_pos_outside and not curr_pos_outside:
+            if not soft_out_near_sideline:
+                return False, None
+
+        side = prev_side or curr_side
+        left_x = prev_left_x if prev_pos_outside else curr_left_x
+        right_x = prev_right_x if prev_pos_outside else curr_right_x
+        if side is None or left_x is None or right_x is None:
             return False, None
 
-        near_side_min_y = int(self.net_area_y_min + 60)
-        if prev_pos[1] < near_side_min_y and y < near_side_min_y:
+        model = self._build_singles_sideline_model(frame)
+        sideline_margin = float(model['margin']) if model is not None else 12.0
+        outside_x = prev_pos[0] if prev_pos_outside else x
+        outside_left_x = prev_left_x if prev_pos_outside else curr_left_x
+        outside_right_x = prev_right_x if prev_pos_outside else curr_right_x
+        outside_depth = 0.0
+        if side == 'left' and outside_left_x is not None:
+            outside_depth = max(0.0, float(outside_left_x) - float(outside_x))
+        elif side == 'right' and outside_right_x is not None:
+            outside_depth = max(0.0, float(outside_x) - float(outside_right_x))
+
+        outward_motion = (
+            (side == 'left' and curr_dx <= -4.0) or
+            (side == 'right' and curr_dx >= 4.0)
+        )
+        soft_out_reversal = (
+            (
+                (
+                    curr_pos_outside and
+                    outside_depth >= max(20.0, sideline_margin * 1.5)
+                ) or
+                soft_out_near_sideline
+            ) and
+            soft_turn_motion and
+            outward_motion and
+            curr_speed >= 18.0
+        )
+        if (prev_speed < 20.0 or curr_speed < 12.0) and not soft_out_reversal:
+            return False, None
+
+        if prev_pos[1] < near_side_min_y and y < near_side_min_y and not soft_out_reversal:
             return False, None
 
         prev_dir = self.prev_motion.get('direction_deg')
@@ -12907,19 +12992,14 @@ class InteractiveBallAnalyzer:
 
         vertical_reversal = prev_dy >= 18.0 and curr_dy <= -12.0
         sharp_turn = angle_diff >= 95.0
-        if not (vertical_reversal or sharp_turn):
+        if not (vertical_reversal or sharp_turn or soft_out_reversal):
             return False, None
 
-        side = prev_side or curr_side
         bounce_point = prev_pos if prev_pos_outside else ball_position
-        left_x = prev_left_x if prev_pos_outside else curr_left_x
-        right_x = prev_right_x if prev_pos_outside else curr_right_x
-        if left_x is None or right_x is None:
-            return False, None
 
-        if self._sideline_line_contact_override(
+        if (not soft_out_near_sideline and self._sideline_line_contact_override(
                 bounce_point, side, left_x, right_x, frame, self.ball_size,
-                emit_debug=False):
+                emit_debug=False)):
             line_context = self._line_contact_bounce_context(
                 bounce_point, ball_position, prev_dx, prev_dy, prev_speed, frame
             )
@@ -12937,6 +13017,7 @@ class InteractiveBallAnalyzer:
             f"Frame {self.frame_count}: [OUT-BOUNCE] bounce_point={bounce_point} side={side} "
             f"court_x={left_x:.1f}-{right_x:.1f} prev_motion=({prev_dx:.1f},{prev_dy:.1f}) "
             f"curr_motion=({curr_dx:.1f},{curr_dy:.1f}) angle_diff={angle_diff:.1f}"
+            f"{' soft_out_reversal=yes' if soft_out_reversal else ''}"
         )
         return True, f"Ball bounced out of court ({side} sideline)"
     
