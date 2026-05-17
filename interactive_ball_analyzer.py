@@ -2296,6 +2296,44 @@ class InteractiveBallAnalyzer:
         if (
                 label in ("alt1", "alt2", "alt4", "alt6") and
                 frame_height and
+                self.last_motion is not None and
+                self.ball_size is not None and
+                current_area is not None and
+                getattr(self, 'stuck_frame_count', 0) >= 2 and
+                prev_pos[1] >= max(850, int(frame_height * 0.40)) and
+                float(self.ball_size) >= 120.0 and
+                float(current_area) >= max(80.0, float(self.ball_size) * 0.55) and
+                override_area <= max(70.0, float(current_area) * 0.45) and
+                current_dynamic
+        ):
+            last_dx = float(self.last_motion.get('dx', 0.0) or 0.0)
+            last_dy = float(self.last_motion.get('dy', 0.0) or 0.0)
+            current_dx = float(current_pos[0] - prev_pos[0])
+            current_dy = float(current_pos[1] - prev_pos[1])
+            override_dx = float(override['pos'][0] - prev_pos[0])
+            override_dy = float(override['pos'][1] - prev_pos[1])
+            current_dot = last_dx * current_dx + last_dy * current_dy
+            override_dot = last_dx * override_dx + last_dy * override_dy
+            current_reverses_incoming_path = (
+                current_dot < 0.0 and
+                current_dy <= -max(18.0, abs(last_dy) * 0.25)
+            )
+            override_keeps_incoming_path = (
+                override_dot > 0.0 and
+                override_dy >= -8.0
+            )
+            current_not_farther_from_track = (
+                current_metrics['prev_distance'] <= override_metrics['prev_distance'] + 25.0
+            )
+            if current_reverses_incoming_path and override_keeps_incoming_path and current_not_farther_from_track:
+                print(
+                    f"  DEBUG: Rejecting {label} override at {override['pos']} - "
+                    f"keeping large lower-court reversal candidate {current_pos}"
+                )
+                return False
+        if (
+                label in ("alt1", "alt2", "alt4", "alt6") and
+                frame_height and
                 prev_pos[1] <= max(320, int(frame_height * 0.16)) and
                 predicted_point is not None and
                 current_metrics['predicted_distance'] is not None and
