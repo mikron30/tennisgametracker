@@ -2599,6 +2599,43 @@ class InteractiveBallAnalyzer:
                 relaxed_min_y = max(0, relaxed_min_y - 90)
         return relaxed_min_y
 
+    def _is_upper_static_recover_jump(self, candidate, frame_shape):
+        """Reject far upper-court fallback jumps onto low-motion static blobs."""
+        if candidate is None or self.ball_center is None or self.ball_size is None:
+            return False
+
+        jump = math.hypot(
+            candidate['pos'][0] - self.ball_center[0],
+            candidate['pos'][1] - self.ball_center[1],
+        )
+        return (
+            self.ball_size <= 12.0 and
+            self.ball_center[1] <= max(360, int(frame_shape[0] * 0.18)) and
+            jump > max(
+                45.0,
+                float((self.last_motion or {}).get('distance', 0.0) or 0.0) * 3.0,
+            ) and
+            candidate.get('motion_mean', 0.0) < 2.0 and
+            candidate.get('motion_max', 0.0) < 10.0
+        )
+
+    def _reject_upper_static_recover(self, candidate, frame_shape, label):
+        """Return True and log when a fallback recovery is a static upper-court jump."""
+        if not self._is_upper_static_recover_jump(candidate, frame_shape):
+            return False
+
+        jump = math.hypot(
+            candidate['pos'][0] - self.ball_center[0],
+            candidate['pos'][1] - self.ball_center[1],
+        )
+        print(
+            f"  DEBUG: Rejecting {label} recover at {candidate['pos']} - "
+            f"upper static jump {jump:.1f}px motion="
+            f"{candidate.get('motion_mean', 0.0):.1f}/"
+            f"{candidate.get('motion_max', 0.0):.1f}"
+        )
+        return True
+
     def _recent_upper_racket_top_exit_context(self, frame_shape, max_frames=45):
         """True when a recent upper-racket contact is now leaving through the top band."""
         if self.ball_center is None:
@@ -8009,6 +8046,8 @@ class InteractiveBallAnalyzer:
                     search_frame, x1, y1, self.ball_center, predicted_point, self.ball_size, allow_inactive,
                     frame_gray=frame_gray, filter_key="alt1"
                 )
+                if retrack is not None and self._reject_upper_static_recover(retrack, frame.shape, "alt"):
+                    retrack = None
                 if retrack is not None:
                     new_pos = retrack['pos']
                     self.ball_center = new_pos
@@ -8031,13 +8070,17 @@ class InteractiveBallAnalyzer:
                     frame_gray=frame_gray, filter_key="alt2"
                 )
                 if retrack2 is not None:
-                    if (not allow_inactive and self.ball_center is not None and
-                            self.stuck_frame_count < 2):
+                    alt2_jump = None
+                    if self.ball_center is not None:
                         alt2_jump = math.hypot(
                             retrack2['pos'][0] - self.ball_center[0],
                             retrack2['pos'][1] - self.ball_center[1],
                         )
-                        if alt2_jump > 100.0:
+                    if not allow_inactive and self._reject_upper_static_recover(retrack2, frame.shape, "alt2"):
+                        retrack2 = None
+                    if (not allow_inactive and self.ball_center is not None and
+                            self.stuck_frame_count < 2):
+                        if retrack2 is not None and alt2_jump is not None and alt2_jump > 100.0:
                             print(
                                 f"  DEBUG: Rejecting alt2 recover at {retrack2['pos']} - "
                                 f"early recovery jump {alt2_jump:.1f}px > 100.0px"
@@ -8094,6 +8137,8 @@ class InteractiveBallAnalyzer:
                     lower=self.alt4_hsv_lower, upper=self.alt4_hsv_upper, frame_gray=frame_gray,
                     filter_key="alt4"
                 )
+                if retrack4 is not None and self._reject_upper_static_recover(retrack4, frame.shape, "alt4"):
+                    retrack4 = None
                 if retrack4 is not None:
                     new_pos = retrack4['pos']
                     self.ball_center = new_pos
@@ -8114,6 +8159,8 @@ class InteractiveBallAnalyzer:
                     lower=self.alt6_hsv_lower, upper=self.alt6_hsv_upper, frame_gray=frame_gray,
                     filter_key="alt6"
                 )
+                if retrack6 is not None and self._reject_upper_static_recover(retrack6, frame.shape, "alt6"):
+                    retrack6 = None
                 if retrack6 is not None:
                     new_pos = retrack6['pos']
                     self.ball_center = new_pos
@@ -8134,6 +8181,8 @@ class InteractiveBallAnalyzer:
                     lower=self.alt3_hsv_lower, upper=self.alt3_hsv_upper, frame_gray=frame_gray,
                     filter_key="alt3"
                 )
+                if retrack3 is not None and self._reject_upper_static_recover(retrack3, frame.shape, "alt3"):
+                    retrack3 = None
                 if retrack3 is not None:
                     new_pos = retrack3['pos']
                     self.ball_center = new_pos
@@ -8173,6 +8222,9 @@ class InteractiveBallAnalyzer:
                     lower=self.s30_hsv_lower, upper=self.s30_hsv_upper, frame_gray=frame_gray,
                     filter_key="s_30"
                 )
+                if retrack_s30 is not None:
+                    if self._reject_upper_static_recover(retrack_s30, frame.shape, "s_30"):
+                        retrack_s30 = None
                 if retrack_s30 is not None:
                     bottom_large_exit_false_s30 = (
                         not allow_inactive and
@@ -8216,6 +8268,8 @@ class InteractiveBallAnalyzer:
                     lower=self.h10_hsv_lower, upper=self.h10_hsv_upper, frame_gray=frame_gray,
                     filter_key="h_10"
                 )
+                if retrack_h10 is not None and self._reject_upper_static_recover(retrack_h10, frame.shape, "h_10"):
+                    retrack_h10 = None
                 if retrack_h10 is not None:
                     new_pos = retrack_h10['pos']
                     self.ball_center = new_pos
@@ -8252,9 +8306,7 @@ class InteractiveBallAnalyzer:
                     and not getattr(self, 'auto_play', False)):
                 predicted_point = predicted_point or self.get_predicted_point()
                 if predicted_point is not None:
-                    print("  DEBUG: Ball lost. Opening HSV debug windows at predicted position...")
-                    self.open_predicted_hsv_debug_all(frame, predicted_point, self.frame_count)
-                    self.pause_requested = True
+                    print("  DEBUG: Ball lost; continuing without auto-pausing.")
             
             # Keep the ball_center at last position instead of losing it
             # Increment stuck counter since no contour was found
@@ -9420,6 +9472,8 @@ class InteractiveBallAnalyzer:
                             lower=self.h10_hsv_lower, upper=self.h10_hsv_upper, frame_gray=frame_gray,
                             filter_key="h_10", ignore_false_points=True, prefer_predicted_path=True
                         )
+                        if retrack_h10 is not None and self._reject_upper_static_recover(retrack_h10, frame.shape, "h_10"):
+                            retrack_h10 = None
                         if retrack_h10 is not None:
                             h10_pos = retrack_h10['pos']
                             h10_prev_distance = math.hypot(
@@ -9959,18 +10013,33 @@ class InteractiveBallAnalyzer:
                 hsv_override_applied and
                 self._recent_offscreen_return_hold_active(window_frames=12)
             )
-            if recent_top_return_override:
+            override_final_dx = override_final_dy = 0
+            override_final_velocity = None
+            if hsv_override_applied and prev_pos is not None:
+                override_final_dx = cx - prev_pos[0]
+                override_final_dy = cy - prev_pos[1]
+                override_final_velocity = math.hypot(override_final_dx, override_final_dy)
+            last_motion_distance = (
+                float(self.last_motion.get('distance', 0.0) or 0.0)
+                if self.last_motion is not None else 0.0
+            )
+            override_replaced_false_jump = (
+                hsv_override_applied and
+                override_final_velocity is not None and
+                velocity >= max(150.0, last_motion_distance * 4.0) and
+                override_final_velocity <= max(40.0, last_motion_distance * 2.0)
+            )
+            if recent_top_return_override or override_replaced_false_jump:
                 current_pos = (cx, cy)
                 current_area = bulb_size
-                dx = dy = 0
-                direction_deg = None
-                if prev_pos:
-                    dx = cx - prev_pos[0]
-                    dy = cy - prev_pos[1]
-                    velocity = math.hypot(dx, dy)
-                    direction_deg = math.degrees(math.atan2(dy, dx)) if velocity > 0 else 0.0
-                else:
-                    velocity = 0
+                dx = override_final_dx
+                dy = override_final_dy
+                velocity = override_final_velocity if override_final_velocity is not None else 0
+                direction_deg = (
+                    math.degrees(math.atan2(dy, dx))
+                    if velocity > 0 else 0.0
+                )
+            if recent_top_return_override:
                 if (
                         prev_pos is not None and
                         dy >= max(8.0, frame_height * 0.004) and
@@ -11121,6 +11190,8 @@ class InteractiveBallAnalyzer:
                 lower=self.h10_hsv_lower, upper=self.h10_hsv_upper, frame_gray=frame_gray,
                 filter_key="h_10", ignore_false_points=True
             )
+            if retrack_h10 is not None and self._reject_upper_static_recover(retrack_h10, frame.shape, "h_10"):
+                retrack_h10 = None
             if retrack_h10 is not None:
                 h10_pos = retrack_h10['pos']
                 prev_distance = math.hypot(
@@ -13841,12 +13912,6 @@ class InteractiveBallAnalyzer:
                         point_end_frame = self.frame_count
                         print(f"Frame {self.frame_count}: POINT ENDED - Ball lost (likely out of court)")
                         print(f"Point duration: {point_end_frame - point_start_frame} frames")
-                        if not getattr(self, 'auto_play', False):
-                            predicted_point = self.get_predicted_point() or self.ball_center
-                            if predicted_point is not None:
-                                print("  DEBUG: Point ended. Opening HSV debug windows at predicted position...")
-                                self.open_predicted_hsv_debug_all(frame, predicted_point, self.frame_count)
-                                self.pause_requested = True
                         game_state = "WAITING_FOR_SERVE"
                         reset_tracking_state(hold_end_marker=True)
             
