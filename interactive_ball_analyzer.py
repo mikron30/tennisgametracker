@@ -11484,73 +11484,41 @@ class InteractiveBallAnalyzer:
 
         point_end_visuals = self._active_point_end_visuals()
         use_point_end_visuals = point_end_visuals if self.ball_center is None else None
+
         visual_ball_center = self.ball_center
-        visual_ball_hsv = self.ball_hsv
-        visual_ball_size = self.ball_size
-        visual_hsv_lower = self.hsv_lower
-        visual_hsv_upper = self.hsv_upper
         if use_point_end_visuals is not None:
             visual_ball_center = use_point_end_visuals.get('ball_center')
-            visual_ball_hsv = use_point_end_visuals.get('ball_hsv')
-            visual_ball_size = use_point_end_visuals.get('ball_size')
-            visual_hsv_lower = use_point_end_visuals.get('hsv_lower')
-            visual_hsv_upper = use_point_end_visuals.get('hsv_upper')
+
+        motion_vectors = getattr(self, 'motion_debug_vectors', [])
+        if motion_vectors:
+            recent_vectors = motion_vectors[-max(1, int(getattr(self, 'motion_debug_vector_limit', 8))):]
+            total = max(1, len(recent_vectors))
+            for idx, entry in enumerate(recent_vectors):
+                p0 = entry.get('from')
+                p1 = entry.get('to')
+                if p0 is None or p1 is None:
+                    continue
+                fade = 0.35 + (0.65 * ((idx + 1) / float(total)))
+                color = (0, int(round(255 * fade)), 0)
+                x0 = int(p0[0] * scale)
+                y0 = int(p0[1] * scale)
+                x1 = int(p1[0] * scale)
+                y1 = int(p1[1] * scale)
+                cv2.line(result, (x0, y0), (x1, y1), color, 2)
 
         if visual_ball_center:
-            # Scale ball coordinates for display
             x = int(visual_ball_center[0] * scale)
             y = int(visual_ball_center[1] * scale)
-            
-            # Draw green circle around the ball
-            cv2.circle(result, (x, y), 10, (0, 255, 0), 2)  # Circle outline
-            cv2.circle(result, (x, y), 2, (0, 255, 0), -1)  # Center dot
-            
-            # Draw info text at the top
-            if visual_ball_hsv is not None and visual_ball_size is not None:
-                # Show current HSV values at clicked point
-                hsv_text = f"Ball HSV: H={visual_ball_hsv[0]}, S={visual_ball_hsv[1]}, V={visual_ball_hsv[2]}"
-                cv2.putText(result, hsv_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-                
-                # Show HSV filter range
-                if visual_hsv_lower is not None and visual_hsv_upper is not None:
-                    filter_text = f"Filter: H={visual_hsv_lower[0]}-{visual_hsv_upper[0]}, S={visual_hsv_lower[1]}-{visual_hsv_upper[1]}, V={visual_hsv_lower[2]}-{visual_hsv_upper[2]}"
-                    cv2.putText(result, filter_text, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-                
-                # Show bulb size
-                size_text = f"Bulb Size: {visual_ball_size:.0f}px"
-                cv2.putText(result, size_text, (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-                
-                # Show ball position
-                pos_text = f"Ball Pos: ({visual_ball_center[0]}, {visual_ball_center[1]})"
-                cv2.putText(result, pos_text, (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-
-        waiting_candidate = getattr(self, 'waiting_serve_candidate', None)
-        waiting_candidate_frame = getattr(self, 'waiting_serve_candidate_frame', -1)
-        if (waiting_candidate is not None and not self.tracking and
-                abs(self.frame_count - waiting_candidate_frame) <= 2):
-            sx = int(waiting_candidate[0] * scale)
-            sy = int(waiting_candidate[1] * scale)
-            cv2.circle(result, (sx, sy), 10, (0, 255, 255), 2)
-            cv2.circle(result, (sx, sy), 2, (0, 255, 255), -1)
-            serve_pos_text = f"Serve Cand: ({waiting_candidate[0]}, {waiting_candidate[1]})"
-            cv2.putText(result, serve_pos_text, (10, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+            cv2.circle(result, (x, y), 10, (0, 255, 0), 2)
+            cv2.circle(result, (x, y), 2, (0, 255, 0), -1)
 
         if getattr(self, 'show_event_markers', False):
-            good_events = []
-            problematic_events = []
             direction_events = getattr(self, 'direction_change_events', [])
-            net_points = getattr(self, 'net_contact_points', [])
             if use_point_end_visuals is not None:
                 direction_events = use_point_end_visuals.get('direction_change_events', [])
-                net_points = use_point_end_visuals.get('net_contact_points', [])
             for event in direction_events:
                 point = event.get('pos')
                 if point is None:
-                    continue
-                if visual_ball_center is not None and math.hypot(
-                    point[0] - visual_ball_center[0],
-                    point[1] - visual_ball_center[1],
-                ) <= 12:
                     continue
                 is_good = event.get('status') == 'good'
                 color = (255, 0, 0) if is_good else (0, 0, 255)
@@ -11558,112 +11526,6 @@ class InteractiveBallAnalyzer:
                 py = int(point[1] * scale)
                 cv2.circle(result, (px, py), 11, color, 2)
                 cv2.circle(result, (px, py), 3, color, -1)
-                frame_label = str(event.get('frame', '?'))
-                cv2.putText(
-                    result,
-                    frame_label,
-                    (px + 8, py - 8),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.42,
-                    color,
-                    1,
-                )
-                if is_good:
-                    good_events.append(event)
-                else:
-                    problematic_events.append(event)
-            # Draw net contact points
-            for point in net_points:
-                px = int(point[0] * scale)
-                py = int(point[1] * scale)
-                cv2.circle(result, (px, py), 12, (0, 0, 255), 3)
-
-            col_top = 240
-            col_x1 = 10
-            col_x2 = 190
-            line_h = 16
-            cv2.putText(result, "GOOD CHANGES", (col_x1, col_top), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
-            cv2.putText(result, "SUSPECT CHANGES", (col_x2, col_top), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
-            for idx, event in enumerate(good_events[-18:]):
-                yy = col_top + 18 + idx * line_h
-                label = f"f{event.get('frame', '?')} {event.get('reason', '')}"
-                cv2.putText(result, label, (col_x1, yy), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 0, 0), 1)
-            for idx, event in enumerate(problematic_events[-18:]):
-                yy = col_top + 18 + idx * line_h
-                label = f"f{event.get('frame', '?')} {event.get('reason', '')}"
-                cv2.putText(result, label, (col_x2, yy), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 0, 255), 1)
-
-        self._prune_bounce_markers()
-        bounce_markers = getattr(self, 'recent_bounce_markers', [])
-        if use_point_end_visuals is not None:
-            bounce_markers = use_point_end_visuals.get('recent_bounce_markers', [])
-        for marker in bounce_markers:
-            point = marker.get('pos')
-            base_color = marker.get('color', (255, 0, 0))
-            if point is None:
-                continue
-            start_frame = int(marker.get('start_frame', self.frame_count))
-            ttl = max(1, int(marker.get('ttl', 7)))
-            age = max(0, self.frame_count - start_frame)
-            if ttl <= 1:
-                fade = 1.0
-            else:
-                fade = max(0.0, 1.0 - (age / float(ttl - 1)))
-            color = tuple(int(round(channel * fade)) for channel in base_color)
-            px = int(point[0] * scale)
-            py = int(point[1] * scale)
-            cv2.circle(result, (px, py), 12, color, 3)
-            cv2.circle(result, (px, py), 4, color, -1)
-
-        result = self._draw_motion_debug_vectors(result, scale=scale)
-
-        top_zone = self._active_top_return_overlay_region((frame.shape[0], frame.shape[1]))
-        if top_zone is not None:
-            tx1, ty1, tx2, ty2 = top_zone
-            cv2.rectangle(
-                result,
-                (int(tx1 * scale), int(ty1 * scale)),
-                (int(tx2 * scale), int(ty2 * scale)),
-                (0, 215, 255),
-                2,
-            )
-            cv2.putText(
-                result,
-                "TOP RETURN ZONE",
-                (int(tx1 * scale) + 4, int(ty1 * scale) + 20),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.55,
-                (0, 215, 255),
-                2,
-            )
-
-        # Show motion metrics and focus-loss status
-        if self.last_motion is not None:
-            distance = self.last_motion['distance']
-            direction_deg = self.last_motion['direction_deg']
-            direction_text = f"{direction_deg:+.1f} deg" if direction_deg is not None else "N/A"
-            motion_text = f"Ball Move: {distance:.1f}px | Dir: {direction_text}"
-            cv2.putText(result, motion_text, (10, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-            cv2.putText(
-                result,
-                f"Dir Change Threshold: {self.direction_change_min_degrees:.0f} deg",
-                (10, 180),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                (0, 220, 255),
-                2,
-            )
-        if self.focus_loss_active:
-            cv2.putText(result, "FOCUS LOST", (10, 210), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-        elif self.using_alt6_hsv:
-            cv2.putText(result, "USING ALTERNATIVE 6 HSV", (10, 210), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        elif self.using_alt2_hsv:
-            cv2.putText(result, "USING ALTERNATIVE 2 HSV", (10, 210), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        elif self.using_alt_hsv:
-            cv2.putText(result, "USING ALTERNATIVE HSV", (10, 210), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-
-        if show_paused_rejected:
-            result = self._draw_rejected_contour_debug(result, scale=scale)
         
         return result
     
@@ -13383,14 +13245,11 @@ class InteractiveBallAnalyzer:
         print("2. Tracks ball through each point")
         print("3. Detects when point ends (out, net, double bounce)")
         print("4. Automatically waits for next serve")
-        print("5. Press 'D' to advance frame by frame")
-        print("6. Press 'N' to mark net area (6 points clockwise)")
-        print("7. Press 'S' to mark serve area (4 points)")
-        print("8. Press 'B' to open ball HSV debug window")
-        print("9. Press SPACE to play/pause")
-        print("10. Press BACKSPACE to step back one frame")
-        print("11. Press 0/1/2/3 for HSV debug on previous frame (standard/alt1/alt2/alt3)")
-        print("12. Press 'Q' to quit")
+        print("5. SPACE pauses/resumes")
+        print("6. D advances one frame")
+        print("7. Number keys 1-9 advance 10-90 tracked frames")
+        print("8. Mouse click prints HSV debug at that point")
+        print("9. Q or ESC quits")
         print("=" * 50)
         if self.start_frame > 0:
             print(f"Starting at frame {self.start_frame}")
@@ -13680,9 +13539,10 @@ class InteractiveBallAnalyzer:
         
         print(f"\nHSV Filter: H={self.hsv_lower[0]}-{self.hsv_upper[0]}, S={self.hsv_lower[1]}-{self.hsv_upper[1]}, V={self.hsv_lower[2]}-{self.hsv_upper[2]}")
         print(f"Game State: {game_state}")
-        print(f"Press 'D' to advance frame by frame")
+        print("Controls: SPACE play/pause, D single step, 1-9 jump 10-90 tracked frames, mouse click HSV debug")
         
         _consecutive_read_failures = 0
+        jump_frames_remaining = 0
         while True:
             self.current_game_state = game_state
             ret, frame = self.cap.read()
@@ -14485,40 +14345,23 @@ class InteractiveBallAnalyzer:
                 display_frame = self.draw_analysis_info(
                     resized_frame,
                     scale=scale_factor,
-                    show_paused_rejected=((not play_mode) or self.pause_requested),
+                    show_paused_rejected=False,
                     game_state=game_state,
                 )
 
-                # Show frame info
-                cv2.putText(display_frame, f"Frame: {self.frame_count}/{self.total_frames}",
-                           (10, new_height-20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-
-                # Show game state and controls
-                if game_state == "SCANNING_FOR_SERVE":
-                    cv2.putText(display_frame, f"SCANNING FOR SERVE | D=Next | N=Net | S=Serve | Q=Quit",
-                               (10, new_height-40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-                elif game_state == "TRACKING_POINT":
-                    cv2.putText(display_frame, f"TRACKING POINT (started frame {point_start_frame}) | D=Next | N=Net | S=Serve | Q=Quit",
-                               (10, new_height-40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                elif game_state == "POINT_ENDED":
-                    cv2.putText(display_frame, f"POINT ENDED (waiting for next serve) | D=Next | N=Net | S=Serve | Q=Quit",
-                               (10, new_height-40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
-                else:
-                    cv2.putText(display_frame, f"Game State: {game_state} | D=Next | N=Net | S=Serve | Q=Quit",
-                               (10, new_height-40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-
-                # C-key contour debug overlay: draw candidate index + area on screen
-                if getattr(self, 'show_contour_debug', False) and hasattr(self, '_debug_contour_candidates'):
-                    for idx, cand in enumerate(self._debug_contour_candidates):
-                        _, _, ccx, ccy, carea, cdist, _, cscore = cand
-                        sx = int(ccx * scale_factor)
-                        sy = int(ccy * scale_factor)
-                        # Yellow circle + index number + area
-                        cv2.circle(display_frame, (sx, sy), 10, (0, 255, 255), 1)
-                        cv2.putText(display_frame, str(idx),
-                                    (sx + 6, sy - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
-                        cv2.putText(display_frame, f"a={carea:.0f} s={cscore:.0f}",
-                                    (sx + 6, sy + 14), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 200, 255), 1)
+                display_state = "WAITING_FOR_SERVE" if game_state in (
+                    "SCANNING_FOR_SERVE", "POINT_ENDED", "WAITING_FOR_SERVE"
+                ) else game_state
+                status_text = f"Frame: {self.frame_count}/{self.total_frames} | Game State: {display_state}"
+                cv2.putText(
+                    display_frame,
+                    status_text,
+                    (10, new_height - 20),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (255, 255, 255),
+                    2,
+                )
 
                 if not self.headless:
                     cv2.imshow("Tennis Game Tracker", display_frame)
@@ -14533,58 +14376,24 @@ class InteractiveBallAnalyzer:
             if not getattr(self, 'auto_play', False) and not self.headless:
                 if self.pause_requested:
                     play_mode = False
-                key = cv2.waitKey(30 if play_mode else 0) & 0xFF
+                if jump_frames_remaining > 0:
+                    jump_frames_remaining -= 1
+                    key = 0xFF
+                else:
+                    key = cv2.waitKey(30 if play_mode else 0) & 0xFF
             else:
                 key = 0xFF  # no-op key in headless/auto_play mode
             if key == ord('q'):
                 break
-            elif key in (ord('0'), ord('1'), ord('2'), ord('3')):
-                self.open_prev_frame_hsv_debug(
-                    prev_frame_for_debug,
-                    prev_ball_center_for_debug,
-                    prev_frame_index_for_debug,
-                    int(chr(key))
-                )
+            elif key == 27:
+                break
+            elif ord('1') <= key <= ord('9'):
+                jump_frames_remaining = (key - ord('0')) * 10
+                play_mode = False
+                print(f"[JUMP] advancing {jump_frames_remaining} tracked frames")
                 continue
             elif key == ord(' '):
                 play_mode = not play_mode
-                continue
-            elif key == ord('n'):
-                # Mark net area
-                print("\n=== MARKING NET AREA ===")
-                if self.mark_net_area(frame):
-                    print("Net area marked successfully! Updated config file.")
-                    # Reload HSV config to get updated net area
-                    self.load_hsv_config()
-                else:
-                    print("Net area marking cancelled.")
-                # Redisplay current frame
-                continue
-            elif key == ord('s'):
-                # Show HSV tuner for serve area
-                print("\n=== SERVE AREA HSV TUNER ===")
-                if hasattr(self, 'serve_area_x_min'):
-                    print(f"Serve area: X={self.serve_area_x_min}-{self.serve_area_x_max}, Y={self.serve_area_y_min}-{self.serve_area_y_max}")
-                    self._open_serve_area_hsv_tuner(frame)
-                else:
-                    print("No serve area configured. Marking serve area first...")
-                    if self.mark_serve_area(frame):
-                        print("Serve area marked successfully! Updated config file.")
-                        # Reload HSV config to get updated serve area
-                        self.load_hsv_config()
-                        # Now open the HSV tuner for the serve area
-                        self._open_serve_area_hsv_tuner(frame)
-                    else:
-                        print("Serve area marking cancelled.")
-                # Redisplay current frame
-                continue
-            elif key == ord('b'):
-                # Show HSV tuner for current ball position
-                if self.ball_center is None:
-                    print("No ball position available yet.")
-                    continue
-                print("\n=== BALL HSV DEBUG ===")
-                self.open_hsv_tuner(frame, self.ball_center)
                 continue
             elif key == ord('d'):
                 # Advance to next frame and automatically track
@@ -14599,26 +14408,6 @@ class InteractiveBallAnalyzer:
                     print("No ball marked yet - click on ball first to enable tracking")
                     # Just continue to next frame without tracking
                     continue
-            elif key == 8:  # BACKSPACE
-                target_frame = max(self.start_frame, self.frame_count - 2)
-                self.cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
-                self.frame_count = target_frame
-                print(f"\n--- STEPPED BACK TO FRAME {self.frame_count} ---")
-                continue
-            elif key == ord('t'):
-                # Show HSV table
-                self.print_hsv_table()
-            elif key == ord('c'):
-                # Toggle contour-number debug overlay
-                self.show_contour_debug = not getattr(self, 'show_contour_debug', False)
-                status = "ON" if self.show_contour_debug else "OFF"
-                print(f"[C KEY] Contour debug overlay: {status}")
-                continue
-            elif key == ord('r'):
-                self.show_event_markers = not getattr(self, 'show_event_markers', False)
-                status = "ON" if self.show_event_markers else "OFF"
-                print(f"[R KEY] Red event markers: {status}")
-                continue
 
             if self.pause_requested:
                 self.pause_requested = False
