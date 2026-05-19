@@ -130,6 +130,9 @@ class InteractiveBallAnalyzer:
         self._ground_bounce_debug_history = []
         self.ground_bounce_count = 0
         self.last_ground_bounce_frame = -1000000
+        self._last_serve_bounce_frame = -1000000
+        self._near_side_large_hit_ref_size = 0.0
+        self._near_side_large_hit_ref_frame = -1000000
         self._contact_recovery_frames = 0
         self._upper_exit_wait_frames = 0
         self._top_return_wait_frames = 0
@@ -1167,6 +1170,96 @@ class InteractiveBallAnalyzer:
         _, chosen = min(continuation_candidates, key=lambda item: item[0])
         print(
             f"  DEBUG: [LARGE-DESCENT CONTINUE] preferring same-flight candidate at "
+            f"{chosen['pos']} area={chosen['area']:.1f}px "
+            f"score={chosen['score']:.1f} over {selected_entry['pos']} "
+            f"area={selected_area:.1f}px score={selected_entry['score']:.1f}"
+        )
+        return chosen
+
+    def _prefer_large_contact_stall_candidate(self, candidate_meta, selected_contour):
+        """Keep the large ball at impact when a smaller racket blob keeps the old path."""
+        if self.ball_center is None or self.last_motion is None or not candidate_meta:
+            return None
+
+        prev_size = float(self.ball_size or 0.0)
+        last_dx = float(self.last_motion.get("dx", 0.0) or 0.0)
+        last_dy = float(self.last_motion.get("dy", 0.0) or 0.0)
+        last_dist = float(self.last_motion.get("distance", 0.0) or 0.0)
+        if prev_size < 75.0 or last_dy < 40.0 or last_dist < 45.0:
+            return None
+
+        selected_entry = None
+        if selected_contour is not None:
+            for entry in candidate_meta:
+                if entry.get("contour") is selected_contour:
+                    selected_entry = entry
+                    break
+        if selected_entry is None:
+            selected_entry = min(candidate_meta, key=lambda entry: (entry["score"], entry["distance"]))
+
+        selected_area = float(selected_entry.get("area", 0.0) or 0.0)
+        selected_distance = float(selected_entry.get("distance", 0.0) or 0.0)
+        selected_keeps_ball_shape = (
+            selected_area >= prev_size * 0.55 and
+            selected_distance <= max(24.0, last_dist * 0.35)
+        )
+        if selected_keeps_ball_shape:
+            return None
+
+        prev_x, prev_y = self.ball_center
+        stall_candidates = []
+        for entry in candidate_meta:
+            if entry is selected_entry:
+                continue
+            if entry.get("source") not in ("primary", "regular", "alt"):
+                continue
+
+            area = float(entry.get("area", 0.0) or 0.0)
+            distance = float(entry.get("distance", 0.0) or 0.0)
+            motion_mean = float(entry.get("motion_mean", 0.0) or 0.0)
+            motion_max = float(entry.get("motion_max", 0.0) or 0.0)
+            cx, cy = entry["pos"]
+
+            if area < prev_size * 0.60 or area > prev_size * 1.45:
+                continue
+            if distance > max(22.0, last_dist * 0.28):
+                continue
+            if motion_max < 55.0 and motion_mean < 12.0:
+                continue
+
+            # The incoming ball can nearly stop at the racket before launching
+            # away on the next frame. Keep that same-size close blob instead of
+            # the racket/string fragment that merely continues the old fall.
+            move_dx = float(cx - prev_x)
+            move_dy = float(cy - prev_y)
+            incoming_progress = last_dx * move_dx + last_dy * move_dy
+            if incoming_progress > last_dist * max(distance, 1.0) * 0.55:
+                continue
+
+            farther_smaller_selected = (
+                selected_distance >= distance + max(28.0, last_dist * 0.28) and
+                selected_area <= max(prev_size * 0.48, area * 0.52)
+            )
+            if not farther_smaller_selected:
+                continue
+
+            area_ratio = abs(area - prev_size) / max(prev_size, 1.0)
+            adjusted_score = (
+                distance * 0.8 +
+                area_ratio * 60.0 -
+                min(45.0, motion_mean * 0.7) -
+                min(55.0, motion_max * 0.22)
+            )
+            if entry.get("source") in ("primary", "regular"):
+                adjusted_score -= 8.0
+            stall_candidates.append((adjusted_score, entry))
+
+        if not stall_candidates:
+            return None
+
+        _, chosen = min(stall_candidates, key=lambda item: item[0])
+        print(
+            f"  DEBUG: [LARGE-CONTACT STALL] preferring close large candidate at "
             f"{chosen['pos']} area={chosen['area']:.1f}px "
             f"score={chosen['score']:.1f} over {selected_entry['pos']} "
             f"area={selected_area:.1f}px score={selected_entry['score']:.1f}"
@@ -4012,6 +4105,12 @@ class InteractiveBallAnalyzer:
             self.stuck_frame_count <= 1
         )
 
+    def _recent_near_side_large_hit_ref_size(self, window_frames=2):
+        """Return the large incoming-ball size just before a near-side racket hit."""
+        if (self.frame_count - getattr(self, '_near_side_large_hit_ref_frame', -1000000)) > window_frames:
+            return 0.0
+        return float(getattr(self, '_near_side_large_hit_ref_size', 0.0) or 0.0)
+
     def _near_camera_large_racket_turn_candidate_ok(
         self,
         pos,
@@ -4027,6 +4126,8 @@ class InteractiveBallAnalyzer:
         frame_height, frame_width = frame_shape[:2]
         origin_x, origin_y = self.ball_center
         prev_size = float(self.ball_size)
+        recent_large_ref_size = self._recent_near_side_large_hit_ref_size()
+        effective_prev_size = max(prev_size, recent_large_ref_size)
         prev_dy = float(self.last_motion.get('dy', 0.0))
         prev_speed = float(self.last_motion.get('distance', 0.0))
         cx, cy = pos
@@ -4034,16 +4135,16 @@ class InteractiveBallAnalyzer:
         dy = cy - origin_y
         turn_dist = math.hypot(dx, dy)
         upward_progress = origin_y - cy
-        large_edge_launch = prev_size >= 240.0
+        large_edge_launch = effective_prev_size >= 240.0
 
-        if prev_size < 180.0:
+        if effective_prev_size < 180.0:
             return False
         min_origin_y = int(frame_height * (0.535 if large_edge_launch else 0.56))
         if origin_y < min_origin_y:
             return False
         if prev_dy < max(28.0, frame_height * 0.013) or prev_speed < 35.0:
             return False
-        if area < max(180.0, prev_size * 0.72):
+        if area < max(180.0, effective_prev_size * 0.72):
             return False
         if upward_progress < max(85.0, min(prev_dy * 1.8, 135.0)):
             return False
@@ -4235,7 +4336,12 @@ class InteractiveBallAnalyzer:
             return False
         if dy < max(6.0, frame_height * 0.0035):
             return False
-        if angle_jump < 70.0:
+        recent_serve_return_window = (
+            self.ground_bounce_count == 1 and
+            (self.frame_count - getattr(self, '_last_serve_bounce_frame', -1000000)) <= 45
+        )
+        min_turn_angle = 65.0 if recent_serve_return_window else 70.0
+        if angle_jump < min_turn_angle:
             return False
         if speed_ratio < 1.55:
             return False
@@ -7528,6 +7634,8 @@ class InteractiveBallAnalyzer:
                 if not allow_inactive and not serve_direction_search and not rally_contact_grace and not ground_bounce_grace:
                     near_side_large_hit_prep = self._near_side_large_racket_hit_prep_active(frame.shape)
                     if near_side_large_hit_prep:
+                        self._near_side_large_hit_ref_size = float(self.ball_size or 0.0)
+                        self._near_side_large_hit_ref_frame = self.frame_count
                         search_radius = max(search_radius, self.max_ball_speed, 360)
                         print(f"  DEBUG: [NEAR-SIDE RACKET PREP] wide search radius={search_radius}px")
                     lower_contact_launch_context = self._get_lower_contact_launch_context(frame.shape)
@@ -8872,6 +8980,45 @@ class InteractiveBallAnalyzer:
         # Always persist candidates for C-key contour debug overlay (lightweight list).
         self._debug_contour_candidates = list(candidates)
 
+        # While a large ball is still visibly clipping the top edge, the generic
+        # scorer can prefer a tiny border speck over the real ball as it drops
+        # back into frame. Promote the large moving continuation before the
+        # delayed off-screen waiter takes over.
+        if simple_top_edge_search and candidate_meta and self.ball_center is not None:
+            prev_x, prev_y = self.ball_center
+            visible_top_candidates = []
+            min_continue_area = max(18.0, float(self.ball_size or 0.0) * 0.45)
+            for meta in candidate_meta:
+                if meta['source'] not in ('primary', 'regular', 'alt'):
+                    continue
+                cx, cy = meta['pos']
+                if cy < prev_y + 8:
+                    continue
+                if meta['area'] < min_continue_area:
+                    continue
+                if meta['motion_mean'] < 6.0 and meta['motion_max'] < 35.0:
+                    continue
+
+                adjusted_score = (
+                    meta['score'] -
+                    min(700.0, meta['area'] * 4.0) -
+                    min(120.0, meta['motion_max'] * 0.8)
+                )
+                visible_top_candidates.append((adjusted_score, meta))
+
+            if visible_top_candidates:
+                _, visible_meta = min(visible_top_candidates, key=lambda item: item[0])
+                best_contour = visible_meta['contour']
+                best_source = visible_meta['source']
+                best_score = visible_meta['score']
+                print(
+                    f"  DEBUG: [TOP-EDGE CONTINUATION] prioritizing visible candidate at "
+                    f"{visible_meta['pos']} area={visible_meta['area']:.1f}px "
+                    f"score={visible_meta['score']:.1f} motion="
+                    f"{visible_meta['motion_mean']:.1f}/{visible_meta['motion_max']:.1f} "
+                    f"source={visible_meta['source']}"
+                )
+
         # During delayed top-return wait, the normal distance-heavy scorer tends to
         # cling to familiar tiny top-line specks near the exit point. If we already
         # have a candidate that looks like a real re-entry into the top band,
@@ -9179,6 +9326,14 @@ class InteractiveBallAnalyzer:
                 best_contour = recent_return_meta['contour']
                 best_source = recent_return_meta['source']
                 best_score = recent_return_meta['score']
+
+            large_contact_stall_meta = self._prefer_large_contact_stall_candidate(
+                candidate_meta, best_contour
+            )
+            if large_contact_stall_meta is not None:
+                best_contour = large_contact_stall_meta['contour']
+                best_source = large_contact_stall_meta['source']
+                best_score = large_contact_stall_meta['score']
 
             large_descent_meta = self._prefer_large_descending_continuation_candidate(
                 candidate_meta, best_contour, frame.shape
@@ -10653,6 +10808,7 @@ class InteractiveBallAnalyzer:
                         bounce_point = serve_bounce_in_event['point']
                         self.ground_bounce_count += 1
                         self.last_ground_bounce_frame = self.frame_count
+                        self._last_serve_bounce_frame = self.frame_count
                         print(f"Frame {self.frame_count}: Ground bounce #{self.ground_bounce_count} detected (serve box jump)")
                         self._handle_ground_bounce_event(
                             bounce_point,
@@ -13298,6 +13454,9 @@ class InteractiveBallAnalyzer:
             self._ground_bounce_debug_history = []
             self.ground_bounce_count = 0
             self.last_ground_bounce_frame = -1000000
+            self._last_serve_bounce_frame = -1000000
+            self._near_side_large_hit_ref_size = 0.0
+            self._near_side_large_hit_ref_frame = -1000000
             self._contact_recovery_frames = 0
             self._upper_exit_wait_frames = 0
             self._top_return_wait_frames = 0
