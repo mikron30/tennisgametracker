@@ -122,6 +122,10 @@ class InteractiveBallAnalyzer:
         self._rally_contact_high_launch_until_frame = -1
         self._last_racket_contact_frame = -1000000
         self._last_racket_contact_point = None
+        self._last_racket_contact_player = None
+        self._last_counted_contact_frame = -1000000
+        self._point_hit_count = 0
+        self._last_point_hit_count = 0
         self._ground_bounce_grace_frames = 0
         self._ground_bounce_ref_size = None
         self._ground_bounce_origin = None
@@ -207,6 +211,25 @@ class InteractiveBallAnalyzer:
         self.direction_change_min_degrees = 20.0
         self.motion_debug_vectors = []
         self.motion_debug_vector_limit = 8
+        self.player_names = ["P1", "P2"]
+        self.score_points = [0, 0]
+        self.score_games = [0, 0]
+        self.score_game_index = 0
+        self._last_scored_point_end_frame = -1
+        self._last_point_winner = None
+        self._last_point_score_reason = None
+        self._last_point_outcome_category = None
+        self.current_serve_attempt = 1
+        self._serve_landed_in_current_attempt = False
+        self._serve_in_recorded_attempt = None
+        self.serve_stats = [
+            {'first_in': 0, 'first_faults': 0, 'second_in': 0, 'double_faults': 0},
+            {'first_in': 0, 'first_faults': 0, 'second_in': 0, 'double_faults': 0},
+        ]
+        self.point_stats = [
+            {'out_errors': 0, 'net_errors': 0, 'unreturned_winners': 0, 'points_won': 0, 'total_hits': 0},
+            {'out_errors': 0, 'net_errors': 0, 'unreturned_winners': 0, 'points_won': 0, 'total_hits': 0},
+        ]
 
     def log_motion_metrics(self, prev_pos, dx, dy, distance, direction_deg):
         """Log per-frame motion and raise a focus-loss flag when movement spikes."""
@@ -3471,6 +3494,9 @@ class InteractiveBallAnalyzer:
         self._awaiting_serve_bounce = False
         self._point_serve_start_side = None
         self._point_target_service_side = None
+        self._serve_landed_in_current_attempt = False
+        self._serve_in_recorded_attempt = None
+        self._reset_point_score_context()
         if origin_pos is None or not hasattr(self, 'serve_area_x_min'):
             return
         serve_mid_x = (self.serve_area_x_min + self.serve_area_x_max) / 2.0
@@ -3479,6 +3505,375 @@ class InteractiveBallAnalyzer:
         self._point_serve_start_side = start_side
         self._point_target_service_side = target_side
         self._awaiting_serve_bounce = True
+
+    def _current_server_index(self):
+        return self.score_game_index % 2
+
+    def _reset_point_score_context(self):
+        self._point_hit_count = 0
+        self._last_point_hit_count = 0
+        self._last_counted_contact_frame = -1000000
+        self._last_racket_contact_player = None
+
+    def _record_racket_contact(self, point, label=None):
+        self._last_racket_contact_frame = self.frame_count
+        self._last_racket_contact_point = point
+        player_idx = self._player_index_at_point(point) if point is not None else None
+        self._last_racket_contact_player = player_idx
+        if self.point_start_frame_internal is not None and self._last_counted_contact_frame != self.frame_count:
+            self._point_hit_count += 1
+            self._last_counted_contact_frame = self.frame_count
+            if player_idx is not None:
+                self.point_stats[player_idx]['total_hits'] += 1
+            player_text = self.player_names[player_idx] if player_idx is not None else "unknown"
+            label_text = f" {label}" if label else ""
+            print(
+                f"[RALLY_HIT] f{self.frame_count}: hit#{self._point_hit_count} "
+                f"player={player_text}{label_text} point={point}"
+            )
+        return player_idx
+
+    def _recent_contact_info(self, frame=None, max_frames=180):
+        contact_point = getattr(self, '_last_racket_contact_point', None)
+        contact_frame = int(getattr(self, '_last_racket_contact_frame', -1000000))
+        contact_player = getattr(self, '_last_racket_contact_player', None)
+        if contact_player is None:
+            contact_player = self._player_index_at_point(contact_point, frame)
+        recent_contact = (
+            contact_player is not None and
+            (self.frame_count - contact_frame) <= max_frames
+        )
+        return recent_contact, contact_player, contact_frame, contact_point
+
+    def _point_bounced_after_contact(self, contact_frame):
+        return int(getattr(self, 'last_ground_bounce_frame', -1000000)) > int(contact_frame)
+
+    def _is_lower_right_exit_score_context(self, point, frame=None):
+        if point is None or frame is None:
+            return False
+        frame_height, frame_width = frame.shape[:2]
+        x, y = point
+        return (
+            float(x) >= frame_width - max(35.0, frame_width * 0.01) and
+            float(y) >= frame_height - max(45.0, frame_height * 0.025)
+        )
+
+    def _point_outcome(self, winner_idx, detail, category, loser_idx=None):
+        return {
+            'winner_idx': winner_idx,
+            'loser_idx': loser_idx if loser_idx is not None and winner_idx is not None else (
+                (1 - winner_idx) if winner_idx is not None else None
+            ),
+            'detail': detail,
+            'category': category,
+        }
+
+    def _serve_attempt_label(self):
+        return "1st" if int(getattr(self, 'current_serve_attempt', 1)) <= 1 else "2nd"
+
+    def _is_service_fault_reason(self, reason):
+        reason_lower = (reason or "").lower()
+        if "serve bounce outside" in reason_lower:
+            return True
+        if "serve" in reason_lower and "outside" in reason_lower:
+            return True
+        if "ball hit the net" in reason_lower:
+            frames_since_start = None
+            if self.point_start_frame_internal is not None:
+                frames_since_start = self.frame_count - self.point_start_frame_internal
+            if getattr(self, '_serve_landed_in_current_attempt', False):
+                if (
+                    frames_since_start is not None and
+                    frames_since_start <= 45 and
+                    int(getattr(self, '_point_hit_count', 0)) == 0
+                ):
+                    return True
+                return False
+            if frames_since_start is not None and frames_since_start > 60:
+                return False
+            recent_contact, contact_player, _, _ = self._recent_contact_info()
+            if recent_contact and contact_player != self._current_server_index():
+                return False
+            return True
+        return False
+
+    def _record_serve_in(self):
+        server_idx = self._current_server_index()
+        stats = self.serve_stats[server_idx]
+        if int(getattr(self, 'current_serve_attempt', 1)) <= 1:
+            stats['first_in'] += 1
+        else:
+            stats['second_in'] += 1
+        self._serve_in_recorded_attempt = int(getattr(self, 'current_serve_attempt', 1))
+        self._serve_landed_in_current_attempt = True
+        print(
+            f"[SERVE_STATS] f{self.frame_count}: {self.player_names[server_idx]} "
+            f"{self._serve_attempt_label()} serve in "
+            f"first={stats['first_in']}/{stats['first_in'] + stats['first_faults']} "
+            f"second={stats['second_in']}/{stats['second_in'] + stats['double_faults']} "
+            f"DF={stats['double_faults']}"
+        )
+
+    def _record_serve_fault(self, reason):
+        server_idx = self._current_server_index()
+        receiver_idx = 1 - server_idx
+        stats = self.serve_stats[server_idx]
+        recorded_attempt = getattr(self, '_serve_in_recorded_attempt', None)
+        if getattr(self, '_serve_landed_in_current_attempt', False) and recorded_attempt is not None:
+            if int(recorded_attempt) <= 1:
+                stats['first_in'] = max(0, stats['first_in'] - 1)
+            else:
+                stats['second_in'] = max(0, stats['second_in'] - 1)
+            self._serve_landed_in_current_attempt = False
+            self._serve_in_recorded_attempt = None
+        if int(getattr(self, 'current_serve_attempt', 1)) <= 1:
+            stats['first_faults'] += 1
+            self.current_serve_attempt = 2
+            self._serve_landed_in_current_attempt = False
+            self._serve_in_recorded_attempt = None
+            print(
+                f"[SERVE_FAULT] f{self.frame_count}: {self.player_names[server_idx]} "
+                f"first serve fault ({reason}); next serve is second serve"
+            )
+            return None, "first serve fault"
+
+        stats['double_faults'] += 1
+        self.current_serve_attempt = 1
+        self._serve_landed_in_current_attempt = False
+        self._serve_in_recorded_attempt = None
+        print(
+            f"[SERVE_FAULT] f{self.frame_count}: {self.player_names[server_idx]} "
+            f"second serve fault ({reason}); double fault"
+        )
+        return receiver_idx, "double fault"
+
+    def _initial_server_end(self):
+        return "near" if int(getattr(self, 'serve_direction_dy', -1)) < 0 else "far"
+
+    def _other_end(self, court_end):
+        return "far" if court_end == "near" else "near"
+
+    def _court_sides_swapped_for_game(self):
+        completed_games = max(0, int(getattr(self, 'score_game_index', 0)))
+        return ((completed_games + 1) // 2) % 2 == 1
+
+    def _player_index_on_court_end(self, court_end):
+        if court_end not in ("near", "far"):
+            return None
+        p1_start_end = self._initial_server_end()
+        p1_current_end = self._other_end(p1_start_end) if self._court_sides_swapped_for_game() else p1_start_end
+        return 0 if court_end == p1_current_end else 1
+
+    def _court_end_for_point(self, point, frame=None):
+        if point is None:
+            return None
+        if hasattr(self, 'net_area_y_min') and hasattr(self, 'net_area_y_max'):
+            net_y = (float(self.net_area_y_min) + float(self.net_area_y_max)) / 2.0
+        elif frame is not None:
+            net_y = frame.shape[0] * 0.5
+        else:
+            return None
+        return "near" if float(point[1]) >= net_y else "far"
+
+    def _player_index_at_point(self, point, frame=None):
+        return self._player_index_on_court_end(self._court_end_for_point(point, frame))
+
+    def _point_score_text(self, player_idx):
+        points = self.score_points
+        mine = points[player_idx]
+        other = points[1 - player_idx]
+        if mine >= 3 and other >= 3:
+            if mine == other:
+                return "40"
+            return "AD" if mine > other else "40"
+        labels = ["0", "15", "30", "40"]
+        return labels[min(mine, 3)]
+
+    def _score_summary(self):
+        return (
+            f"{self.player_names[0]} {self.score_games[0]}G {self._point_score_text(0)} - "
+            f"{self.player_names[1]} {self.score_games[1]}G {self._point_score_text(1)}"
+        )
+
+    def _serve_stats_text(self, player_idx):
+        stats = self.serve_stats[player_idx]
+        first_total = stats['first_in'] + stats['first_faults']
+        first_pct = int(round((stats['first_in'] / first_total) * 100)) if first_total else 0
+        return (
+            f"1st {stats['first_in']}/{first_total} {first_pct}% "
+            f"1F {stats['first_faults']} DF {stats['double_faults']}"
+        )
+
+    def _point_stats_text(self, player_idx):
+        stats = self.point_stats[player_idx]
+        return (
+            f"Out {stats['out_errors']} Net {stats['net_errors']} "
+            f"Unret {stats['unreturned_winners']} Hits {stats['total_hits']}"
+        )
+
+    def _infer_point_outcome(self, reason, end_position=None, frame=None):
+        reason_text = reason or ""
+        reason_lower = reason_text.lower()
+        server_idx = self._current_server_index()
+        receiver_idx = 1 - server_idx
+
+        if "serve bounce outside" in reason_lower or (
+                "serve" in reason_lower and "outside" in reason_lower):
+            return self._point_outcome(receiver_idx, "server lost serve fault", "serve_fault", server_idx)
+
+        recent_contact, contact_player, contact_frame, _ = self._recent_contact_info(frame=frame)
+        landing_player = self._player_index_at_point(end_position or self.ball_center, frame)
+
+        if "ball hit the net" in reason_lower:
+            if landing_player is not None:
+                return self._point_outcome(1 - landing_player, "ball hit net on player side", "net_error", landing_player)
+            if recent_contact:
+                return self._point_outcome(1 - contact_player, "last hitter hit net", "net_error", contact_player)
+            return self._point_outcome(receiver_idx, "server hit net", "net_error", server_idx)
+
+        if "bounce outside singles court" in reason_lower or "bounced out of court" in reason_lower:
+            if (
+                "bounce outside singles court" in reason_lower and
+                self._is_lower_right_exit_score_context(end_position or self.ball_center, frame) and
+                landing_player is not None
+            ):
+                return self._point_outcome(
+                    1 - landing_player,
+                    "ball bounced on player side and was not returned",
+                    "unreturned",
+                    landing_player,
+                )
+            if landing_player is not None:
+                return self._point_outcome(landing_player, "ball out on player court; opponent fault", "out_error", 1 - landing_player)
+            if (
+                self.point_start_frame_internal is not None and
+                (self.frame_count - self.point_start_frame_internal) <= 45
+            ):
+                return self._point_outcome(receiver_idx, "early serve/rally out by server", "out_error", server_idx)
+            if recent_contact:
+                return self._point_outcome(1 - contact_player, "last hitter missed court", "out_error", contact_player)
+
+        if "upper fence" in reason_lower and "fell down" in reason_lower:
+            if recent_contact:
+                return self._point_outcome(contact_player, "ball jumped and was not returned", "unreturned", 1 - contact_player)
+            if landing_player is not None:
+                return self._point_outcome(1 - landing_player, "ball jumped and was not returned", "unreturned", landing_player)
+
+        if "stuck_timeout" in reason_lower:
+            if recent_contact:
+                if self._point_bounced_after_contact(contact_frame):
+                    return self._point_outcome(contact_player, "opponent did not return after bounce", "unreturned", 1 - contact_player)
+                return self._point_outcome(1 - contact_player, "last hitter lost point", "out_error", contact_player)
+            if landing_player is not None:
+                return self._point_outcome(1 - landing_player, "ball stuck on player side", "unreturned", landing_player)
+
+        if (
+            "hitter side" in reason_lower or
+            "fence" in reason_lower or
+            "timeout" in reason_lower or
+            "lost" in reason_lower
+        ):
+            if recent_contact:
+                if self._point_bounced_after_contact(contact_frame):
+                    return self._point_outcome(contact_player, "opponent did not return after bounce", "unreturned", 1 - contact_player)
+                return self._point_outcome(1 - contact_player, "last hitter lost point", "out_error", contact_player)
+
+        if "bounced twice" in reason_lower or "stopped" in reason_lower:
+            if recent_contact:
+                return self._point_outcome(contact_player, "opponent did not return after bounce", "unreturned", 1 - contact_player)
+            if landing_player is not None:
+                return self._point_outcome(1 - landing_player, "double bounce on opponent side", "unreturned", landing_player)
+
+        return self._point_outcome(None, "winner unknown", "unknown")
+
+    def _record_point_result(self, reason, end_position=None, frame=None):
+        if self._last_scored_point_end_frame == self.frame_count:
+            return None
+
+        if self._is_service_fault_reason(reason):
+            winner_idx, detail = self._record_serve_fault(reason)
+            outcome = self._point_outcome(
+                winner_idx,
+                detail,
+                "double_fault" if winner_idx is not None else "first_serve_fault",
+                self._current_server_index() if winner_idx is not None else None,
+            )
+        else:
+            outcome = self._infer_point_outcome(reason, end_position=end_position, frame=frame)
+            winner_idx = outcome['winner_idx']
+            detail = outcome['detail']
+
+        self._last_scored_point_end_frame = self.frame_count
+        self._last_point_winner = winner_idx
+        self._last_point_score_reason = detail
+        self._last_point_outcome_category = outcome['category']
+        self._last_point_hit_count = int(getattr(self, '_point_hit_count', 0))
+        if winner_idx is None:
+            if detail != "first serve fault":
+                self.current_serve_attempt = 1
+                self._serve_landed_in_current_attempt = False
+                self._serve_in_recorded_attempt = None
+            print(
+                f"[SCORE] f{self.frame_count}: no point awarded reason={reason} "
+                f"score={self._score_summary()} detail={detail} "
+                f"category={outcome['category']} hits={self._last_point_hit_count} "
+                f"next_serve={self._serve_attempt_label()}"
+            )
+            return None
+
+        loser_idx = 1 - winner_idx
+        category = outcome['category']
+        stat_loser = outcome.get('loser_idx')
+        self.point_stats[winner_idx]['points_won'] += 1
+        if category == "out_error" and stat_loser is not None:
+            self.point_stats[stat_loser]['out_errors'] += 1
+        elif category == "net_error" and stat_loser is not None:
+            self.point_stats[stat_loser]['net_errors'] += 1
+        elif category == "unreturned":
+            self.point_stats[winner_idx]['unreturned_winners'] += 1
+
+        self.score_points[winner_idx] += 1
+        game_won = (
+            self.score_points[winner_idx] >= 4 and
+            (self.score_points[winner_idx] - self.score_points[loser_idx]) >= 2
+        )
+        if game_won:
+            self.score_games[winner_idx] += 1
+            self.score_points = [0, 0]
+            self.score_game_index += 1
+        self.current_serve_attempt = 1
+        self._serve_landed_in_current_attempt = False
+        self._serve_in_recorded_attempt = None
+
+        print(
+            f"[SCORE] f{self.frame_count}: winner={self.player_names[winner_idx]} "
+            f"reason={reason} detail={detail} category={category} "
+            f"hits={self._last_point_hit_count} score={self._score_summary()} "
+            f"server={self.player_names[self._current_server_index()]} "
+            f"game={self.score_game_index + 1}"
+        )
+        return winner_idx
+
+    def _draw_scoreboard(self, result):
+        height, width = result.shape[:2]
+        server_idx = self._current_server_index()
+        rows = [
+            f"{'*' if server_idx == 0 else ' '} {self.player_names[0]}  G{self.score_games[0]}  {self._point_score_text(0)}",
+            f"{'*' if server_idx == 1 else ' '} {self.player_names[1]}  G{self.score_games[1]}  {self._point_score_text(1)}",
+            f"{self.player_names[0]} {self._serve_stats_text(0)} | {self._point_stats_text(0)}",
+            f"{self.player_names[1]} {self._serve_stats_text(1)} | {self._point_stats_text(1)}",
+            f"Last: {self._last_point_hit_count} hits {self._last_point_outcome_category or ''}",
+        ]
+        x = 12
+        y = max(30, height - 170)
+        for idx, text in enumerate(rows):
+            font_scale = 0.78 if idx < 2 else 0.52
+            thickness = 2 if idx < 2 else 1
+            color = (40, 220, 255) if idx < 2 else (230, 230, 230)
+            yy = y + idx * 28
+            cv2.putText(result, text, (x, yy), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 0), thickness + 2)
+            cv2.putText(result, text, (x, yy), cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, thickness)
+        return result
 
     def _classify_ground_bounce(self, point, frame, conservative_sideline_override=False):
         outside_singles, side, left_x, right_x = self._point_outside_singles_sidelines(point, frame)
@@ -3550,6 +3945,8 @@ class InteractiveBallAnalyzer:
         if getattr(self, '_awaiting_serve_bounce', False):
             self._awaiting_serve_bounce = False
         if in_bounds:
+            if serve_bounce_active and not getattr(self, '_serve_landed_in_current_attempt', False):
+                self._record_serve_in()
             review_reason = "serve" if serve_bounce_active else "ground"
             self._append_direction_change_review_event(point, "good", review_reason, frame=self.frame_count)
             if not serve_bounce_active and getattr(self, 'ground_bounce_count', 0) >= 2:
@@ -3669,8 +4066,7 @@ class InteractiveBallAnalyzer:
         self._rally_contact_expected = new_pos
         self._rally_contact_progress = math.hypot(new_pos[0] - origin[0], new_pos[1] - origin[1])
         self._rally_contact_high_launch_until_frame = -1
-        self._last_racket_contact_frame = self.frame_count
-        self._last_racket_contact_point = origin
+        self._record_racket_contact(origin, label='racket contact')
         self._add_impact_marker(origin, kind='racket_contact', ttl=7, label='racket contact')
         edge_ratio = racket_debug.get('edge_ratio', 0.0) * 100.0 if racket_debug else 0.0
         high_sat_ratio = racket_debug.get('high_sat_ratio', 0.0) * 100.0 if racket_debug else 0.0
@@ -10743,8 +11139,7 @@ class InteractiveBallAnalyzer:
                             'label': 'racket contact',
                         }
                         print(f"Frame {self.frame_count}: Allowing lower-racket contact turn")
-                        self._last_racket_contact_frame = self.frame_count
-                        self._last_racket_contact_point = impact_event['point']
+                        self._record_racket_contact(impact_event['point'], label=impact_event['label'])
                         self._add_impact_marker(
                             impact_event['point'],
                             kind=impact_event['kind'],
@@ -10924,8 +11319,7 @@ class InteractiveBallAnalyzer:
                                 source_label="racket rebound" if ground_bounce_rebound_candidate else "predicted launch"
                             )
                             if ground_bounce_rebound_candidate:
-                                self._last_racket_contact_frame = self.frame_count
-                                self._last_racket_contact_point = (cx, cy)
+                                self._record_racket_contact((cx, cy), label='racket rebound')
                             self._ground_bounce_grace_frames = max(getattr(self, '_ground_bounce_grace_frames', 0), 3)
                             self._ground_bounce_ref_size = max(8.0, min(max(float(bulb_size), ground_bounce_context['ref_size']), 90.0))
                             self._ground_bounce_origin = ground_bounce_context['origin']
@@ -10953,8 +11347,7 @@ class InteractiveBallAnalyzer:
                         )
                     if impact_event is not None:
                         if impact_event.get('kind') == 'racket_contact':
-                            self._last_racket_contact_frame = self.frame_count
-                            self._last_racket_contact_point = impact_event.get('point')
+                            self._record_racket_contact(impact_event.get('point'), label=impact_event.get('label'))
                         self._add_impact_marker(
                             impact_event.get('point'),
                             kind=impact_event.get('kind', 'direction_change'),
@@ -11479,6 +11872,7 @@ class InteractiveBallAnalyzer:
     def draw_analysis_info(self, frame, scale=1.0, show_paused_rejected=False, game_state=None):
         """Draw analysis information on the frame with proper scaling."""
         result = frame.copy()
+        result = self._draw_scoreboard(result)
         if game_state is None:
             game_state = getattr(self, 'current_game_state', None)
 
@@ -13286,6 +13680,8 @@ class InteractiveBallAnalyzer:
             self._last_impact_marker_pos = None
             self._last_impact_marker_kind = None
             self.direction_change_streak = 0
+            self._point_hit_count = 0
+            self._last_counted_contact_frame = -1000000
             self.edge_wait = False
             self.near_edge = False
             self.using_alt_hsv = False
@@ -13305,6 +13701,7 @@ class InteractiveBallAnalyzer:
             self._rally_contact_high_launch_until_frame = -1
             self._last_racket_contact_frame = -1000000
             self._last_racket_contact_point = None
+            self._last_racket_contact_player = None
             self._ground_bounce_grace_frames = 0
             self._ground_bounce_ref_size = None
             self._ground_bounce_origin = None
@@ -13793,6 +14190,7 @@ class InteractiveBallAnalyzer:
                             )
                     else:
                         print(f"[POINT_END] f{self.frame_count}: reason=POINT_TIMEOUT duration={dur}f — returning to serve detection")
+                        self._record_point_result("POINT_TIMEOUT", end_position=self.ball_center, frame=frame)
                         game_state = "WAITING_FOR_SERVE"
                         reset_tracking_state(hold_end_marker=True)
 
@@ -13840,6 +14238,7 @@ class InteractiveBallAnalyzer:
                         print(f"Frame {self.frame_count}: POINT ENDED - {pending_reason}")
                         print(f"Point duration: {dur} frames")
                         print(f"[POINT_END] f{self.frame_count}: reason={pending_reason} duration={dur}f pos={tracked_position} vel={vel:.1f}px vel_hist={vel_hist_tail}")
+                        self._record_point_result(pending_reason, end_position=tracked_position, frame=frame)
                         if "bounced twice" in pending_reason.lower():
                             self._serve_scan_block_until_frame = max(
                                 getattr(self, '_serve_scan_block_until_frame', -1),
@@ -13860,6 +14259,7 @@ class InteractiveBallAnalyzer:
                         print(f"Frame {self.frame_count}: POINT ENDED - Ball stuck for {self.stuck_frame_count} frames")
                         print(f"Point duration: {dur} frames")
                         print(f"[POINT_END] f{self.frame_count}: reason=STUCK_TIMEOUT stuck={self.stuck_frame_count} duration={dur}f pos={tracked_position}")
+                        self._record_point_result("STUCK_TIMEOUT", end_position=tracked_position, frame=frame)
                         game_state = "WAITING_FOR_SERVE"
                         reset_tracking_state(hold_end_marker=True, end_position=tracked_position)
                     elif self.stuck_frame_count >= 15 and self._top_return_wait_active():
@@ -13874,6 +14274,7 @@ class InteractiveBallAnalyzer:
                             print(f"Frame {self.frame_count}: POINT ENDED - {reason}")
                             print(f"Point duration: {dur} frames")
                             print(f"[POINT_END] f{self.frame_count}: reason={reason} duration={dur}f pos={tracked_position} vel={vel:.1f}px vel_hist={vel_hist_tail}")
+                            self._record_point_result(reason, end_position=tracked_position, frame=frame)
                             reason_lower = reason.lower()
                             if "bounced twice" in reason_lower:
                                 self._serve_scan_block_until_frame = max(
@@ -13905,6 +14306,7 @@ class InteractiveBallAnalyzer:
                         print(f"Frame {self.frame_count}: POINT ENDED - Ball lost after back-return timeout")
                         print(f"Point duration: {dur} frames")
                         print(f"[POINT_END] f{self.frame_count}: reason=BACK_RETURN_TIMEOUT duration={dur}f")
+                        self._record_point_result("BACK_RETURN_TIMEOUT", end_position=self.ball_center, frame=frame)
                         game_state = "WAITING_FOR_SERVE"
                         reset_tracking_state(hold_end_marker=True)
                         continue
@@ -13931,6 +14333,7 @@ class InteractiveBallAnalyzer:
                         point_end_frame = self.frame_count
                         print(f"Frame {self.frame_count}: POINT ENDED - Ball lost (likely out of court)")
                         print(f"Point duration: {point_end_frame - point_start_frame} frames")
+                        self._record_point_result("Ball lost (likely out of court)", end_position=self.ball_center, frame=frame)
                         game_state = "WAITING_FOR_SERVE"
                         reset_tracking_state(hold_end_marker=True)
             
