@@ -272,9 +272,15 @@ class InteractiveBallAnalyzer:
                             (self.frame_count - getattr(self, 'last_ground_bounce_frame', -1000000)) > 2 and
                             distance > 12 and
                             (angle_diff >= 110.0 or (prev_dx * dx) < -12.0)):
-                        print(f"Frame {self.frame_count}: Resetting bounce count after new shot direction change")
-                        self.ground_bounce_count = 0
-                        self.last_ground_bounce_frame = -1000000
+                        if getattr(self, '_direction_only_bounce_preserve_frame', -1000000) == self.frame_count:
+                            print(
+                                f"Frame {self.frame_count}: Preserving bounce count through "
+                                f"same-frame direction-only change"
+                            )
+                        else:
+                            print(f"Frame {self.frame_count}: Resetting bounce count after new shot direction change")
+                            self.ground_bounce_count = 0
+                            self.last_ground_bounce_frame = -1000000
                     self.direction_change_points.append((change_point[0], change_point[1]))
                     self._record_direction_change_event(
                         change_point,
@@ -3785,6 +3791,45 @@ class InteractiveBallAnalyzer:
                 return self._point_outcome(1 - landing_player, "double bounce on opponent side", "unreturned", landing_player)
 
         return self._point_outcome(None, "winner unknown", "unknown")
+
+    def _would_point_win_game(self, winner_idx):
+        if winner_idx is None:
+            return False
+        loser_idx = 1 - winner_idx
+        winner_points = self.score_points[winner_idx] + 1
+        loser_points = self.score_points[loser_idx]
+        return winner_points >= 4 and (winner_points - loser_points) >= 2
+
+    def _ignore_unresolved_timeout_if_game_decider(self, reason, end_position=None, frame=None):
+        reason_lower = (reason or "").lower()
+        unresolved_timeout = (
+            "point_timeout" in reason_lower or
+            "stuck_timeout" in reason_lower or
+            "timeout" in reason_lower or
+            "lost" in reason_lower
+        )
+        if not unresolved_timeout:
+            return False
+
+        outcome = self._infer_point_outcome(reason, end_position=end_position, frame=frame)
+        winner_idx = outcome.get('winner_idx')
+        if not self._would_point_win_game(winner_idx):
+            return False
+
+        self._last_scored_point_end_frame = self.frame_count
+        self._last_point_winner = None
+        self._last_point_score_reason = "ignored unresolved timeout at game point"
+        self._last_point_outcome_category = "unknown"
+        self._last_point_hit_count = int(getattr(self, '_point_hit_count', 0))
+        self.current_serve_attempt = 1
+        self._serve_landed_in_current_attempt = False
+        self._serve_in_recorded_attempt = None
+        print(
+            f"[SCORE] f{self.frame_count}: no point awarded reason={reason} "
+            f"score={self._score_summary()} detail=ignored unresolved timeout at game point "
+            f"category=unknown hits={self._last_point_hit_count} next_serve={self._serve_attempt_label()}"
+        )
+        return True
 
     def _record_point_result(self, reason, end_position=None, frame=None):
         if self._last_scored_point_end_frame == self.frame_count:
@@ -11176,29 +11221,44 @@ class InteractiveBallAnalyzer:
                             and serve_bounce_out_event is None
                             and not recent_bounce_reversal_candidate and not recent_bounce_regular_candidate):
                         strong_x_reversal = (self.last_motion['dx'] * dx) < -12 if self.last_motion is not None else False
-                        if (lower_contact_launch_candidate or large_lower_launch_candidate or
-                                strong_x_reversal or angle_jump >= 120 or speed_ratio > 1.8):
+                        contact_like_shot_change = (
+                            lower_contact_launch_candidate or
+                            large_lower_launch_candidate
+                        )
+                        direction_only_shot_change = (
+                            strong_x_reversal or
+                            angle_jump >= 120 or
+                            speed_ratio > 1.8
+                        )
+                        if contact_like_shot_change or direction_only_shot_change:
                             if self.ground_bounce_count > 0:
-                                if (
-                                    large_lower_launch_candidate and
-                                    self.ball_center is not None and
-                                    self.ball_center[1] >= int(frame_height * 0.50)
-                                ):
-                                    self._late_contact_prior_bounce_count = max(
-                                        int(getattr(self, '_late_contact_prior_bounce_count', 0)),
-                                        int(self.ground_bounce_count),
-                                    )
-                                    self._late_contact_prior_bounce_until_frame = max(
-                                        int(getattr(self, '_late_contact_prior_bounce_until_frame', -1000000)),
-                                        self.frame_count + 90,
-                                    )
+                                if contact_like_shot_change:
+                                    if (
+                                        large_lower_launch_candidate and
+                                        self.ball_center is not None and
+                                        self.ball_center[1] >= int(frame_height * 0.50)
+                                    ):
+                                        self._late_contact_prior_bounce_count = max(
+                                            int(getattr(self, '_late_contact_prior_bounce_count', 0)),
+                                            int(self.ground_bounce_count),
+                                        )
+                                        self._late_contact_prior_bounce_until_frame = max(
+                                            int(getattr(self, '_late_contact_prior_bounce_until_frame', -1000000)),
+                                            self.frame_count + 90,
+                                        )
+                                        print(
+                                            f"Frame {self.frame_count}: Preserving prior bounce count "
+                                            f"{self._late_contact_prior_bounce_count} through late lower launch"
+                                        )
+                                    print(f"Frame {self.frame_count}: Resetting bounce count after non-bounce shot change")
+                                    self.ground_bounce_count = 0
+                                    self.last_ground_bounce_frame = -1000000
+                                else:
+                                    self._direction_only_bounce_preserve_frame = self.frame_count
                                     print(
-                                        f"Frame {self.frame_count}: Preserving prior bounce count "
-                                        f"{self._late_contact_prior_bounce_count} through late lower launch"
+                                        f"Frame {self.frame_count}: Preserving bounce count through "
+                                        f"direction-only shot change"
                                     )
-                                print(f"Frame {self.frame_count}: Resetting bounce count after non-bounce shot change")
-                            self.ground_bounce_count = 0
-                            self.last_ground_bounce_frame = -1000000
                     if change_detected and serve_bounce_in_event is not None:
                         bounce_point = serve_bounce_in_event['point']
                         self.ground_bounce_count += 1
@@ -14189,8 +14249,16 @@ class InteractiveBallAnalyzer:
                                 f"(seen {frames_since_seen}f ago, motion={last_motion_distance:.1f}px)"
                             )
                     else:
-                        print(f"[POINT_END] f{self.frame_count}: reason=POINT_TIMEOUT duration={dur}f — returning to serve detection")
-                        self._record_point_result("POINT_TIMEOUT", end_position=self.ball_center, frame=frame)
+                        if self._ignore_unresolved_timeout_if_game_decider(
+                            "POINT_TIMEOUT", end_position=self.ball_center, frame=frame
+                        ):
+                            print(
+                                f"[POINT_IGNORED] f{self.frame_count}: reason=POINT_TIMEOUT "
+                                f"duration={dur}f would decide game without a located ball"
+                            )
+                        else:
+                            print(f"[POINT_END] f{self.frame_count}: reason=POINT_TIMEOUT duration={dur}f — returning to serve detection")
+                            self._record_point_result("POINT_TIMEOUT", end_position=self.ball_center, frame=frame)
                         game_state = "WAITING_FOR_SERVE"
                         reset_tracking_state(hold_end_marker=True)
 
@@ -14256,10 +14324,18 @@ class InteractiveBallAnalyzer:
                     if self.stuck_frame_count >= 15 and not self._top_return_wait_active():
                         point_end_frame = self.frame_count
                         dur = point_end_frame - point_start_frame if point_start_frame else 0
-                        print(f"Frame {self.frame_count}: POINT ENDED - Ball stuck for {self.stuck_frame_count} frames")
-                        print(f"Point duration: {dur} frames")
-                        print(f"[POINT_END] f{self.frame_count}: reason=STUCK_TIMEOUT stuck={self.stuck_frame_count} duration={dur}f pos={tracked_position}")
-                        self._record_point_result("STUCK_TIMEOUT", end_position=tracked_position, frame=frame)
+                        if self._ignore_unresolved_timeout_if_game_decider(
+                            "STUCK_TIMEOUT", end_position=tracked_position, frame=frame
+                        ):
+                            print(
+                                f"[POINT_IGNORED] f{self.frame_count}: reason=STUCK_TIMEOUT "
+                                f"stuck={self.stuck_frame_count} duration={dur}f would decide game without a located ball"
+                            )
+                        else:
+                            print(f"Frame {self.frame_count}: POINT ENDED - Ball stuck for {self.stuck_frame_count} frames")
+                            print(f"Point duration: {dur} frames")
+                            print(f"[POINT_END] f{self.frame_count}: reason=STUCK_TIMEOUT stuck={self.stuck_frame_count} duration={dur}f pos={tracked_position}")
+                            self._record_point_result("STUCK_TIMEOUT", end_position=tracked_position, frame=frame)
                         game_state = "WAITING_FOR_SERVE"
                         reset_tracking_state(hold_end_marker=True, end_position=tracked_position)
                     elif self.stuck_frame_count >= 15 and self._top_return_wait_active():
