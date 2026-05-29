@@ -1,4 +1,5 @@
 import argparse
+import csv
 import cv2
 import numpy as np
 import json
@@ -15,11 +16,18 @@ class InteractiveBallAnalyzer:
         config_file: str = "hsv_config.json",
         headless: bool = False,
         disable_false_points: bool = False,
+        point_history_file: str = "point_history.csv",
+        write_point_history: bool = True,
     ):
         self.video_path = video_path
         self.config_file = config_file
         self.headless = headless
         self.disable_false_points = disable_false_points
+        self.point_history_file = point_history_file
+        self.write_point_history = write_point_history
+        self._point_history_initialized = False
+        self._point_history_point_index = 0
+        self._point_history_current = None
         self.cap = cv2.VideoCapture(video_path)
         self.start_frame = max(0, start_frame)
         self.cap.set(cv2.CAP_PROP_POS_FRAMES, self.start_frame)
@@ -2717,8 +2725,9 @@ class InteractiveBallAnalyzer:
         if (self._upper_slow_arc_active() and
                 getattr(self, "ground_bounce_count", 0) > 0 and
                 (self.ball_size is None or self.ball_size <= 35.0)):
+            relaxed_min_y = max(0, relaxed_min_y - 90)
             if motion_max >= 70.0 or (motion_mean >= 14.0 and motion_max >= 35.0):
-                relaxed_min_y = max(0, relaxed_min_y - 90)
+                relaxed_min_y = max(0, relaxed_min_y - 70)
         return relaxed_min_y
 
     def _is_upper_static_recover_jump(self, candidate, frame_shape):
@@ -3503,6 +3512,7 @@ class InteractiveBallAnalyzer:
         self._serve_landed_in_current_attempt = False
         self._serve_in_recorded_attempt = None
         self._reset_point_score_context()
+        self._start_point_history_row(origin_pos)
         if origin_pos is None or not hasattr(self, 'serve_area_x_min'):
             return
         serve_mid_x = (self.serve_area_x_min + self.serve_area_x_max) / 2.0
@@ -3511,6 +3521,107 @@ class InteractiveBallAnalyzer:
         self._point_serve_start_side = start_side
         self._point_target_service_side = target_side
         self._awaiting_serve_bounce = True
+
+    def _point_history_headers(self):
+        return [
+            'point_index',
+            'serve_start_frame',
+            'point_end_frame',
+            'duration_frames',
+            'server',
+            'serve_attempt',
+            'start_position',
+            'end_position',
+            'rally_shots',
+            'point_awarded',
+            'winner',
+            'end_reason',
+            'why',
+            'category',
+            'score_before',
+            'score_after',
+            'p1_games',
+            'p1_points',
+            'p2_games',
+            'p2_points',
+            'next_server',
+            'next_serve',
+        ]
+
+    def _format_history_point(self, point):
+        if point is None:
+            return ''
+        try:
+            return f"({int(point[0])},{int(point[1])})"
+        except Exception:
+            return str(point)
+
+    def _initialize_point_history_file(self):
+        if not self.write_point_history or self._point_history_initialized:
+            return
+        if not self.point_history_file:
+            self.write_point_history = False
+            return
+        directory = os.path.dirname(self.point_history_file)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        with open(self.point_history_file, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=self._point_history_headers())
+            writer.writeheader()
+        self._point_history_initialized = True
+        print(f"[POINT_HISTORY] Writing point history to {self.point_history_file}")
+
+    def _start_point_history_row(self, origin_pos):
+        if not self.write_point_history:
+            return
+        self._initialize_point_history_file()
+        self._point_history_current = {
+            'serve_start_frame': self.frame_count,
+            'server_idx': self._current_server_index(),
+            'serve_attempt': self._serve_attempt_label(),
+            'start_position': origin_pos,
+            'score_before': self._score_summary(),
+        }
+
+    def _append_point_history_row(self, reason, outcome, winner_idx, end_position, score_after, point_awarded):
+        if not self.write_point_history:
+            return
+        self._initialize_point_history_file()
+        context = self._point_history_current or {}
+        start_frame = context.get('serve_start_frame', self.point_start_frame_internal)
+        duration = ''
+        if start_frame is not None:
+            duration = max(0, self.frame_count - int(start_frame))
+        server_idx = context.get('server_idx', self._current_server_index())
+        self._point_history_point_index += 1
+        row = {
+            'point_index': self._point_history_point_index,
+            'serve_start_frame': start_frame if start_frame is not None else '',
+            'point_end_frame': self.frame_count,
+            'duration_frames': duration,
+            'server': self.player_names[server_idx] if server_idx is not None else '',
+            'serve_attempt': context.get('serve_attempt', self._serve_attempt_label()),
+            'start_position': self._format_history_point(context.get('start_position')),
+            'end_position': self._format_history_point(end_position),
+            'rally_shots': int(getattr(self, '_last_point_hit_count', 0)),
+            'point_awarded': 'yes' if point_awarded else 'no',
+            'winner': self.player_names[winner_idx] if winner_idx is not None else '',
+            'end_reason': reason or '',
+            'why': outcome.get('detail', '') if outcome else '',
+            'category': outcome.get('category', '') if outcome else '',
+            'score_before': context.get('score_before', ''),
+            'score_after': score_after,
+            'p1_games': self.score_games[0],
+            'p1_points': self._point_score_text(0),
+            'p2_games': self.score_games[1],
+            'p2_points': self._point_score_text(1),
+            'next_server': self.player_names[self._current_server_index()],
+            'next_serve': self._serve_attempt_label(),
+        }
+        with open(self.point_history_file, 'a', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=self._point_history_headers())
+            writer.writerow(row)
+        self._point_history_current = None
 
     def _current_server_index(self):
         return self.score_game_index % 2
@@ -3824,6 +3935,19 @@ class InteractiveBallAnalyzer:
         self.current_serve_attempt = 1
         self._serve_landed_in_current_attempt = False
         self._serve_in_recorded_attempt = None
+        ignored_outcome = self._point_outcome(
+            None,
+            "ignored unresolved timeout at game point",
+            "unknown",
+        )
+        self._append_point_history_row(
+            reason,
+            ignored_outcome,
+            None,
+            end_position,
+            self._score_summary(),
+            point_awarded=False,
+        )
         print(
             f"[SCORE] f{self.frame_count}: no point awarded reason={reason} "
             f"score={self._score_summary()} detail=ignored unresolved timeout at game point "
@@ -3864,6 +3988,14 @@ class InteractiveBallAnalyzer:
                 f"category={outcome['category']} hits={self._last_point_hit_count} "
                 f"next_serve={self._serve_attempt_label()}"
             )
+            self._append_point_history_row(
+                reason,
+                outcome,
+                winner_idx,
+                end_position,
+                self._score_summary(),
+                point_awarded=False,
+            )
             return None
 
         loser_idx = 1 - winner_idx
@@ -3896,6 +4028,14 @@ class InteractiveBallAnalyzer:
             f"hits={self._last_point_hit_count} score={self._score_summary()} "
             f"server={self.player_names[self._current_server_index()]} "
             f"game={self.score_game_index + 1}"
+        )
+        self._append_point_history_row(
+            reason,
+            outcome,
+            winner_idx,
+            end_position,
+            self._score_summary(),
+            point_awarded=True,
         )
         return winner_idx
 
@@ -4816,6 +4956,11 @@ class InteractiveBallAnalyzer:
         ball_size = float(self.ball_size or 0.0)
         speed = float(self.last_motion.get('distance', 0.0) or 0.0)
         dy = float(self.last_motion.get('dy', 0.0) or 0.0)
+        continuing_upper_flight = (
+            self._upper_slow_arc_active() and
+            speed > 10.0 and
+            dy < -3.0
+        )
         in_upper_fence_band = (
             lane_min_x <= x <= lane_max_x and
             upper_fence_y_min <= y <= upper_fence_y_max
@@ -4823,7 +4968,8 @@ class InteractiveBallAnalyzer:
         tiny_visible_ball = 3.0 <= ball_size <= 16.0
         settled_or_falling = (speed <= 6.5 and dy >= -3.0) or getattr(self, 'stuck_frame_count', 0) >= 1
 
-        if not (in_upper_fence_band and tiny_visible_ball and settled_or_falling):
+        if (not in_upper_fence_band or not tiny_visible_ball or
+                continuing_upper_flight or not settled_or_falling):
             self._upper_fence_fall_frames = 0
             return False
 
@@ -5198,6 +5344,27 @@ class InteractiveBallAnalyzer:
 
                 frame0_hotspot = self._find_frame0_background_hotspot((cx, cy))
                 if frame0_hotspot is not None and (motion_mean is None or (motion_mean < 8.0 and motion_max < 35.0)):
+                    continue
+
+                expected_dx = float(self.last_motion.get('dx', 0.0) or 0.0)
+                expected_dy = float(self.last_motion.get('dy', 0.0) or 0.0)
+                recent_speed = float(self.last_motion.get('distance', 0.0) or 0.0)
+                prev_size = float(self.ball_size or 0.0)
+                early_recover = getattr(self, 'stuck_frame_count', 0) <= 2
+                flat_lateral_jump = (
+                    early_recover and
+                    ref_y <= upper_limit and
+                    recent_speed <= max_prev_speed and
+                    abs(dx) >= max(70.0, recent_speed * 8.0, abs(expected_dx) * 6.0 + 40.0) and
+                    abs(dy) <= max(12.0, recent_speed * 2.2) and
+                    (prev_size <= 0.0 or area >= max(18.0, prev_size * 1.6))
+                )
+                if flat_lateral_jump:
+                    print(
+                        f"  DEBUG: [CONTACT RECOVER] rejected flat upper lateral jump "
+                        f"at ({cx},{cy}) dx={dx:+d} dy={dy:+d} "
+                        f"area={area:.1f}px prev_size={prev_size:.1f}px"
+                    )
                     continue
 
                 if abs(dx) <= local_radius and abs(dy) <= local_vertical_band:
@@ -8085,7 +8252,19 @@ class InteractiveBallAnalyzer:
                         print(f"  DEBUG: [LOWER-HIT PREP] wide search radius={search_radius}px "
                               f"expected={lower_contact_launch_context['expected']}")
                     else:
-                        ground_bounce_context = self._get_ground_bounce_context(frame.shape)
+                        allow_near_net_ground_bounce = (
+                            self._late_contact_prior_bounce_active() and
+                            self.last_motion is not None and
+                            self.ball_size is not None and
+                            self.ball_size <= 120.0 and
+                            float(self.last_motion.get('dy', 0.0) or 0.0) >=
+                            max(12.0, frame_height * 0.006) and
+                            (self.frame_count - int(getattr(self, '_last_racket_contact_frame', -1000000))) >= 50
+                        )
+                        ground_bounce_context = self._get_ground_bounce_context(
+                            frame.shape,
+                            allow_near_net=allow_near_net_ground_bounce,
+                        )
                         if ground_bounce_context is not None:
                             search_radius = max(search_radius, max(self.max_ball_speed, 110))
                             print(f"  DEBUG: [GROUND-BOUNCE PREP] wide search radius={search_radius}px "
@@ -11002,6 +11181,31 @@ class InteractiveBallAnalyzer:
                         bounce_dist <= ground_bounce_context['max_launch_dist'] and
                         expected_distance <= ground_bounce_context['expected_cap']
                     )
+                    near_net_shallow_bounce = False
+                    if hasattr(self, 'net_area_y_min') and hasattr(self, 'net_area_y_max'):
+                        near_net_shallow_bounce = (
+                            not ground_bounce_candidate and
+                            self._late_contact_prior_bounce_active() and
+                            (self.net_area_y_min - 90) <= origin_y <= (self.net_area_y_max + 130) and
+                            incoming_dy >= max(18.0, frame_height * 0.010) and
+                            dy <= 2.0 and
+                            angle_jump >= 45.0 and
+                            same_direction_x and
+                            candidate_not_tiny and
+                            bounce_dist >= max(12.0, ground_bounce_context['min_launch_dist'] * 0.70) and
+                            bounce_dist <= ground_bounce_context['max_launch_dist'] and
+                            expected_distance <= max(ground_bounce_context['expected_cap'], 95.0) and
+                            bulb_size >= max(35.0, ground_bounce_context['ref_size'] * 0.50) and
+                            motion_max >= 60.0
+                        )
+                    if near_net_shallow_bounce:
+                        ground_bounce_candidate = True
+                        print(
+                            f"Frame {self.frame_count}: [NEAR-NET SHALLOW BOUNCE] "
+                            f"origin=({origin_x},{origin_y}) candidate=({cx},{cy}) "
+                            f"incoming=({incoming_dx:.1f},{incoming_dy:.1f}) "
+                            f"motion={motion_mean:.1f}/{motion_max:.1f}"
+                        )
                     if large_lower_bounce_launch_override:
                         ground_bounce_candidate = True
                     upper_soft_ground_bounce_candidate = (
@@ -13693,6 +13897,7 @@ class InteractiveBallAnalyzer:
     def process_video(self, auto_play=False, max_frames=0):
         """Process video with intelligent tennis game analysis."""
         self.auto_play = auto_play  # store so detect_ball can skip GUI debug in batch mode
+        self._initialize_point_history_file()
         print("Intelligent Tennis Game Tracker")
         print("=" * 50)
         print("1. Waits for first serve position")
@@ -14927,6 +15132,10 @@ if __name__ == "__main__":
                         help="Disable learned false-point hiding in debug/tuner views (default)")
     parser.add_argument("--enable-false-points", dest="disable_false_points", action="store_false",
                         help="Enable learned false-point hiding in debug/tuner views")
+    parser.add_argument("--point-history-file", default="point_history.csv",
+                        help="CSV path for point history output (default: point_history.csv)")
+    parser.add_argument("--no-point-history", action="store_true",
+                        help="Disable point history CSV output")
     parser.set_defaults(disable_false_points=True)
     args = parser.parse_args()
 
@@ -14936,5 +15145,7 @@ if __name__ == "__main__":
         print("[FALSE_POINT] Debug false-point masking disabled")
     analyzer = InteractiveBallAnalyzer(court["video"], start_frame=args.start_frame,
                                        config_file=court["config"], headless=args.headless,
-                                       disable_false_points=args.disable_false_points)
+                                       disable_false_points=args.disable_false_points,
+                                       point_history_file=args.point_history_file,
+                                       write_point_history=not args.no_point_history)
     analyzer.process_video(auto_play=args.auto_play, max_frames=args.max_frames)

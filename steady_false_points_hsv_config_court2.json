@@ -11641,6 +11641,138 @@
       "filter_keys": [
         "alt6"
       ]
+    },
+    {
+      "pos": [
+        1788,
+        244
+      ],
+      "radius": 22,
+      "count": 3,
+      "reason": "steady repeated false point",
+      "filter_keys": [
+        "alt2"
+      ]
+    },
+    {
+      "pos": [
+        1434,
+        504
+      ],
+      "radius": 22,
+      "count": 3,
+      "reason": "steady repeated false point",
+      "filter_keys": [
+        "alt2"
+      ]
+    },
+    {
+      "pos": [
+        2422,
+        1950
+      ],
+      "radius": 22,
+      "count": 3,
+      "reason": "steady repeated false point",
+      "filter_keys": [
+        "alt2"
+      ]
+    },
+    {
+      "pos": [
+        1596,
+        190
+      ],
+      "radius": 22,
+      "count": 3,
+      "reason": "steady repeated false point",
+      "filter_keys": [
+        "alt2"
+      ]
+    },
+    {
+      "pos": [
+        1198,
+        328
+      ],
+      "radius": 22,
+      "count": 3,
+      "reason": "steady repeated false point",
+      "filter_keys": [
+        "alt2"
+      ]
+    },
+    {
+      "pos": [
+        2522,
+        122
+      ],
+      "radius": 22,
+      "count": 3,
+      "reason": "steady repeated false point",
+      "filter_keys": [
+        "alt5"
+      ]
+    },
+    {
+      "pos": [
+        2468,
+        44
+      ],
+      "radius": 22,
+      "count": 3,
+      "reason": "steady repeated false point",
+      "filter_keys": [
+        "alt6"
+      ]
+    },
+    {
+      "pos": [
+        2624,
+        598
+      ],
+      "radius": 22,
+      "count": 3,
+      "reason": "frame0-backed steady false point",
+      "filter_keys": [
+        "alt2"
+      ]
+    },
+    {
+      "pos": [
+        1184,
+        612
+      ],
+      "radius": 22,
+      "count": 3,
+      "reason": "steady repeated false point",
+      "filter_keys": [
+        "alt2"
+      ]
+    },
+    {
+      "pos": [
+        1306,
+        682
+      ],
+      "radius": 22,
+      "count": 3,
+      "reason": "steady repeated false point",
+      "filter_keys": [
+        "alt2"
+      ]
+    },
+    {
+      "pos": [
+        1147,
+        651
+      ],
+      "radius": 22,
+      "count": 3,
+      "reason": "steady repeated false point",
+      "filter_keys": [
+        "alt2"
+      ]
     }
   ]
 }
