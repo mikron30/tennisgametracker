@@ -93,6 +93,23 @@ class InteractiveBallAnalyzer:
         self.alts20_hsv_upper = None
         self.alts9_11_hsv_lower = None
         self.alts9_11_hsv_upper = None
+        self.click_upper_hsv_specs = [
+            (
+                "click_upper_tight",
+                np.array([95, 12, 180], dtype=np.uint8),
+                np.array([103, 38, 255], dtype=np.uint8),
+                0.0,
+            ),
+            (
+                "click_upper_bright",
+                np.array([90, 10, 170], dtype=np.uint8),
+                np.array([108, 45, 255], dtype=np.uint8),
+                18.0,
+            ),
+        ]
+        self._click_upper_hsv_recover_frame = -1000000
+        self.disable_click_upper_hsv = os.environ.get("DISABLE_CLICK_UPPER_HSV", "0") == "1"
+        self._top_far_out_deferred_candidate = None
         # Keep behind-net / near-net HSV fully disabled by default.
         # Set DISABLE_BEHIND_NET=0 to temporarily re-enable it if needed.
         self.disable_behind_net_mode = os.environ.get("DISABLE_BEHIND_NET", "1") == "1"
@@ -643,6 +660,8 @@ class InteractiveBallAnalyzer:
             return "alts_20"
         if key.startswith("alts9_11") or key.startswith("alts911"):
             return "alts9_11"
+        if key.startswith("click_upper"):
+            return "click_upper"
         if key.startswith("behind_net") or key.startswith("at_edge"):
             return "behind_net"
         if key.startswith("regular") or key in ("single", "single_prefocus", "serve_area", "current"):
@@ -5007,6 +5026,34 @@ class InteractiveBallAnalyzer:
 
         dy = float(self.last_motion.get('dy', 0.0) or 0.0)
         speed = float(self.last_motion.get('distance', 0.0) or 0.0)
+        deferred = getattr(self, '_top_far_out_deferred_candidate', None)
+        recent_click_upper_recover = (
+            self.frame_count - getattr(self, '_click_upper_hsv_recover_frame', -1000000) <= 2
+        )
+        if deferred is not None and recent_click_upper_recover:
+            deferred_frame = int(deferred.get('frame', -1000000))
+            deferred_pos = deferred.get('pos')
+            if deferred_pos is not None and 0 < self.frame_count - deferred_frame <= 8:
+                deferred_x, deferred_y = deferred_pos
+                current_outside, current_far_y = self._point_outside_top_singles_baseline(ball_position, frame)
+                deferred_outside, deferred_far_y = self._point_outside_top_singles_baseline(deferred_pos, frame)
+                upper_line_context = (
+                    1950 <= deferred_x <= 2118 and
+                    175 <= deferred_y <= 255 and
+                    1950 <= x <= 2118 and
+                    130 <= y <= 225
+                )
+                upward_after_defer = y <= deferred_y - 10 and dy <= -6.0 and abs(x - deferred_x) <= 70
+                if upper_line_context and upward_after_defer and (current_outside or deferred_outside):
+                    far_y = current_far_y if current_outside else deferred_far_y
+                    print(
+                        f"Frame {self.frame_count}: [TOP-FAR-OUT CONFIRMED] "
+                        f"deferred_pos={deferred_pos} pos={ball_position} "
+                        f"far_baseline_y={far_y:.1f} dy={dy:.1f} speed={speed:.1f}"
+                    )
+                    self._top_far_out_deferred_candidate = None
+                    return True, "Ball bounced out of court (far baseline)"
+
         if not (dy >= max(10.0, frame_height * 0.006) and speed <= max(130.0, frame_height * 0.060)):
             return False, None
 
@@ -5921,6 +5968,162 @@ class InteractiveBallAnalyzer:
             current_size <= 12.0 and
             (last_dy is None or last_dy <= 0.0)
         )
+
+    def _click_upper_hsv_recover_active(self, frame_shape, allow_inactive):
+        if getattr(self, 'disable_click_upper_hsv', False) or allow_inactive or self.ball_center is None:
+            return False
+        frame_height, frame_width = frame_shape[:2]
+        prev_x, prev_y = self.ball_center
+        min_x = min(1950, frame_width - 1)
+        max_x = min(frame_width - 1, 2118)
+        min_y = min(180, frame_height - 1)
+        max_y = min(frame_height - 1, 255)
+        if not (min_x <= prev_x <= max_x and min_y <= prev_y <= max_y):
+            return False
+
+        current_size = float(self.ball_size or 0.0)
+        if current_size > 28.0:
+            return False
+
+        recent_click_recover = (
+            self.frame_count - getattr(self, '_click_upper_hsv_recover_frame', -1000000) <= 3
+        )
+        return self.stuck_frame_count >= 1 or recent_click_recover
+
+    def _retrack_click_upper_hsv(self, search_frame, x1, y1, predicted_point, frame_gray=None):
+        if self.ball_center is None:
+            return None
+
+        prev_x, prev_y = self.ball_center
+        line_x1, line_x2 = 1950, 2118
+        line_y1, line_y2 = 175, 262
+        roi_x1 = max(0, int(line_x1 - x1))
+        roi_y1 = max(0, int(line_y1 - y1))
+        roi_x2 = min(search_frame.shape[1], int(line_x2 - x1 + 1))
+        roi_y2 = min(search_frame.shape[0], int(line_y2 - y1 + 1))
+        if roi_x2 <= roi_x1 or roi_y2 <= roi_y1:
+            return None
+
+        local_frame = search_frame[roi_y1:roi_y2, roi_x1:roi_x2]
+        if local_frame.size == 0:
+            return None
+
+        hsv_local = cv2.cvtColor(local_frame, cv2.COLOR_BGR2HSV)
+        best = None
+        best_score = float('inf')
+
+        for label, lower, upper, label_penalty in getattr(self, 'click_upper_hsv_specs', []):
+            if label != "click_upper_tight" and self.stuck_frame_count < 1:
+                continue
+            mask = cv2.inRange(hsv_local, lower, upper)
+            if cv2.countNonZero(mask) == 0:
+                continue
+
+            count, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
+            for idx in range(1, count):
+                area = int(stats[idx, cv2.CC_STAT_AREA])
+                if area < 3 or area > 42:
+                    continue
+                width = int(stats[idx, cv2.CC_STAT_WIDTH])
+                height = int(stats[idx, cv2.CC_STAT_HEIGHT])
+                if width > 18 or height > 18:
+                    continue
+
+                component_ys, component_xs = np.where(labels == idx)
+                if component_xs.size == 0:
+                    continue
+                centroid_x, centroid_y = centroids[idx]
+                nearest_idx = int(np.argmin(
+                    (component_xs - centroid_x) ** 2 + (component_ys - centroid_y) ** 2
+                ))
+                local_x = int(component_xs[nearest_idx])
+                local_y = int(component_ys[nearest_idx])
+                cx = x1 + roi_x1 + local_x
+                cy = y1 + roi_y1 + local_y
+
+                dx = cx - prev_x
+                dy = cy - prev_y
+                distance = math.hypot(dx, dy)
+                distance_cap = 92.0 if label == "click_upper_tight" else 70.0
+                if distance > distance_cap or abs(dx) > 115 or dy < -68 or dy > 42:
+                    continue
+
+                motion_metrics = self._candidate_motion_metrics(frame_gray, cx, cy, radius=6)
+                motion_mean = motion_metrics['mean'] if motion_metrics is not None else 0.0
+                motion_max = motion_metrics['max'] if motion_metrics is not None else 0.0
+                strong_motion = (
+                    motion_max >= 35.0 or
+                    motion_mean >= 6.0 or
+                    (area >= 8 and motion_max >= 22.0)
+                )
+                if not strong_motion:
+                    continue
+
+                frame0_hotspot = self._find_frame0_background_hotspot((cx, cy))
+                if frame0_hotspot is not None and motion_mean < 10.0 and motion_max < 45.0:
+                    continue
+
+                ignored_entry = self._find_ignored_tracking_position((cx, cy), filter_key="click_upper")
+                if ignored_entry is not None and motion_mean < 10.0 and motion_max < 60.0:
+                    continue
+
+                predicted_distance = (
+                    math.hypot(cx - predicted_point[0], cy - predicted_point[1])
+                    if predicted_point is not None else None
+                )
+                score = (
+                    distance * 1.45 +
+                    abs(dx) * 0.25 +
+                    max(0.0, float(dy)) * 0.8 +
+                    max(0.0, -float(dy)) * 0.18 -
+                    min(55.0, area * 1.6) -
+                    min(60.0, motion_max * 0.22) -
+                    min(25.0, motion_mean * 0.8) +
+                    label_penalty
+                )
+                if predicted_distance is not None:
+                    score += min(35.0, predicted_distance * 0.08)
+
+                if score < best_score:
+                    hsv_at_point = hsv_local[local_y, local_x]
+                    best_score = score
+                    best = {
+                        'label': label,
+                        'pos': (cx, cy),
+                        'area': float(area),
+                        'hsv': hsv_at_point,
+                        'lower': lower.copy(),
+                        'upper': upper.copy(),
+                        'distance': distance,
+                        'score': score,
+                        'motion_mean': motion_mean,
+                        'motion_max': motion_max,
+                        'predicted_distance': predicted_distance,
+                        'filter_key': "click_upper",
+                    }
+
+        if best is not None:
+            print(
+                f"  DEBUG: Click-HSV upper recover candidate {best['pos']} "
+                f"via {best['label']} area={best['area']:.1f}px "
+                f"motion={best['motion_mean']:.1f}/{best['motion_max']:.1f} "
+                f"dist={best['distance']:.1f}px score={best['score']:.1f}"
+            )
+        return best
+
+    def _commit_click_upper_hsv_recover(self, recover):
+        prev_pos = self.ball_center
+        new_pos = recover['pos']
+        self.ball_center = new_pos
+        self.ball_hsv = recover['hsv']
+        self.ball_size = recover['area']
+        self._update_recovered_motion(prev_pos, new_pos)
+        self._activate_regular_hsv()
+        self.direction_change_streak = 0
+        self.stuck_frame_count = 0
+        self._click_upper_hsv_recover_frame = self.frame_count
+        print(f"Frame {self.frame_count}: [CLICK HSV UPPER RECOVER] Ball at {new_pos} via {recover['label']}")
+        return self.ball_center
 
     def _retrack_with_upper_exit_low_s(self, search_frame, x1, y1, predicted_point, frame_gray=None):
         """Try a lower-saturation HSV only for upper-flight no-detection cases."""
@@ -8583,6 +8786,13 @@ class InteractiveBallAnalyzer:
                 print(f"Frame {self.frame_count}: [TOP-RETURN WAIT] no top-line reentry, holding {self.ball_center}")
                 return self.ball_center
 
+            if self._click_upper_hsv_recover_active(frame.shape, allow_inactive):
+                click_upper_recover = self._retrack_click_upper_hsv(
+                    search_frame, x1, y1, predicted_point, frame_gray=frame_gray
+                )
+                if click_upper_recover is not None:
+                    return self._commit_click_upper_hsv_recover(click_upper_recover)
+
             if (not allow_inactive and self.ball_center and not getattr(self, 'edge_wait', False)
                     and self.stuck_frame_count < 5
                     and hasattr(self, '_prev_frame_gray') and self._prev_frame_gray is not None):
@@ -10824,6 +11034,10 @@ class InteractiveBallAnalyzer:
                     existing_defer = int(getattr(self, '_top_far_out_defer_until_frame', -1000000))
                     if self.frame_count > existing_defer:
                         self._top_far_out_defer_until_frame = self.frame_count + 3
+                        self._top_far_out_deferred_candidate = {
+                            'frame': self.frame_count,
+                            'pos': (cx, cy),
+                        }
                         print(
                             f"Frame {self.frame_count}: [TOP-FAR-OUT DEFER] "
                             f"smooth HSV return continuation at ({cx},{cy})"
@@ -11956,6 +12170,12 @@ class InteractiveBallAnalyzer:
                 self._activate_regular_hsv()
                 print(f"Frame {self.frame_count}: [REGULAR RECOVER] Ball at {new_pos}")
                 return self.ball_center
+        if best_contour is None and self._click_upper_hsv_recover_active(frame.shape, allow_inactive):
+            click_upper_recover = self._retrack_click_upper_hsv(
+                search_frame, x1, y1, predicted_point, frame_gray=frame_gray
+            )
+            if click_upper_recover is not None:
+                return self._commit_click_upper_hsv_recover(click_upper_recover)
         # Early-frame fallback: if nothing selected, try full-frame smallest contour
         if best_contour is None and early_frames:
             fallback_mask = cv2.inRange(frame, hsv_lower_use, hsv_upper_use) if 'hsv_lower_use' in locals() else None
