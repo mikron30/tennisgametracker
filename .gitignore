@@ -50,6 +50,11 @@ tmp/
 # Logs
 *.log
 
+# Generated point history CSVs
+point_history*.csv*
+point_hist*.csv*
+pointshistory/
+
 # Generated image output directories
 ball_trace/
 diagnostic_frames/

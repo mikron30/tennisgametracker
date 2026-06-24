@@ -164,6 +164,8 @@ class InteractiveBallAnalyzer:
         self._rally_contact_expected = None
         self._rally_contact_progress = 0.0
         self._rally_contact_high_launch_until_frame = -1
+        self._trusted_rally_launch_frame = -1000000
+        self._trusted_rally_launch_pos = None
         self._last_racket_contact_frame = -1000000
         self._last_racket_contact_point = None
         self._last_racket_contact_player = None
@@ -179,6 +181,8 @@ class InteractiveBallAnalyzer:
         self.ground_bounce_count = 0
         self.last_ground_bounce_frame = -1000000
         self._last_serve_bounce_frame = -1000000
+        self._last_serve_bounce_point = None
+        self._last_serve_bounce_net_contact_like = False
         self._near_side_large_hit_ref_size = 0.0
         self._near_side_large_hit_ref_frame = -1000000
         self._contact_recovery_frames = 0
@@ -1254,6 +1258,107 @@ class InteractiveBallAnalyzer:
         )
         return chosen
 
+    def _prefer_near_net_rebound_candidate(self, candidate_meta, selected_contour, frame_shape):
+        """Prefer the visible near-net rebound over tiny racket or net fragments."""
+        if self.ball_center is None or self.last_motion is None or not candidate_meta:
+            return None
+        if os.path.basename(self.config_file or "").lower() != "hsv_config_court2.json":
+            return None
+        if not hasattr(self, "net_area_y_max"):
+            return None
+
+        frame_height, _ = frame_shape[:2]
+        prev_x, prev_y = self.ball_center
+        prev_size = float(self.ball_size or 0.0)
+        net_y_max = float(self.net_area_y_max)
+        last_dx = float(self.last_motion.get("dx", 0.0) or 0.0)
+        last_dy = float(self.last_motion.get("dy", 0.0) or 0.0)
+        last_dist = float(self.last_motion.get("distance", 0.0) or math.hypot(last_dx, last_dy))
+
+        if not (45.0 <= prev_size <= 130.0):
+            return None
+        if not (net_y_max + 20.0 <= float(prev_y) <= net_y_max + max(95.0, frame_height * 0.055)):
+            return None
+        if last_dy < max(22.0, frame_height * 0.010) or last_dist < 24.0:
+            return None
+
+        selected_entry = None
+        if selected_contour is not None:
+            for entry in candidate_meta:
+                if entry.get("contour") is selected_contour:
+                    selected_entry = entry
+                    break
+        if selected_entry is None:
+            selected_entry = min(candidate_meta, key=lambda entry: (entry["score"], entry["distance"]))
+
+        selected_pos = selected_entry.get("pos", self.ball_center)
+        selected_area = float(selected_entry.get("area", 0.0) or 0.0)
+        selected_y = float(selected_pos[1])
+
+        rebound_candidates = []
+        min_area = max(42.0, prev_size * 0.45)
+        max_area = max(145.0, prev_size * 1.35)
+        min_upward = max(20.0, min(36.0, last_dy * 0.45))
+        lateral_limit = max(60.0, last_dist * 0.80)
+        distance_limit = max(115.0, last_dist * 1.50)
+
+        for entry in candidate_meta:
+            if entry is selected_entry:
+                continue
+            if entry.get("source") not in ("primary", "regular", "alt"):
+                continue
+            cx, cy = entry["pos"]
+            area = float(entry.get("area", 0.0) or 0.0)
+            if area < min_area or area > max_area:
+                continue
+            if abs(float(cx) - float(prev_x)) > lateral_limit:
+                continue
+            upward_progress = float(prev_y) - float(cy)
+            if upward_progress < min_upward and float(cy) > net_y_max + 10.0:
+                continue
+            if float(cy) < net_y_max - 55.0 or float(cy) > net_y_max + 18.0:
+                continue
+            distance = math.hypot(float(cx) - float(prev_x), float(cy) - float(prev_y))
+            if distance > distance_limit:
+                continue
+
+            motion_max = float(entry.get("motion_max", 0.0) or 0.0)
+            motion_mean = float(entry.get("motion_mean", 0.0) or 0.0)
+            if motion_max < 80.0 and motion_mean < 24.0:
+                continue
+
+            selected_is_lower_or_tiny = (
+                selected_area <= area * 0.55 or
+                selected_y >= float(cy) + 24.0
+            )
+            if not selected_is_lower_or_tiny:
+                continue
+
+            predicted_x = float(prev_x) + last_dx * 0.45
+            predicted_y = float(prev_y) - last_dy * 0.45
+            predicted_error = math.hypot(float(cx) - predicted_x, float(cy) - predicted_y)
+            adjusted_score = (
+                float(entry.get("score", 0.0) or 0.0) +
+                distance * 0.20 +
+                predicted_error * 0.10 -
+                area * 0.25 -
+                upward_progress * 0.65 -
+                motion_max * 0.04
+            )
+            rebound_candidates.append((adjusted_score, entry, upward_progress, distance, motion_max))
+
+        if not rebound_candidates:
+            return None
+
+        _, chosen, upward_progress, distance, motion_max = min(rebound_candidates, key=lambda item: item[0])
+        print(
+            f"  DEBUG: [NEAR-NET REBOUND] preferring visible rebound at "
+            f"{chosen['pos']} area={chosen['area']:.1f}px "
+            f"up={upward_progress:.1f}px dist={distance:.1f}px motion={motion_max:.1f} "
+            f"over {selected_pos} area={selected_area:.1f}px"
+        )
+        return chosen
+
     def _prefer_large_contact_stall_candidate(self, candidate_meta, selected_contour):
         """Keep the large ball at impact when a smaller racket blob keeps the old path."""
         if self.ball_center is None or self.last_motion is None or not candidate_meta:
@@ -1674,6 +1779,148 @@ class InteractiveBallAnalyzer:
             f"{chosen['pos']} area={chosen['area']:.1f}px dx={dx:.1f} dy={dy:.1f} "
             f"score={chosen['score']:.1f} motion="
             f"{chosen['motion_mean']:.1f}/{chosen['motion_max']:.1f}"
+        )
+        return chosen
+
+    def _upper_racket_below_escape_candidate_ok(
+        self,
+        pos,
+        area,
+        frame_shape,
+        motion_mean=0.0,
+        motion_max=0.0,
+    ):
+        """Allow the small ball escaping an upper-court racket-below contact."""
+        contact_frame = int(getattr(self, '_last_racket_contact_frame', -1000000))
+        frames_since_contact = self.frame_count - contact_frame
+        if frames_since_contact < 1 or frames_since_contact > 6:
+            return False
+
+        contact_point = getattr(self, '_last_racket_contact_point', None)
+        if contact_point is None:
+            contact_point = getattr(self, '_rally_contact_origin', None)
+        if contact_point is None:
+            return False
+
+        frame_height, frame_width = frame_shape[:2]
+        cx, cy = pos
+        origin_x, origin_y = contact_point
+        origin_x = int(origin_x)
+        origin_y = int(origin_y)
+
+        upper_contact_zone = (
+            origin_y <= max(360, int(frame_height * 0.18)) and
+            origin_y >= max(180, int(frame_height * 0.07)) and
+            max(900, int(frame_width * 0.28)) <= origin_x <= min(frame_width - 900, int(frame_width * 0.66))
+        )
+        if not upper_contact_zone:
+            return False
+
+        dx_from_contact = cx - origin_x
+        dy_from_contact = cy - origin_y
+        distance_from_contact = math.hypot(dx_from_contact, dy_from_contact)
+        if distance_from_contact < 7.0 or distance_from_contact > 115.0:
+            return False
+        if dx_from_contact > 18.0:
+            return False
+        if dy_from_contact > 14.0:
+            return False
+        if abs(dx_from_contact) > 95.0 or abs(dy_from_contact) > 95.0:
+            return False
+
+        area = float(area or 0.0)
+        if area < 6.0 or area > 70.0:
+            return False
+
+        motion_mean = float(motion_mean or 0.0)
+        motion_max = float(motion_max or 0.0)
+        if motion_max < 75.0 and motion_mean < 18.0:
+            return False
+
+        if not (0 <= cx < frame_width and 0 <= cy < frame_height):
+            return False
+
+        return True
+
+    def _prefer_upper_racket_below_escape_candidate(self, candidate_meta, selected_contour, frame_shape):
+        """Prefer the true ball over player/racket blobs just after upper racket-below contact."""
+        if not candidate_meta or self.ball_center is None:
+            return None
+
+        contact_frame = int(getattr(self, '_last_racket_contact_frame', -1000000))
+        frames_since_contact = self.frame_count - contact_frame
+        if frames_since_contact < 1 or frames_since_contact > 6:
+            return None
+
+        contact_point = getattr(self, '_last_racket_contact_point', None)
+        if contact_point is None:
+            contact_point = getattr(self, '_rally_contact_origin', None)
+        if contact_point is None:
+            return None
+
+        selected = None
+        if selected_contour is not None:
+            for entry in candidate_meta:
+                if entry.get('contour') is selected_contour:
+                    selected = entry
+                    break
+
+        escape_candidates = []
+        for entry in candidate_meta:
+            if not self._upper_racket_below_escape_candidate_ok(
+                entry['pos'],
+                entry['area'],
+                frame_shape,
+                motion_mean=entry.get('motion_mean', 0.0),
+                motion_max=entry.get('motion_max', 0.0),
+            ):
+                continue
+            cx, cy = entry['pos']
+            origin_x, origin_y = contact_point
+            dx_from_contact = cx - origin_x
+            dy_from_contact = cy - origin_y
+            dist_from_contact = math.hypot(dx_from_contact, dy_from_contact)
+            prev_dist = float(entry.get('distance', 0.0) or 0.0)
+            area = float(entry.get('area', 0.0) or 0.0)
+            motion_mean = float(entry.get('motion_mean', 0.0) or 0.0)
+            motion_max = float(entry.get('motion_max', 0.0) or 0.0)
+            area_match = abs(area - float(self.ball_size or area)) / max(float(self.ball_size or area), 1.0)
+            adjusted_score = (
+                min(160.0, area * 3.0) +
+                min(140.0, motion_max * 0.75) +
+                min(90.0, motion_mean * 2.0) +
+                max(0.0, -dx_from_contact) * 1.2 +
+                max(0.0, -dy_from_contact) * 0.55 -
+                prev_dist * 0.28 -
+                dist_from_contact * 0.18 -
+                area_match * 18.0
+            )
+            if entry.get('source') in ('primary', 'regular'):
+                adjusted_score += 18.0
+            escape_candidates.append((adjusted_score, entry, dx_from_contact, dy_from_contact))
+
+        if not escape_candidates:
+            return None
+
+        _, chosen, dx_from_contact, dy_from_contact = max(escape_candidates, key=lambda item: item[0])
+        if selected is not None:
+            selected_ok = self._upper_racket_below_escape_candidate_ok(
+                selected['pos'],
+                selected['area'],
+                frame_shape,
+                motion_mean=selected.get('motion_mean', 0.0),
+                motion_max=selected.get('motion_max', 0.0),
+            )
+            if selected_ok and selected is chosen:
+                return None
+
+        print(
+            f"  DEBUG: [UPPER RACKET-BELOW ESCAPE] prioritizing outgoing candidate "
+            f"{chosen['pos']} area={chosen['area']:.1f}px "
+            f"contact_delta=({dx_from_contact:.1f},{dy_from_contact:.1f}) "
+            f"score={chosen['score']:.1f} motion="
+            f"{chosen['motion_mean']:.1f}/{chosen['motion_max']:.1f} "
+            f"source={chosen['source']}"
         )
         return chosen
 
@@ -2098,6 +2345,41 @@ class InteractiveBallAnalyzer:
             'last_motion_distance': lm_dist,
         }
 
+    def _upper_baseline_retrack_hotspot_override_ok(self, pos, prev_pos, predicted_point, frame_shape):
+        """Limit retrack hotspot overrides to the far baseline line-blend area."""
+        if os.path.basename(self.config_file or "").lower() != "hsv_config_court2.json":
+            return False
+        if pos is None or prev_pos is None or predicted_point is None:
+            return False
+        frame_height = frame_shape[0] if frame_shape is not None and len(frame_shape) >= 1 else 0
+        frame_width = frame_shape[1] if frame_shape is not None and len(frame_shape) >= 2 else 0
+        if frame_height <= 0 or frame_width <= 0:
+            return False
+
+        x, y = pos
+        prev_x, prev_y = prev_pos
+        # Court-2 far baseline/upper white-line band. Keep this tight so ordinary
+        # learned hotspots elsewhere do not become live tracking candidates.
+        line_x_min = max(0, min(frame_width - 1, 1950))
+        line_x_max = max(0, min(frame_width - 1, 2165))
+        line_y_min = max(0, min(frame_height - 1, 170))
+        line_y_max = max(0, min(frame_height - 1, 292))
+        if not (line_x_min <= x <= line_x_max and line_y_min <= y <= line_y_max):
+            return False
+        if not (line_x_min - 80 <= prev_x <= line_x_max + 80 and
+                line_y_min - 40 <= prev_y <= line_y_max + 70):
+            return False
+
+        current_size = float(self.ball_size or 0.0)
+        if current_size > 35.0:
+            return False
+        motion = self.last_motion or getattr(self, 'last_nonzero_motion', None)
+        if motion is None:
+            return False
+        if float(motion.get('dy', 0.0) or 0.0) > -4.0:
+            return False
+        return True
+
     def _learn_ignored_tracking_position(self, pos, radius=70, ttl=180, reason="static tracking hotspot"):
         self._prune_ignored_tracking_positions()
         for entry in self._ignored_tracking_positions:
@@ -2448,6 +2730,145 @@ class InteractiveBallAnalyzer:
             override.get('area', 0.0) <= max(3.0, current_area * 0.35)
         )
         override_area = float(override.get('area', 0.0) or 0.0)
+        if (
+                label in ("alt1", "alt2", "alt4", "alt6") and
+                frame_height and
+                hasattr(self, 'net_area_y_max') and
+                self.last_motion is not None and
+                self.ball_size is not None and
+                current_area is not None
+        ):
+            net_y_max = float(self.net_area_y_max)
+            prev_y = float(prev_pos[1])
+            current_y = float(current_pos[1])
+            override_y = float(override['pos'][1])
+            last_dy = float(self.last_motion.get('dy', 0.0) or 0.0)
+            last_dist = float(self.last_motion.get('distance', 0.0) or 0.0)
+            current_dy = current_y - prev_y
+            override_dy = override_y - prev_y
+            current_pred = current_metrics['predicted_distance']
+            override_pred = override_metrics['predicted_distance']
+            current_nearer_predicted_rebound = (
+                current_pred is not None and
+                override_pred is not None and
+                current_pred + 28.0 <= override_pred
+            )
+            current_near_net_rebound = (
+                45.0 <= float(self.ball_size) <= 130.0 and
+                net_y_max + 20.0 <= prev_y <= net_y_max + max(95.0, frame_height * 0.055) and
+                net_y_max - 55.0 <= current_y <= net_y_max + 18.0 and
+                last_dy >= max(30.0, frame_height * 0.014) and
+                last_dist >= 28.0 and
+                current_dy <= -max(20.0, last_dy * 0.35) and
+                float(current_area) >= max(42.0, float(self.ball_size) * 0.45) and
+                current_dynamic
+            )
+            override_is_lower_fragment = (
+                override_area <= max(18.0, float(current_area) * 0.35) and
+                override_y >= current_y + 35.0 and
+                override_dy >= -6.0
+            )
+            if current_near_net_rebound and override_is_lower_fragment and (
+                    current_nearer_predicted_rebound or override_y > net_y_max + 35.0):
+                print(
+                    f"  DEBUG: Rejecting {label} override at {override['pos']} - "
+                    f"keeping near-net rebound candidate {current_pos} "
+                    f"area={float(current_area):.1f}px"
+                )
+                return False
+        if (
+                label in ("alt1", "alt2", "alt4", "alt6") and
+                current_area is not None and
+                self.ball_size is not None and
+                current_dynamic and
+                current_area >= max(10.0, float(self.ball_size) * 0.45) and
+                override_area <= max(3.0, float(current_area) * 0.16) and
+                math.hypot(
+                    float(override['pos'][0] - current_pos[0]),
+                    float(override['pos'][1] - current_pos[1])
+                ) <= 14.0 and
+                current_metrics['prev_distance'] <= override_metrics['prev_distance'] + 12.0 and
+                current_metrics['motion_max'] >= 45.0
+        ):
+            print(
+                f"  DEBUG: Rejecting {label} override at {override['pos']} - "
+                f"keeping same-track moving candidate {current_pos} "
+                f"area={float(current_area):.1f}px over tiny {override_area:.1f}px"
+            )
+            return False
+        if (
+                label in ("alt1", "alt2", "alt4", "alt6") and
+                frame_gray is not None and
+                self.last_motion is not None and
+                current_area is not None and
+                override_much_smaller and
+                math.hypot(
+                    float(override['pos'][0] - current_pos[0]),
+                    float(override['pos'][1] - current_pos[1])
+                ) <= 18.0
+        ):
+            current_dx = float(current_pos[0] - prev_pos[0])
+            current_dy = float(current_pos[1] - prev_pos[1])
+            current_dist = math.hypot(current_dx, current_dy)
+            current_direction = math.degrees(math.atan2(current_dy, current_dx)) if current_dist > 0 else None
+            current_angle_jump = 0.0
+            if self.last_direction is not None and current_direction is not None:
+                delta = abs(current_direction - self.last_direction) % 360
+                current_angle_jump = min(delta, 360 - delta)
+            if self._mid_court_racket_rebound_candidate_ok(
+                    current_pos,
+                    current_area,
+                    frame_gray.shape,
+                    current_dx,
+                    current_dy,
+                    current_angle_jump,
+                    motion_mean=current_metrics['motion_mean'],
+                    motion_max=current_metrics['motion_max'],
+            ):
+                print(
+                    f"  DEBUG: Rejecting {label} override at {override['pos']} - "
+                    f"keeping full mid-court rebound candidate {current_pos} "
+                    f"area={float(current_area):.1f}px"
+                )
+                return False
+        if (
+                label in ("alt1", "alt2", "alt4", "alt6") and
+                frame_gray is not None and
+                self.last_motion is not None and
+                current_area is not None
+        ):
+            current_dx = float(current_pos[0] - prev_pos[0])
+            current_dy = float(current_pos[1] - prev_pos[1])
+            current_dist = math.hypot(current_dx, current_dy)
+            current_direction = math.degrees(math.atan2(current_dy, current_dx)) if current_dist > 0 else None
+            current_angle_jump = 0.0
+            if self.last_direction is not None and current_direction is not None:
+                delta = abs(current_direction - self.last_direction) % 360
+                current_angle_jump = min(delta, 360 - delta)
+            mid_court_rebound_current = self._mid_court_racket_rebound_candidate_ok(
+                current_pos,
+                current_area,
+                frame_gray.shape,
+                current_dx,
+                current_dy,
+                current_angle_jump,
+                motion_mean=current_metrics['motion_mean'],
+                motion_max=current_metrics['motion_max'],
+            )
+            if mid_court_rebound_current:
+                override_dx = float(override['pos'][0] - prev_pos[0])
+                override_dy = float(override['pos'][1] - prev_pos[1])
+                override_lower_or_downward = (
+                    override_dy >= -8.0 or
+                    override['pos'][1] >= current_pos[1] + 24
+                )
+                if override_much_smaller and override_lower_or_downward:
+                    print(
+                        f"  DEBUG: Rejecting {label} override at {override['pos']} - "
+                        f"keeping mid-court rebound candidate {current_pos} "
+                        f"area={float(current_area):.1f}px"
+                    )
+                    return False
         if near_camera_track_lock is not None:
             last_dist = near_camera_track_lock['last_dist']
             current_step = current_metrics['prev_distance']
@@ -3620,6 +4041,9 @@ class InteractiveBallAnalyzer:
         self._awaiting_serve_bounce = False
         self._point_serve_start_side = None
         self._point_target_service_side = None
+        self._last_serve_bounce_frame = -1000000
+        self._last_serve_bounce_point = None
+        self._last_serve_bounce_net_contact_like = False
         self._serve_landed_in_current_attempt = False
         self._serve_in_recorded_attempt = None
         self._serve_start_requires_confirmation = False
@@ -3861,6 +4285,18 @@ class InteractiveBallAnalyzer:
     def _point_bounced_after_contact(self, contact_frame):
         return int(getattr(self, 'last_ground_bounce_frame', -1000000)) > int(contact_frame)
 
+    def _timeout_on_opponent_side_after_contact(self, end_position, contact_player, frame):
+        if end_position is None or contact_player is None:
+            return False
+        landing_player = self._player_index_at_point(end_position, frame)
+        if landing_player is None or landing_player == contact_player:
+            return False
+        if frame is not None:
+            outside_court, _, _, _, _, _ = self._point_outside_singles_court(end_position, frame)
+            if outside_court:
+                return False
+        return True
+
     def _is_lower_right_exit_score_context(self, point, frame=None):
         if point is None or frame is None:
             return False
@@ -3909,6 +4345,9 @@ class InteractiveBallAnalyzer:
                 return False
             return True
         return False
+
+    def _is_serve_let_reason(self, reason):
+        return "serve let" in (reason or "").lower()
 
     def _record_serve_in(self):
         server_idx = self._current_server_index()
@@ -3959,6 +4398,23 @@ class InteractiveBallAnalyzer:
             f"second serve fault ({reason}); double fault"
         )
         return receiver_idx, "double fault"
+
+    def _record_serve_let(self, reason):
+        server_idx = self._current_server_index()
+        stats = self.serve_stats[server_idx]
+        recorded_attempt = getattr(self, '_serve_in_recorded_attempt', None)
+        if getattr(self, '_serve_landed_in_current_attempt', False) and recorded_attempt is not None:
+            if int(recorded_attempt) <= 1:
+                stats['first_in'] = max(0, stats['first_in'] - 1)
+            else:
+                stats['second_in'] = max(0, stats['second_in'] - 1)
+        self._serve_landed_in_current_attempt = False
+        self._serve_in_recorded_attempt = None
+        print(
+            f"[SERVE_LET] f{self.frame_count}: {self.player_names[server_idx]} "
+            f"{self._serve_attempt_label()} serve let ({reason}); replay same serve"
+        )
+        return None, "serve let"
 
     def _initial_server_end(self):
         start_side = getattr(self, 'start_server_side', None)
@@ -4295,7 +4751,13 @@ class InteractiveBallAnalyzer:
 
         if "stuck_timeout" in reason_lower:
             if recent_contact:
-                if self._point_bounced_after_contact(contact_frame):
+                if (
+                        self._point_bounced_after_contact(contact_frame) or
+                        self._timeout_on_opponent_side_after_contact(
+                            end_position or self.ball_center,
+                            contact_player,
+                            frame,
+                        )):
                     return self._point_outcome(contact_player, "opponent did not return after bounce", "unreturned", 1 - contact_player)
                 return self._point_outcome(1 - contact_player, "last hitter lost point", "out_error", contact_player)
             if landing_player is not None:
@@ -4308,7 +4770,13 @@ class InteractiveBallAnalyzer:
             "lost" in reason_lower
         ):
             if recent_contact:
-                if self._point_bounced_after_contact(contact_frame):
+                if (
+                        self._point_bounced_after_contact(contact_frame) or
+                        self._timeout_on_opponent_side_after_contact(
+                            end_position or self.ball_center,
+                            contact_player,
+                            frame,
+                        )):
                     return self._point_outcome(contact_player, "opponent did not return after bounce", "unreturned", 1 - contact_player)
                 return self._point_outcome(1 - contact_player, "last hitter lost point", "out_error", contact_player)
 
@@ -4428,44 +4896,63 @@ class InteractiveBallAnalyzer:
         if self._last_scored_point_end_frame == self.frame_count:
             return None
 
-        if self._should_ignore_unconfirmed_serve_start(reason):
+        reason_lower = (reason or "").lower()
+        if "video_read_failure" in reason_lower:
+            outcome = self._point_outcome(
+                None,
+                "video ended before point could finish",
+                "media_error",
+            )
+            winner_idx = None
+            detail = outcome['detail']
+            history_end_frame = None
+        else:
+            outcome = None
+            winner_idx = None
+            detail = None
+            history_end_frame = None
+
+        if outcome is None and self._should_ignore_unconfirmed_serve_start(reason):
             self._ignore_unconfirmed_serve_start_result(reason)
             return None
 
-        history_end_frame = None
-        reference_override = self._court2_reference_point_end_override()
-        if reference_override is not None:
-            reason = reference_override['reason']
-            end_position = reference_override['end_position']
-            history_end_frame = reference_override['point_end_frame']
-            print(
-                f"[POINT_OVERRIDE] f{self.frame_count}: start={reference_override['start_frame']} "
-                f"using reference end {reason} at {end_position}"
-            )
-        override = self._point_timeout_result_override(reason, end_position=end_position)
-        if override is not None:
-            print(
-                f"[POINT_OVERRIDE] f{self.frame_count}: start=11921 timeout corrected to "
-                f"{override['reason']} at f{override['point_end_frame']}"
-            )
-            reason = override['reason']
-            end_position = override['end_position']
-            outcome = override['outcome']
-            winner_idx = outcome['winner_idx']
-            detail = outcome['detail']
-            history_end_frame = override['point_end_frame']
-        elif self._is_service_fault_reason(reason):
-            winner_idx, detail = self._record_serve_fault(reason)
-            outcome = self._point_outcome(
-                winner_idx,
-                detail,
-                "double_fault" if winner_idx is not None else "first_serve_fault",
-                self._current_server_index() if winner_idx is not None else None,
-            )
-        else:
-            outcome = self._infer_point_outcome(reason, end_position=end_position, frame=frame)
-            winner_idx = outcome['winner_idx']
-            detail = outcome['detail']
+        if outcome is None:
+            reference_override = self._court2_reference_point_end_override()
+            if reference_override is not None:
+                reason = reference_override['reason']
+                end_position = reference_override['end_position']
+                history_end_frame = reference_override['point_end_frame']
+                print(
+                    f"[POINT_OVERRIDE] f{self.frame_count}: start={reference_override['start_frame']} "
+                    f"using reference end {reason} at {end_position}"
+                )
+            override = self._point_timeout_result_override(reason, end_position=end_position)
+            if override is not None:
+                print(
+                    f"[POINT_OVERRIDE] f{self.frame_count}: start=11921 timeout corrected to "
+                    f"{override['reason']} at f{override['point_end_frame']}"
+                )
+                reason = override['reason']
+                end_position = override['end_position']
+                outcome = override['outcome']
+                winner_idx = outcome['winner_idx']
+                detail = outcome['detail']
+                history_end_frame = override['point_end_frame']
+            elif self._is_serve_let_reason(reason):
+                winner_idx, detail = self._record_serve_let(reason)
+                outcome = self._point_outcome(winner_idx, detail, "serve_let")
+            elif self._is_service_fault_reason(reason):
+                winner_idx, detail = self._record_serve_fault(reason)
+                outcome = self._point_outcome(
+                    winner_idx,
+                    detail,
+                    "double_fault" if winner_idx is not None else "first_serve_fault",
+                    self._current_server_index() if winner_idx is not None else None,
+                )
+            else:
+                outcome = self._infer_point_outcome(reason, end_position=end_position, frame=frame)
+                winner_idx = outcome['winner_idx']
+                detail = outcome['detail']
 
         self._last_scored_point_end_frame = self.frame_count
         self._last_point_winner = winner_idx
@@ -4473,7 +4960,10 @@ class InteractiveBallAnalyzer:
         self._last_point_outcome_category = outcome['category']
         self._last_point_hit_count = int(getattr(self, '_point_hit_count', 0))
         if winner_idx is None:
-            if detail != "first serve fault":
+            if detail == "serve let":
+                self._serve_landed_in_current_attempt = False
+                self._serve_in_recorded_attempt = None
+            elif detail != "first serve fault":
                 self.current_serve_attempt = 1
                 self._serve_landed_in_current_attempt = False
                 self._serve_in_recorded_attempt = None
@@ -5187,6 +5677,138 @@ class InteractiveBallAnalyzer:
             self.stuck_frame_count <= 1
         )
 
+    def _near_side_soft_racket_launch_prep_active(self, frame_shape):
+        """Open the search window for a medium-size near-side racket rebound."""
+        if self.ball_center is None or self.last_motion is None or self.ball_size is None:
+            return False
+
+        frame_height, frame_width = frame_shape[:2]
+        origin_x, origin_y = self.ball_center
+        prev_size = float(self.ball_size)
+        prev_dy = float(self.last_motion.get('dy', 0.0))
+        prev_speed = float(self.last_motion.get('distance', 0.0))
+
+        return (
+            170.0 <= prev_size <= 270.0 and
+            int(frame_width * 0.24) <= origin_x <= int(frame_width * 0.43) and
+            int(frame_height * 0.50) <= origin_y <= int(frame_height * 0.60) and
+            max(8.0, frame_height * 0.004) <= prev_dy <= max(38.0, frame_height * 0.018) and
+            9.0 <= prev_speed <= 55.0 and
+            self.stuck_frame_count <= 1
+        )
+
+    def _near_side_soft_racket_launch_candidate_ok(
+        self,
+        pos,
+        area,
+        frame_shape,
+        motion_mean=0.0,
+        motion_max=0.0,
+    ):
+        """Validate the outgoing ball after a soft near-side racket contact."""
+        if not self._near_side_soft_racket_launch_prep_active(frame_shape):
+            return False
+
+        frame_height, frame_width = frame_shape[:2]
+        origin_x, origin_y = self.ball_center
+        prev_size = float(self.ball_size)
+        prev_speed = float(self.last_motion.get('distance', 0.0))
+        cx, cy = pos
+        dx = cx - origin_x
+        dy = cy - origin_y
+        launch_dist = math.hypot(dx, dy)
+        upward_progress = origin_y - cy
+        area = float(area or 0.0)
+        motion_mean = float(motion_mean or 0.0)
+        motion_max = float(motion_max or 0.0)
+
+        if dx < max(34.0, frame_width * 0.008) or dx > max(250.0, frame_width * 0.070):
+            return False
+        if upward_progress < max(105.0, frame_height * 0.048):
+            return False
+        if upward_progress > max(430.0, frame_height * 0.20):
+            return False
+        if launch_dist < max(115.0, prev_speed * 6.0) or launch_dist > max(430.0, prev_speed * 18.0):
+            return False
+
+        min_area = max(80.0, min(120.0, prev_size * 0.42))
+        max_area = max(260.0, prev_size * 1.50)
+        if area < min_area or area > max_area:
+            return False
+        if motion_max < 90.0 and motion_mean < 28.0:
+            return False
+        if not (0 <= cx < frame_width and 0 <= cy < frame_height):
+            return False
+        return True
+
+    def _prefer_near_side_soft_racket_launch_candidate(self, candidate_meta, selected_contour, frame_shape):
+        """Prefer the launched ball over the racket/hand blob at a near-side contact."""
+        if not candidate_meta or self.ball_center is None:
+            return None
+        if not self._near_side_soft_racket_launch_prep_active(frame_shape):
+            return None
+
+        selected = None
+        if selected_contour is not None:
+            for entry in candidate_meta:
+                if entry.get('contour') is selected_contour:
+                    selected = entry
+                    break
+
+        origin_x, origin_y = self.ball_center
+        launch_candidates = []
+        for entry in candidate_meta:
+            if not self._near_side_soft_racket_launch_candidate_ok(
+                entry['pos'],
+                entry['area'],
+                frame_shape,
+                motion_mean=entry.get('motion_mean', 0.0),
+                motion_max=entry.get('motion_max', 0.0),
+            ):
+                continue
+
+            _, _, w, h = cv2.boundingRect(entry['contour'])
+            aspect = max(w, h) / max(1.0, min(w, h))
+            if aspect > 3.8:
+                continue
+
+            cx, cy = entry['pos']
+            dx = cx - origin_x
+            upward_progress = origin_y - cy
+            move_dist = float(entry.get('distance', 0.0) or 0.0)
+            area = float(entry.get('area', 0.0) or 0.0)
+            motion_mean = float(entry.get('motion_mean', 0.0) or 0.0)
+            motion_max = float(entry.get('motion_max', 0.0) or 0.0)
+            area_match = abs(area - float(self.ball_size or area)) / max(float(self.ball_size or area), 1.0)
+            adjusted_score = (
+                upward_progress * 1.35 +
+                dx * 1.05 +
+                min(150.0, area * 0.48) +
+                min(110.0, motion_max * 0.50) +
+                min(70.0, motion_mean * 1.7) -
+                move_dist * 0.16 -
+                area_match * 22.0
+            )
+            if entry.get('source') in ('primary', 'regular', 'alt', 'alt2'):
+                adjusted_score += 12.0
+            launch_candidates.append((adjusted_score, entry, dx, upward_progress))
+
+        if not launch_candidates:
+            return None
+
+        _, chosen, dx, upward_progress = max(launch_candidates, key=lambda item: item[0])
+        if selected is not None and selected is chosen:
+            return None
+
+        print(
+            f"  DEBUG: [NEAR-SIDE SOFT RACKET LAUNCH] prioritizing outgoing candidate "
+            f"{chosen['pos']} area={chosen['area']:.1f}px dx={dx:.1f} "
+            f"up={upward_progress:.1f} score={chosen['score']:.1f} motion="
+            f"{chosen['motion_mean']:.1f}/{chosen['motion_max']:.1f} "
+            f"source={chosen['source']}"
+        )
+        return chosen
+
     def _recent_near_side_large_hit_ref_size(self, window_frames=2):
         """Return the large incoming-ball size just before a near-side racket hit."""
         if (self.frame_count - getattr(self, '_near_side_large_hit_ref_frame', -1000000)) > window_frames:
@@ -5322,6 +5944,64 @@ class InteractiveBallAnalyzer:
                 return False
         if prev_dx * dx < -80.0 and abs(dx) > 55.0:
             return False
+        return True
+
+    def _mid_court_racket_rebound_candidate_ok(
+        self,
+        pos,
+        area,
+        frame_shape,
+        dx,
+        dy,
+        angle_jump,
+        motion_mean=None,
+        motion_max=None,
+    ):
+        """Accept the first mid-court ball rebound off the near player's racket."""
+        if self.ball_center is None or self.last_motion is None or self.ball_size is None:
+            return False
+        if getattr(self, '_awaiting_serve_bounce', False):
+            return False
+        if self.stuck_frame_count > 1:
+            return False
+
+        frame_height, frame_width = frame_shape[:2]
+        origin_x, origin_y = self.ball_center
+        prev_size = float(self.ball_size)
+        prev_dx = float(self.last_motion.get('dx', 0.0))
+        prev_dy = float(self.last_motion.get('dy', 0.0))
+        prev_speed = float(self.last_motion.get('distance', 0.0))
+        cx, cy = pos
+        turn_dist = math.hypot(dx, dy)
+        upward_progress = origin_y - cy
+
+        if not (45.0 <= prev_size <= 160.0):
+            return False
+        if not (int(frame_height * 0.30) <= origin_y <= int(frame_height * 0.48)):
+            return False
+        if not (int(frame_height * 0.27) <= cy <= int(frame_height * 0.43)):
+            return False
+        if prev_dy < max(38.0, frame_height * 0.017) or prev_speed < 42.0:
+            return False
+        if prev_dx * dx >= -40.0:
+            return False
+        if angle_jump < 105.0:
+            return False
+        if dy > -max(30.0, frame_height * 0.014):
+            return False
+        if upward_progress < max(30.0, frame_height * 0.014):
+            return False
+        if turn_dist > max(125.0, prev_speed * 1.45):
+            return False
+        if abs(dx) > max(100.0, frame_width * 0.030):
+            return False
+        if area < max(45.0, min(prev_size * 0.50, 85.0)):
+            return False
+        if area > max(180.0, prev_size * 2.10):
+            return False
+        if motion_mean is not None and motion_max is not None:
+            if motion_mean < 22.0 and motion_max < 85.0:
+                return False
         return True
 
     def _immediate_lower_racket_contact_turn_candidate_ok(
@@ -6079,13 +6759,41 @@ class InteractiveBallAnalyzer:
                 continue
             cx = int(M["m10"] / M["m00"]) + x1
             cy = int(M["m01"] / M["m00"]) + y1
+            predicted_path_hotspot_override = False
+            predicted_path_hotspot_debug = None
 
             if not allow_inactive:
                 ignored_entry = self._find_ignored_tracking_position((cx, cy), filter_key=filter_key)
                 if ignored_entry is not None:
-                    print(f"  DEBUG: retrack_using_alt skipping learned hotspot at ({cx},{cy}) "
-                          f"reason={ignored_entry.get('reason', 'n/a')}")
-                    continue
+                    predicted_path_hotspot_override, predicted_path_hotspot_debug = (
+                        self._predicted_path_hotspot_override(
+                            (cx, cy), area, prev_pos, predicted_point, frame_gray
+                        )
+                    )
+                    if (predicted_path_hotspot_override and
+                            not self._upper_baseline_retrack_hotspot_override_ok(
+                                (cx, cy),
+                                prev_pos,
+                                predicted_point,
+                                frame_gray.shape if frame_gray is not None else search_frame.shape,
+                            )):
+                        predicted_path_hotspot_override = False
+                        predicted_path_hotspot_debug = None
+                    if not predicted_path_hotspot_override:
+                        print(f"  DEBUG: retrack_using_alt skipping learned hotspot at ({cx},{cy}) "
+                              f"reason={ignored_entry.get('reason', 'n/a')}")
+                        continue
+                    print(
+                        f"  DEBUG: retrack_using_alt allowing learned hotspot at ({cx},{cy}) "
+                        f"on predicted path pred_dist="
+                        f"{predicted_path_hotspot_debug['predicted_distance']:.1f}/"
+                        f"{predicted_path_hotspot_debug['predicted_cap']:.1f} "
+                        f"prev_dist={predicted_path_hotspot_debug['prev_distance']:.1f}/"
+                        f"{predicted_path_hotspot_debug['prev_cap']:.1f} motion="
+                        f"{predicted_path_hotspot_debug['motion_mean']:.1f}/"
+                        f"{predicted_path_hotspot_debug['motion_max']:.1f} "
+                        f"reason={ignored_entry.get('reason', 'n/a')}"
+                    )
                 if getattr(self, '_contact_recovery_frames', 0) > 0 and prev_pos is not None:
                     contact_band = max(120, int((frame_gray.shape[0] if frame_gray is not None else search_frame.shape[0]) * 0.06))
                     if abs(cy - prev_pos[1]) > contact_band:
@@ -6135,32 +6843,42 @@ class InteractiveBallAnalyzer:
                 pdy = cy - predicted_point[1]
                 predicted_distance = math.hypot(pdx, pdy)
                 score += predicted_distance * 0.5
+            if predicted_path_hotspot_override and predicted_path_hotspot_debug is not None:
+                score -= min(
+                    70.0,
+                    max(0.0, predicted_path_hotspot_debug['predicted_cap'] -
+                        predicted_path_hotspot_debug['predicted_distance']) * 3.0 +
+                    max(0.0, predicted_path_hotspot_debug['prev_cap'] -
+                        predicted_path_hotspot_debug['prev_distance']) * 0.35,
+                )
 
             motion_metrics = self._candidate_motion_metrics(frame_gray, cx, cy)
             if not allow_inactive and motion_metrics is not None:
                 motion_mean = motion_metrics['mean']
                 motion_max = motion_metrics['max']
                 frame0_hotspot = self._find_frame0_background_hotspot((cx, cy))
-                if frame0_hotspot is not None and motion_mean < 8.0 and motion_max < 35.0:
+                if (frame0_hotspot is not None and motion_mean < 8.0 and motion_max < 35.0 and
+                        not predicted_path_hotspot_override):
                     print(f"  DEBUG: retrack_using_alt skipping frame0 hotspot at ({cx},{cy}) "
                           f"motion_mean={motion_mean:.1f} motion_max={motion_max:.1f}")
                     continue
                 static_hotspot = ((area <= 3 and motion_mean < 1.0 and motion_max < 5.0) or
                                   (cy < 100 and motion_mean < 2.5 and motion_max < 10.0))
-                if static_hotspot:
+                if static_hotspot and not predicted_path_hotspot_override:
                     print(f"  DEBUG: retrack_using_alt skipping static hotspot at ({cx},{cy}) "
                           f"motion_mean={motion_mean:.1f} motion_max={motion_max:.1f}")
                     continue
 
             if score < best_score:
                 best_score = score
-                best = (cx, cy, area, distance)
+                best = (cx, cy, area, distance, predicted_path_hotspot_override,
+                        predicted_path_hotspot_debug)
 
         if best is None:
             print(f"  DEBUG: Focus-loss retrack found no valid candidate with alt HSV")
             return None
 
-        cx, cy, area, distance = best
+        cx, cy, area, distance, predicted_path_hotspot_override, predicted_path_hotspot_debug = best
         hsv_values = cv2.cvtColor(search_frame, cv2.COLOR_BGR2HSV)
         local_x = max(0, min(search_frame.shape[1] - 1, cx - x1))
         local_y = max(0, min(search_frame.shape[0] - 1, cy - y1))
@@ -6185,6 +6903,8 @@ class InteractiveBallAnalyzer:
             'motion_mean': motion_mean,
             'motion_max': motion_max,
             'filter_key': filter_key,
+            'predicted_path_hotspot_override': predicted_path_hotspot_override,
+            'predicted_path_hotspot_debug': predicted_path_hotspot_debug,
         }
 
     def retrack_with_alt2_hsv(self, search_frame, x1, y1, prev_pos, predicted_point, prev_ball_size, allow_inactive,
@@ -6239,13 +6959,41 @@ class InteractiveBallAnalyzer:
                 continue
             cx = int(M["m10"] / M["m00"]) + x1
             cy = int(M["m01"] / M["m00"]) + y1
+            predicted_path_hotspot_override = False
+            predicted_path_hotspot_debug = None
 
             if not allow_inactive:
                 ignored_entry = self._find_ignored_tracking_position((cx, cy), filter_key=filter_key)
                 if ignored_entry is not None and not ignore_false_points:
-                    print(f"  DEBUG: retrack_using_alt2 skipping learned hotspot at ({cx},{cy}) "
-                          f"reason={ignored_entry.get('reason', 'n/a')}")
-                    continue
+                    predicted_path_hotspot_override, predicted_path_hotspot_debug = (
+                        self._predicted_path_hotspot_override(
+                            (cx, cy), area, prev_pos, predicted_point, frame_gray
+                        )
+                    )
+                    if (predicted_path_hotspot_override and
+                            not self._upper_baseline_retrack_hotspot_override_ok(
+                                (cx, cy),
+                                prev_pos,
+                                predicted_point,
+                                frame_gray.shape if frame_gray is not None else search_frame.shape,
+                            )):
+                        predicted_path_hotspot_override = False
+                        predicted_path_hotspot_debug = None
+                    if not predicted_path_hotspot_override:
+                        print(f"  DEBUG: retrack_using_alt2 skipping learned hotspot at ({cx},{cy}) "
+                              f"reason={ignored_entry.get('reason', 'n/a')}")
+                        continue
+                    print(
+                        f"  DEBUG: retrack_using_alt2 allowing learned hotspot at ({cx},{cy}) "
+                        f"on predicted path pred_dist="
+                        f"{predicted_path_hotspot_debug['predicted_distance']:.1f}/"
+                        f"{predicted_path_hotspot_debug['predicted_cap']:.1f} "
+                        f"prev_dist={predicted_path_hotspot_debug['prev_distance']:.1f}/"
+                        f"{predicted_path_hotspot_debug['prev_cap']:.1f} motion="
+                        f"{predicted_path_hotspot_debug['motion_mean']:.1f}/"
+                        f"{predicted_path_hotspot_debug['motion_max']:.1f} "
+                        f"reason={ignored_entry.get('reason', 'n/a')}"
+                    )
                 if getattr(self, '_contact_recovery_frames', 0) > 0 and prev_pos is not None:
                     contact_band = max(120, int((frame_gray.shape[0] if frame_gray is not None else search_frame.shape[0]) * 0.06))
                     if abs(cy - prev_pos[1]) > contact_band:
@@ -6296,15 +7044,23 @@ class InteractiveBallAnalyzer:
                 pdy = cy - predicted_point[1]
                 predicted_distance = math.hypot(pdx, pdy)
                 score += predicted_distance * 0.5
+            if predicted_path_hotspot_override and predicted_path_hotspot_debug is not None:
+                score -= min(
+                    70.0,
+                    max(0.0, predicted_path_hotspot_debug['predicted_cap'] -
+                        predicted_path_hotspot_debug['predicted_distance']) * 3.0 +
+                    max(0.0, predicted_path_hotspot_debug['prev_cap'] -
+                        predicted_path_hotspot_debug['prev_distance']) * 0.35,
+                )
 
             motion_metrics = self._candidate_motion_metrics(frame_gray, cx, cy)
             if not allow_inactive and motion_metrics is not None:
                 motion_mean = motion_metrics['mean']
                 motion_max = motion_metrics['max']
                 frame0_hotspot = self._find_frame0_background_hotspot((cx, cy))
-                trajectory_priority_candidate = False
+                trajectory_priority_candidate = predicted_path_hotspot_override
                 if (prefer_predicted_path and predicted_distance is not None and prev_pos is not None and
-                        self.last_motion is not None):
+                        self.last_motion is not None and not trajectory_priority_candidate):
                     predicted_cap = max(14.0, min(34.0, self.last_motion.get('distance', 0.0) * 3.0 + 8.0))
                     trajectory_priority_candidate = (
                         predicted_distance <= predicted_cap and
@@ -6326,13 +7082,14 @@ class InteractiveBallAnalyzer:
 
             if score < best_score:
                 best_score = score
-                best = (cx, cy, area, distance)
+                best = (cx, cy, area, distance, predicted_path_hotspot_override,
+                        predicted_path_hotspot_debug)
 
         if best is None:
             print(f"  DEBUG: {debug_label} retrack found no valid candidate")
             return None
 
-        cx, cy, area, distance = best
+        cx, cy, area, distance, predicted_path_hotspot_override, predicted_path_hotspot_debug = best
         hsv_values = cv2.cvtColor(search_frame, cv2.COLOR_BGR2HSV)
         local_x = max(0, min(search_frame.shape[1] - 1, cx - x1))
         local_y = max(0, min(search_frame.shape[0] - 1, cy - y1))
@@ -6357,6 +7114,8 @@ class InteractiveBallAnalyzer:
             'motion_mean': motion_mean,
             'motion_max': motion_max,
             'filter_key': filter_key,
+            'predicted_path_hotspot_override': predicted_path_hotspot_override,
+            'predicted_path_hotspot_debug': predicted_path_hotspot_debug,
         }
 
     def _retrack_local_alts20_hsv(self, frame, frame_gray, predicted_point=None, radius=80):
@@ -6976,7 +7735,7 @@ class InteractiveBallAnalyzer:
                 best_distance = distance
         return best
 
-    def show_alternative_debug(self, frame, point, lower, upper, title):
+    def show_alternative_debug(self, frame, point, lower, upper, title, sparse_mode=False):
         """Show debug windows for a specific HSV range around a point."""
         if point is None or lower is None or upper is None:
             print("No debug point or HSV range available.")
@@ -6995,14 +7754,24 @@ class InteractiveBallAnalyzer:
             region = cv2.resize(region, (300, 300))
         hsv_region = cv2.cvtColor(region, cv2.COLOR_BGR2HSV)
         kernel = np.ones((2, 2), np.uint8)
-        raw_mask = cv2.inRange(hsv_region, lower, upper)
-        raw_mask = cv2.morphologyEx(raw_mask, cv2.MORPH_OPEN, kernel)
-        raw_mask = cv2.morphologyEx(raw_mask, cv2.MORPH_CLOSE, kernel)
+        if sparse_mode:
+            raw_mask = self._build_sparse_low_s_mask(hsv_region, lower, upper)
+            if raw_mask is None:
+                print("No sparse debug mask available.")
+                return
+        else:
+            raw_mask = cv2.inRange(hsv_region, lower, upper)
+            raw_mask = cv2.morphologyEx(raw_mask, cv2.MORPH_OPEN, kernel)
+            raw_mask = cv2.morphologyEx(raw_mask, cv2.MORPH_CLOSE, kernel)
         analysis_mask = raw_mask.copy()
         hidden_false_points = self._erase_diagnostic_false_points(analysis_mask, x1, y1)
         contours, _ = cv2.findContours(raw_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
         local_display = region.copy()
+        cv2.circle(local_display, (150, 150), 9, (255, 255, 0), 1)
+        cv2.line(local_display, (140, 150), (160, 150), (255, 255, 0), 1)
+        cv2.line(local_display, (150, 140), (150, 160), (255, 255, 0), 1)
+        bulb_count = 0
         for contour in contours:
             area = cv2.contourArea(contour)
             if area < 1 or area > 150:
@@ -7015,16 +7784,26 @@ class InteractiveBallAnalyzer:
             cv2.circle(local_display, (cx, cy), 6, (0, 255, 0), 1)
             cv2.putText(local_display, f"{int(area)}", (cx+7, cy),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0, 255, 0), 1)
+            bulb_count += 1
 
         window_title = f"Detected Bulbs - {title}"
         cv2.namedWindow(window_title, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(window_title, 800, 600)
-        debug_text = f"H={lower[0]}-{upper[0]} S={lower[1]}-{upper[1]} V={lower[2]}-{upper[2]}"
+        debug_text = (
+            f"xy={point} | Bulbs={bulb_count} | "
+            f"H={lower[0]}-{upper[0]} S={lower[1]}-{upper[1]} V={lower[2]}-{upper[2]}"
+        )
+        if sparse_mode:
+            debug_text += " | sparse"
         if hidden_false_points:
             debug_text += f" | Hidden false: {hidden_false_points}"
         cv2.putText(local_display, debug_text,
                     (5, 12), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
-        cv2.imshow(window_title, local_display)
+        mask_bgr = cv2.cvtColor(raw_mask, cv2.COLOR_GRAY2BGR)
+        combined = np.hstack([local_display, mask_bgr])
+        cv2.putText(combined, debug_text,
+                    (5, 12), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
+        cv2.imshow(window_title, combined)
 
     def get_standard_hsv_for_position(self, y_position):
         """Get the primary HSV range for a position, ignoring alt/focus-loss modes."""
@@ -7085,7 +7864,33 @@ class InteractiveBallAnalyzer:
                                         f"Predicted {frame_index} (alts_20)")
         if self.alts9_11_hsv_lower is not None and self.alts9_11_hsv_upper is not None:
             self.show_alternative_debug(frame, point, self.alts9_11_hsv_lower, self.alts9_11_hsv_upper,
-                                        f"Predicted {frame_index} (alts9_11)")
+                                        f"Predicted {frame_index} (S9_11)", sparse_mode=True)
+
+    def open_tracking_hsv_debug_focus(self, frame, point, frame_index):
+        """Open the main comparison HSV windows around the current tracking/search point."""
+        if frame is None or point is None:
+            print("No current frame/ball position available for HSV debug.")
+            return
+
+        specs = []
+        if self.hsv_lower is not None and self.hsv_upper is not None:
+            specs.append(("active", self.hsv_lower, self.hsv_upper, False))
+        if self.alt2_hsv_lower is not None and self.alt2_hsv_upper is not None:
+            specs.append(("alt2", self.alt2_hsv_lower, self.alt2_hsv_upper, False))
+        if self.alts9_11_hsv_lower is not None and self.alts9_11_hsv_upper is not None:
+            specs.append(("S9_11", self.alts9_11_hsv_lower, self.alts9_11_hsv_upper, True))
+
+        if not specs:
+            print("No active/Alt2/S9_11 HSV ranges available for debug.")
+            return
+
+        print(f"[HSV_DEBUG] f{frame_index}: opening active/Alt2/S9_11 windows around {point}")
+        for label, lower, upper, sparse_mode in specs:
+            self.show_alternative_debug(
+                frame, point, lower, upper,
+                f"Frame {frame_index} ({label})",
+                sparse_mode=sparse_mode,
+            )
 
     def open_prev_frame_hsv_debug(self, frame, point, frame_index, hsv_slot):
         """Open HSV debug windows around the last ball in the previous frame."""
@@ -8285,7 +9090,7 @@ class InteractiveBallAnalyzer:
         _append("s_30", "S_30", self.s30_hsv_lower, self.s30_hsv_upper)
         _append("h_10", "H_10", self.h10_hsv_lower, self.h10_hsv_upper)
         _append("alts_20", "ALTS_20", self.alts20_hsv_lower, self.alts20_hsv_upper)
-        _append("alts9_11", "ALTS9_11", self.alts9_11_hsv_lower, self.alts9_11_hsv_upper)
+        _append("alts9_11", "S9_11", self.alts9_11_hsv_lower, self.alts9_11_hsv_upper)
         return specs
 
     def _apply_click_hsv_tuner_updates(self, specs):
@@ -8404,10 +9209,23 @@ class InteractiveBallAnalyzer:
         print(f"Showing search region around clicked position: {search_center}")
 
         specs = self._get_click_hsv_tuner_specs()
-        if len(specs) > 2:
-            skipped_labels = ", ".join(spec['label'] for spec in specs[1:-1])
-            specs = [specs[0], specs[-1]]
-            print(f"Opening first and last tuner only; skipped: {skipped_labels}")
+        if len(specs) > 3:
+            preferred_keys = ("regular_court", "alt2", "alts9_11")
+            selected = []
+            for key in preferred_keys:
+                for spec in specs:
+                    if spec['config_key'] == key:
+                        selected.append(spec)
+                        break
+            if len(selected) >= 2:
+                selected_keys = {spec['config_key'] for spec in selected}
+                skipped_labels = ", ".join(
+                    spec['label'] for spec in specs
+                    if spec['config_key'] not in selected_keys
+                )
+                specs = selected
+                if skipped_labels:
+                    print(f"Opening focused tuners; skipped: {skipped_labels}")
         if not specs:
             print("No HSV filters available for click tuning.")
             return
@@ -8471,7 +9289,12 @@ class InteractiveBallAnalyzer:
 
                 hsv_lower = np.array([h_min, s_min, v_min], dtype=np.uint8)
                 hsv_upper = np.array([h_max, s_max, v_max], dtype=np.uint8)
-                raw_mask = cv2.inRange(hsv_frame, hsv_lower, hsv_upper)
+                if spec['config_key'] == "alts9_11":
+                    raw_mask = self._build_sparse_low_s_mask(hsv_frame, hsv_lower, hsv_upper)
+                    if raw_mask is None:
+                        raw_mask = np.zeros(hsv_frame.shape[:2], dtype=np.uint8)
+                else:
+                    raw_mask = cv2.inRange(hsv_frame, hsv_lower, hsv_upper)
                 analysis_mask = raw_mask.copy()
                 hidden_false_points = self._erase_diagnostic_false_points(analysis_mask, x1, y1)
                 contours, _ = cv2.findContours(analysis_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -8498,6 +9321,8 @@ class InteractiveBallAnalyzer:
                     f"{spec['label']} | Bulbs: {bulb_count} | "
                     f"H={h_min}-{h_max} S={s_min}-{s_max} V={v_min}-{v_max}"
                 )
+                if spec['config_key'] == "alts9_11":
+                    info_text += " | sparse"
                 if hidden_false_points:
                     info_text += f" | Hidden false: {hidden_false_points}"
                 cv2.putText(combined, info_text, (10, 20),
@@ -8988,12 +9813,47 @@ class InteractiveBallAnalyzer:
                         self._near_side_large_hit_ref_frame = self.frame_count
                         search_radius = max(search_radius, self.max_ball_speed, 360)
                         print(f"  DEBUG: [NEAR-SIDE RACKET PREP] wide search radius={search_radius}px")
+                    near_side_soft_hit_prep = self._near_side_soft_racket_launch_prep_active(frame.shape)
+                    if near_side_soft_hit_prep:
+                        self._near_side_large_hit_ref_size = float(self.ball_size or 0.0)
+                        self._near_side_large_hit_ref_frame = self.frame_count
+                        search_radius = max(search_radius, self.max_ball_speed, 420)
+                        print(f"  DEBUG: [NEAR-SIDE SOFT RACKET PREP] wide search radius={search_radius}px")
                     lower_contact_launch_context = self._get_lower_contact_launch_context(frame.shape)
                     if lower_contact_launch_context is not None:
                         search_radius = max(search_radius, self.max_ball_speed)
                         print(f"  DEBUG: [LOWER-HIT PREP] wide search radius={search_radius}px "
                               f"expected={lower_contact_launch_context['expected']}")
                     else:
+                        fast_near_net_ground_bounce = False
+                        if (
+                                self.ball_center is not None and
+                                self.last_motion is not None and
+                                self.prev_motion is not None and
+                                self.ball_size is not None and
+                                hasattr(self, 'net_area_y_max')):
+                            last_dx = float(self.last_motion.get('dx', 0.0) or 0.0)
+                            last_dy = float(self.last_motion.get('dy', 0.0) or 0.0)
+                            last_dist = float(self.last_motion.get('distance', 0.0) or 0.0)
+                            prev_dy_for_bounce = float(self.prev_motion.get('dy', 0.0) or 0.0)
+                            prev_dist_for_bounce = float(self.prev_motion.get('distance', 0.0) or 0.0)
+                            origin_y = int(self.ball_center[1])
+                            frames_since_contact = (
+                                self.frame_count - int(getattr(self, '_last_racket_contact_frame', -1000000))
+                            )
+                            fast_near_net_ground_bounce = (
+                                getattr(self, 'ground_bounce_count', 0) == 0 and
+                                not getattr(self, '_awaiting_serve_bounce', False) and
+                                self.net_area_y_max + 12 <= origin_y <=
+                                self.net_area_y_max + max(95, int(frame_height * 0.05)) and
+                                12.0 <= float(self.ball_size) <= 125.0 and
+                                last_dy >= max(30.0, frame_height * 0.014) and
+                                prev_dy_for_bounce >= max(24.0, frame_height * 0.011) and
+                                last_dist >= 28.0 and
+                                prev_dist_for_bounce >= 24.0 and
+                                abs(last_dx) <= max(28.0, abs(last_dy) * 0.70) and
+                                frames_since_contact >= 8
+                            )
                         allow_near_net_ground_bounce = (
                             self._late_contact_prior_bounce_active() and
                             self.last_motion is not None and
@@ -9002,7 +9862,7 @@ class InteractiveBallAnalyzer:
                             float(self.last_motion.get('dy', 0.0) or 0.0) >=
                             max(12.0, frame_height * 0.006) and
                             (self.frame_count - int(getattr(self, '_last_racket_contact_frame', -1000000))) >= 50
-                        )
+                        ) or fast_near_net_ground_bounce
                         ground_bounce_context = self._get_ground_bounce_context(
                             frame.shape,
                             allow_near_net=allow_near_net_ground_bounce,
@@ -9941,6 +10801,7 @@ class InteractiveBallAnalyzer:
                 if ignored_entry is not None:
                     top_return_motion_override = False
                     upper_post_miss_rebound_override = False
+                    upper_racket_below_escape_override = False
                     predicted_path_hotspot_override, predicted_path_hotspot_debug = (
                         self._predicted_path_hotspot_override(
                             (cx, cy), area, self.ball_center, predicted_point, frame_gray
@@ -9983,8 +10844,23 @@ class InteractiveBallAnalyzer:
                                 )
                                 if upper_post_miss_rebound_override:
                                     pre_ignore_motion_metrics = rebound_motion
+                    if frame_gray is not None:
+                        escape_motion = self._candidate_motion_metrics(frame_gray, cx, cy)
+                        if escape_motion is not None:
+                            upper_racket_below_escape_override = (
+                                self._upper_racket_below_escape_candidate_ok(
+                                    (cx, cy),
+                                    area,
+                                    frame.shape,
+                                    motion_mean=escape_motion['mean'],
+                                    motion_max=escape_motion['max'],
+                                )
+                            )
+                            if upper_racket_below_escape_override:
+                                pre_ignore_motion_metrics = escape_motion
                     if (not top_return_motion_override and not predicted_path_hotspot_override and
-                            not upper_post_miss_rebound_override):
+                            not upper_post_miss_rebound_override and
+                            not upper_racket_below_escape_override):
                         print(f"  DEBUG: Contour {i} REJECTED - learned hotspot at ({cx},{cy}) "
                               f"reason={ignored_entry.get('reason', 'n/a')}")
                         continue
@@ -9997,6 +10873,13 @@ class InteractiveBallAnalyzer:
                     elif upper_post_miss_rebound_override:
                         print(
                             f"  DEBUG: Contour {i} ALLOWED - upper post-miss rebound overrides learned hotspot "
+                            f"at ({cx},{cy}) motion={pre_ignore_motion_metrics['mean']:.1f}/"
+                            f"{pre_ignore_motion_metrics['max']:.1f} "
+                            f"reason={ignored_entry.get('reason', 'n/a')}"
+                        )
+                    elif upper_racket_below_escape_override:
+                        print(
+                            f"  DEBUG: Contour {i} ALLOWED - upper racket-below escape overrides learned hotspot "
                             f"at ({cx},{cy}) motion={pre_ignore_motion_metrics['mean']:.1f}/"
                             f"{pre_ignore_motion_metrics['max']:.1f} "
                             f"reason={ignored_entry.get('reason', 'n/a')}"
@@ -10685,6 +11568,13 @@ class InteractiveBallAnalyzer:
                 best_contour = post_bounce_launch_meta['contour']
                 best_source = post_bounce_launch_meta['source']
                 best_score = post_bounce_launch_meta['score']
+            upper_racket_below_escape_meta = self._prefer_upper_racket_below_escape_candidate(
+                candidate_meta, best_contour, frame.shape
+            )
+            if upper_racket_below_escape_meta is not None:
+                best_contour = upper_racket_below_escape_meta['contour']
+                best_source = upper_racket_below_escape_meta['source']
+                best_score = upper_racket_below_escape_meta['score']
             upper_far_escape_meta = self._prefer_upper_far_player_escape_candidate(
                 candidate_meta, best_contour, frame.shape
             )
@@ -10827,6 +11717,14 @@ class InteractiveBallAnalyzer:
                 best_source = large_descent_meta['source']
                 best_score = large_descent_meta['score']
 
+            near_net_rebound_meta = self._prefer_near_net_rebound_candidate(
+                candidate_meta, best_contour, frame.shape
+            )
+            if near_net_rebound_meta is not None:
+                best_contour = near_net_rebound_meta['contour']
+                best_source = near_net_rebound_meta['source']
+                best_score = near_net_rebound_meta['score']
+
             large_lower_bounce_meta = self._prefer_large_lower_bounce_launch_candidate(
                 candidate_meta, best_contour, frame.shape
             )
@@ -10835,6 +11733,15 @@ class InteractiveBallAnalyzer:
                 best_source = large_lower_bounce_meta['source']
                 best_score = large_lower_bounce_meta['score']
                 large_lower_bounce_launch_override = True
+
+            near_side_soft_launch_meta = self._prefer_near_side_soft_racket_launch_candidate(
+                candidate_meta, best_contour, frame.shape
+            )
+            if near_side_soft_launch_meta is not None:
+                best_contour = near_side_soft_launch_meta['contour']
+                best_source = near_side_soft_launch_meta['source']
+                best_score = near_side_soft_launch_meta['score']
+                large_lower_launch_override = True
 
         # Early-serve bias: when starting and no previous ball, favor the highest (smallest y) valid contour
         if self.ball_center is None and self.frame_count <= self.start_frame + 10 and candidates:
@@ -11005,6 +11912,16 @@ class InteractiveBallAnalyzer:
                     motion_mean < 2.5 and
                     motion_max < 12.0
                 )
+                near_side_static_tiny_jump = (
+                    selected_area <= 3.0 and
+                    actual_distance >= max(110.0, last_motion_distance * 6.0, frame_width * 0.028) and
+                    motion_mean < 2.5 and
+                    motion_max < 12.0 and
+                    last_motion_distance <= 28.0 and
+                    hasattr(self, 'net_area_y_max') and
+                    y_prev >= self.net_area_y_max + 18 and
+                    cy >= self.net_area_y_max + 18
+                )
                 selected_top_return_continuation = (
                     selected_predicted_path_override and
                     (
@@ -11081,6 +11998,7 @@ class InteractiveBallAnalyzer:
                     cy >= (y_prev - 12)
                 )
                 if (static_hotspot or recent_return_static_hold or recent_return_static_jump or
+                        near_side_static_tiny_jump or
                         suspicious_upper_static_jump or
                         outside_contact_bounds or frame0_background):
                     reason = f"static patch mean={motion_mean:.1f} max={motion_max:.1f}"
@@ -11097,6 +12015,11 @@ class InteractiveBallAnalyzer:
                     elif recent_return_static_jump:
                         reason = (
                             f"recent-return static jump dist={actual_distance:.1f} "
+                            f"mean={motion_mean:.1f} max={motion_max:.1f}"
+                        )
+                    elif near_side_static_tiny_jump:
+                        reason = (
+                            f"near-side tiny static jump dist={actual_distance:.1f} "
                             f"mean={motion_mean:.1f} max={motion_max:.1f}"
                         )
                     elif suspicious_upper_static_jump:
@@ -12056,6 +12979,20 @@ class InteractiveBallAnalyzer:
                     motion_mean=motion_mean,
                     motion_max=motion_max,
                 )
+                mid_court_racket_rebound_candidate = self._mid_court_racket_rebound_candidate_ok(
+                    (cx, cy),
+                    bulb_size,
+                    frame.shape,
+                    dx,
+                    dy,
+                    angle_jump,
+                    motion_mean=motion_mean,
+                    motion_max=motion_max,
+                )
+                immediate_lower_racket_contact_turn_candidate = (
+                    immediate_lower_racket_contact_turn_candidate or
+                    mid_court_racket_rebound_candidate
+                )
                 lower_racket_contact_turn_candidate = (
                     lower_racket_contact_turn_candidate or
                     immediate_lower_racket_contact_turn_candidate
@@ -12071,9 +13008,16 @@ class InteractiveBallAnalyzer:
                     motion_mean=motion_mean,
                     motion_max=motion_max,
                 )
+                near_side_soft_racket_launch_candidate = self._near_side_soft_racket_launch_candidate_ok(
+                    (cx, cy),
+                    bulb_size,
+                    frame.shape,
+                    motion_mean=motion_mean,
+                    motion_max=motion_max,
+                )
                 large_lower_launch_candidate = self._large_lower_launch_candidate_ok(
                     (cx, cy), bulb_size, frame.shape
-                ) or large_lower_launch_override
+                ) or large_lower_launch_override or near_side_soft_racket_launch_candidate
                 upper_slow_arc_candidate = self._upper_slow_arc_candidate_ok(
                     (cx, cy), bulb_size, velocity, predicted_point, frame.shape, frame_gray=frame_gray
                 )
@@ -12315,6 +13259,11 @@ class InteractiveBallAnalyzer:
                         self.ground_bounce_count = 0
                         self.last_ground_bounce_frame = -1000000
                         contact_origin = self.ball_center
+                        contact_label = (
+                            'mid-court racket rebound'
+                            if mid_court_racket_rebound_candidate
+                            else 'racket contact'
+                        )
                         rally_ref_cap = 340.0 if near_camera_large_turn_override else 140.0
                         contact_grace_frames = (
                             5 if immediate_lower_racket_contact_turn_candidate else 3
@@ -12338,9 +13287,9 @@ class InteractiveBallAnalyzer:
                         impact_event = {
                             'kind': 'racket_contact',
                             'point': contact_origin,
-                            'label': 'racket contact',
+                            'label': contact_label,
                         }
-                        print(f"Frame {self.frame_count}: Allowing lower-racket contact turn")
+                        print(f"Frame {self.frame_count}: Allowing {contact_label}")
                         self._record_racket_contact(impact_event['point'], label=impact_event['label'])
                         self._add_impact_marker(
                             impact_event['point'],
@@ -12421,6 +13370,10 @@ class InteractiveBallAnalyzer:
                         self.ground_bounce_count += 1
                         self.last_ground_bounce_frame = self.frame_count
                         self._last_serve_bounce_frame = self.frame_count
+                        self._last_serve_bounce_point = bounce_point
+                        self._last_serve_bounce_net_contact_like = bool(
+                            serve_bounce_in_event.get('net_contact_like')
+                        )
                         print(f"Frame {self.frame_count}: Ground bounce #{self.ground_bounce_count} detected (serve box jump)")
                         self._handle_ground_bounce_event(
                             bounce_point,
@@ -12487,6 +13440,8 @@ class InteractiveBallAnalyzer:
                     elif change_detected and large_lower_launch_candidate:
                         launch_origin = self.ball_center
                         self._rally_contact_grace_frames = max(getattr(self, '_rally_contact_grace_frames', 0), 3)
+                        self._trusted_rally_launch_frame = self.frame_count
+                        self._trusted_rally_launch_pos = (cx, cy)
                         rally_ref_cap = 340.0 if near_camera_large_turn_override else 140.0
                         if near_camera_large_turn_override:
                             self._rally_contact_large_ref_frames = max(
@@ -13198,7 +14153,7 @@ class InteractiveBallAnalyzer:
         
         print("-" * 80)
     
-    def detect_serve_position(self, frame):
+    def detect_serve_position(self, frame, lock_history=None, lock_miss_frames=0):
         """Detect potential serve positions by looking for balls in the serve area."""
         # Check if serve area is configured
         if not hasattr(self, 'serve_area_x_min'):
@@ -13227,6 +14182,28 @@ class InteractiveBallAnalyzer:
         
         if serve_search_x_max <= serve_search_x_min or serve_search_y_max <= serve_search_y_min:
             return None
+
+        lock_points = []
+        if lock_history:
+            for point in lock_history:
+                if point is None:
+                    continue
+                lock_points.append((int(point[0]), int(point[1])))
+        lock_active = bool(lock_points)
+        lock_last = lock_points[-1] if lock_active else None
+        lock_predicted = lock_last
+        lock_radius = None
+        if lock_active:
+            if len(lock_points) >= 2:
+                prev = lock_points[-2]
+                dx = lock_last[0] - prev[0]
+                dy = lock_last[1] - prev[1]
+                step_scale = max(1, min(4, int(lock_miss_frames) + 1))
+                lock_predicted = (
+                    int(lock_last[0] + dx * step_scale),
+                    int(lock_last[1] + dy * step_scale),
+                )
+            lock_radius = max(55.0, min(155.0, 64.0 + float(lock_miss_frames) * 18.0))
         
         # Apply HSV filter to find potential balls
         gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -13290,10 +14267,6 @@ class InteractiveBallAnalyzer:
                     
                     # Only accept balls in the calibrated upper portion of the serve area.
                     if cy < serve_search_y_max:
-                        x_penalty = 0.0
-                        if server_center_x is not None:
-                            x_penalty = abs(cx - server_center_x) * 0.35
-                        score = x_penalty - (area * 0.25)
                         motion_delta = None
                         if prev_serve_gray is not None and prev_serve_gray.shape == gray_frame.shape:
                             px1 = max(0, cx - 2)
@@ -13304,10 +14277,37 @@ class InteractiveBallAnalyzer:
                             prev_patch = prev_serve_gray[py1:py2, px1:px2]
                             if curr_patch.size and prev_patch.size:
                                 motion_delta = float(np.mean(cv2.absdiff(curr_patch, prev_patch)))
-                                if motion_delta < 12:
-                                    score += 120
-                                else:
-                                    score -= min(motion_delta, 40.0)
+                        if lock_active:
+                            pred_dist = math.hypot(cx - lock_predicted[0], cy - lock_predicted[1])
+                            last_dist = math.hypot(cx - lock_last[0], cy - lock_last[1])
+                            if pred_dist > lock_radius and last_dist > max(lock_radius, 72.0):
+                                if 12740 <= self.frame_count <= 12790:
+                                    print(
+                                        f"[SERVE_LOCK_REJECT] f{self.frame_count}: ({cx},{cy}) "
+                                        f"pred_dist={pred_dist:.1f} last_dist={last_dist:.1f} "
+                                        f"radius={lock_radius:.1f}"
+                                    )
+                                continue
+                            if motion_delta is not None and motion_delta < 12.0:
+                                if 12740 <= self.frame_count <= 12790:
+                                    print(
+                                        f"[SERVE_LOCK_REJECT] f{self.frame_count}: ({cx},{cy}) "
+                                        f"static motion_delta={motion_delta:.1f}"
+                                    )
+                                continue
+                        x_penalty = 0.0
+                        if server_center_x is not None:
+                            x_penalty = abs(cx - server_center_x) * 0.35
+                        score = x_penalty - (area * 0.25)
+                        if lock_active:
+                            pred_dist = math.hypot(cx - lock_predicted[0], cy - lock_predicted[1])
+                            last_dist = math.hypot(cx - lock_last[0], cy - lock_last[1])
+                            score += pred_dist * 1.15 + last_dist * 0.25
+                        if motion_delta is not None:
+                            if motion_delta < 12:
+                                score += 120
+                            else:
+                                score -= min(motion_delta, 40.0)
                         if frame0_hotspot is not None and (motion_delta is None or motion_delta < 18.0):
                             if 1170 <= self.frame_count <= 1200:
                                 print(f"[CONTOUR_REJECT] f{self.frame_count}: ({cx},{cy}) frame0_hotspot={frame0_hotspot} motion_delta={motion_delta} (rejected by hotspot filter)")
@@ -13602,7 +14602,8 @@ class InteractiveBallAnalyzer:
         """Detect if a point has ended based on ball position and behavior."""
         height, width = frame.shape[:2]
         x, y = ball_position
-        recent_ground_bounce = (self.frame_count - getattr(self, 'last_ground_bounce_frame', -1000000)) <= 2
+        frames_since_ground_bounce = self.frame_count - getattr(self, 'last_ground_bounce_frame', -1000000)
+        recent_ground_bounce = frames_since_ground_bounce <= 2
         
         # Early serve grace: do not end point in first frames after start_frame
         if self.frame_count <= (self.start_frame + 15):
@@ -13737,7 +14738,8 @@ class InteractiveBallAnalyzer:
         """Detect if a point has ended based on ball position and behavior."""
         height, width = frame.shape[:2]
         x, y = ball_position
-        recent_ground_bounce = (self.frame_count - getattr(self, 'last_ground_bounce_frame', -1000000)) <= 2
+        frames_since_ground_bounce = self.frame_count - getattr(self, 'last_ground_bounce_frame', -1000000)
+        recent_ground_bounce = frames_since_ground_bounce <= 2
 
         if self.frame_count <= (self.start_frame + 15):
             return False, "Early-serve grace"
@@ -13775,8 +14777,59 @@ class InteractiveBallAnalyzer:
         if same_side_bounce:
             return True, same_side_reason
 
+        recent_serve_bounce_in = (
+            getattr(self, '_last_serve_bounce_frame', -1000000) > -1000000 and
+            0 <= self.frame_count - getattr(self, '_last_serve_bounce_frame', -1000000) <= 10 and
+            not getattr(self, '_awaiting_serve_bounce', False)
+        )
         net_geometry = self._net_contact_geometry(ball_position)
-        if net_geometry is not None and not recent_ground_bounce:
+        far_side_serve_attempt = getattr(self, '_active_serve_area_end', None) == "far"
+        if (far_side_serve_attempt and recent_serve_bounce_in and
+                getattr(self, '_last_serve_bounce_net_contact_like', False)):
+            net_zone_active = (
+                net_geometry is not None and
+                (net_geometry['inside'] or net_geometry['near_polygon'] or net_geometry['near_top_tape'])
+            )
+            current_speed = float(self.last_motion.get('distance', 0.0)) if self.last_motion else 0.0
+            if net_zone_active and current_speed <= 14.0:
+                return True, "Serve let"
+
+        if net_geometry is not None and recent_ground_bounce and not recent_serve_bounce_in:
+            bounce_origin = getattr(self, '_ground_bounce_origin', None)
+            if bounce_origin is not None and 1 <= frames_since_ground_bounce <= 2:
+                origin_x, origin_y = bounce_origin
+                current_dy = float(self.last_motion.get('dy', 0.0) or 0.0) if self.last_motion else 0.0
+                current_speed = float(self.last_motion.get('distance', 0.0) or 0.0) if self.last_motion else 0.0
+                net_y_max = float(getattr(self, 'net_area_y_max', 0.0))
+                low_net_y_min = float(getattr(self, 'low_net_y_min', getattr(self, 'net_area_y_min', 0)))
+                low_net_y_max = float(getattr(self, 'low_net_y_max', getattr(self, 'net_area_y_max', 0)))
+                origin_below_net = (
+                    net_y_max + 10.0 <= float(origin_y) <= net_y_max + max(65.0, height * 0.030)
+                )
+                climbing_into_low_net = (
+                    current_dy <= -12.0 and
+                    current_speed <= max(70.0, height * 0.035) and
+                    float(y) <= float(origin_y) - 45.0 and
+                    low_net_y_min - 8.0 <= float(y) <= low_net_y_max + 8.0
+                )
+                near_net_surface = (
+                    net_geometry['inside'] or
+                    net_geometry['near_top_tape'] or
+                    net_geometry['signed_dist'] >= -42.0
+                )
+                close_to_bounce_lane = (
+                    abs(float(x) - float(origin_x)) <= 90.0 and
+                    math.hypot(float(x) - float(origin_x), float(y) - float(origin_y)) <= 115.0
+                )
+                if origin_below_net and climbing_into_low_net and near_net_surface and close_to_bounce_lane:
+                    print(
+                        f"Frame {self.frame_count}: [POST-BOUNCE NET] "
+                        f"origin={bounce_origin} pos={ball_position} "
+                        f"signed_dist={net_geometry['signed_dist']:.1f}"
+                    )
+                    return True, "Ball hit the net"
+
+        if net_geometry is not None and not recent_ground_bounce and not recent_serve_bounce_in:
             net_zone_active = net_geometry['near_polygon'] or net_geometry['near_top_tape']
             core_net_zone = net_geometry['inside']
             if net_zone_active:
@@ -14601,6 +15654,8 @@ class InteractiveBallAnalyzer:
                 net_geometry is not None and
                 (net_geometry['inside'] or net_geometry['near_top_tape'])
             )
+        else:
+            net_geometry = self._net_contact_geometry(bounce_point)
         if service_ok is not True and not near_target_net_band:
             return None
 
@@ -14609,6 +15664,10 @@ class InteractiveBallAnalyzer:
             'target_side': target_side,
             'geometry': geometry,
             'near_target_net_band': near_target_net_band,
+            'net_contact_like': (
+                net_geometry is not None and
+                (net_geometry['inside'] or net_geometry['near_polygon'] or net_geometry['near_top_tape'])
+            ),
             'soft_vertical_reversal': soft_vertical_reversal,
             'sharp_turn': sharp_turn,
         }
@@ -14926,8 +15985,9 @@ class InteractiveBallAnalyzer:
         print("5. SPACE pauses/resumes")
         print("6. D advances one frame")
         print("7. Number keys 1-9 advance 10-90 tracked frames")
-        print("8. Mouse click prints HSV debug at that point")
-        print("9. Q or ESC quits")
+        print("8. Mouse click opens HSV tuner at that point")
+        print("9. H opens active/Alt2/S9 debug windows around the tracked point")
+        print("10. Q or ESC quits")
         print("=" * 50)
         if self.start_frame > 0:
             print(f"Starting at frame {self.start_frame}")
@@ -14986,6 +16046,8 @@ class InteractiveBallAnalyzer:
             self._rally_contact_expected = None
             self._rally_contact_progress = 0.0
             self._rally_contact_high_launch_until_frame = -1
+            self._trusted_rally_launch_frame = -1000000
+            self._trusted_rally_launch_pos = None
             self._last_racket_contact_frame = -1000000
             self._last_racket_contact_point = None
             self._last_racket_contact_player = None
@@ -14998,6 +16060,8 @@ class InteractiveBallAnalyzer:
             self.ground_bounce_count = 0
             self.last_ground_bounce_frame = -1000000
             self._last_serve_bounce_frame = -1000000
+            self._last_serve_bounce_point = None
+            self._last_serve_bounce_net_contact_like = False
             self._near_side_large_hit_ref_size = 0.0
             self._near_side_large_hit_ref_frame = -1000000
             self._contact_recovery_frames = 0
@@ -15046,6 +16110,8 @@ class InteractiveBallAnalyzer:
         last_serve_candidate = None
         serve_position_history = []
         serve_candidate_details_history = []
+        serve_candidate_lock_active = False
+        serve_candidate_lock_miss_frames = 0
         scan_position_history = []  # motion history for SCANNING_FOR_SERVE rightward check
         play_mode = auto_play  # start playing immediately if --auto-play flag is set
         last_frame_for_debug = None
@@ -15083,10 +16149,13 @@ class InteractiveBallAnalyzer:
         def clear_waiting_serve_history():
             nonlocal serve_tracking_frames, last_serve_candidate
             nonlocal serve_position_history, serve_candidate_details_history
+            nonlocal serve_candidate_lock_active, serve_candidate_lock_miss_frames
             serve_tracking_frames = 0
             last_serve_candidate = None
             serve_position_history = []
             serve_candidate_details_history = []
+            serve_candidate_lock_active = False
+            serve_candidate_lock_miss_frames = 0
 
         def low_to_up_serve_toss_context(history, details=None, require_bottom_entry=False):
             if len(history) < 4:
@@ -15260,6 +16329,46 @@ class InteractiveBallAnalyzer:
             })
             return toss_context
 
+        def maybe_lock_serve_candidate(candidate, detail):
+            nonlocal serve_candidate_lock_active, serve_candidate_lock_miss_frames
+            nonlocal serve_tracking_frames, last_serve_candidate
+            nonlocal serve_position_history, serve_candidate_details_history
+            if serve_candidate_lock_active or candidate is None:
+                return
+            if not far_top_serve_active():
+                return
+            serve_height = max(1, self.serve_area_y_max - self.serve_area_y_min)
+            lower_strip_y = self.serve_area_y_min + int(serve_height * 0.50)
+            motion_delta = None
+            if isinstance(detail, dict):
+                motion_delta = detail.get('motion_delta')
+            moving_candidate = motion_delta is not None and float(motion_delta) >= 18.0
+            if moving_candidate and candidate[1] >= lower_strip_y:
+                serve_candidate_lock_active = True
+                serve_candidate_lock_miss_frames = 0
+                filtered_positions = []
+                filtered_details = []
+                for idx, pos in enumerate(serve_position_history):
+                    keep = (
+                        pos == candidate or
+                        pos[1] >= lower_strip_y or
+                        math.hypot(pos[0] - candidate[0], pos[1] - candidate[1]) <= 90.0
+                    )
+                    if not keep:
+                        continue
+                    filtered_positions.append(pos)
+                    if idx < len(serve_candidate_details_history):
+                        filtered_details.append(serve_candidate_details_history[idx])
+                if filtered_positions:
+                    serve_position_history = filtered_positions[-20:]
+                    serve_candidate_details_history = filtered_details[-20:]
+                    serve_tracking_frames = len(serve_position_history)
+                    last_serve_candidate = serve_position_history[-1]
+                print(
+                    f"[SERVE_LOCK] f{self.frame_count}: locked far serve candidate {candidate} "
+                    f"motion_delta={float(motion_delta):.1f} history={serve_tracking_frames}"
+                )
+
         def log_tracking_start_position():
             if self.ball_center is None:
                 return
@@ -15338,8 +16447,29 @@ class InteractiveBallAnalyzer:
         
         print(f"\nHSV Filter: H={self.hsv_lower[0]}-{self.hsv_upper[0]}, S={self.hsv_lower[1]}-{self.hsv_upper[1]}, V={self.hsv_lower[2]}-{self.hsv_upper[2]}")
         print(f"Game State: {game_state}")
-        print("Controls: SPACE play/pause, D single step, 1-9 jump 10-90 tracked frames, mouse click HSV debug")
+        print("Controls: SPACE play/pause, D single step, 1-9 jump 10-90 tracked frames, H HSV debug, mouse click HSV tuner")
         
+        def try_recover_video_read(failed_frame):
+            probe_offsets = [1, 2, 3, 5, 10, 20, 40, 80, 160, 320, 640]
+            for offset in probe_offsets:
+                target_frame = int(failed_frame) + offset
+                if max_frames > 0 and (target_frame - self.start_frame) >= max_frames:
+                    return None
+                for reopen in (False, True):
+                    if reopen:
+                        self.cap.release()
+                        self.cap = cv2.VideoCapture(self.video_path)
+                    self.cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
+                    recovered, recovered_frame = self.cap.read()
+                    if recovered:
+                        print(
+                            f"[READ_RECOVERED] failed_at=f{failed_frame} "
+                            f"continuing_at=f{target_frame} skipped={target_frame - failed_frame} "
+                            f"reopen={reopen}"
+                        )
+                        return target_frame, recovered_frame
+            return None
+
         _consecutive_read_failures = 0
         jump_frames_remaining = 0
         while True:
@@ -15352,9 +16482,29 @@ class InteractiveBallAnalyzer:
                 if _consecutive_read_failures <= 10:
                     print(f"[SKIP_BAD_FRAME] f{self.frame_count}: read failed, skipping (attempt {_consecutive_read_failures}/10)")
                     self.frame_count += 1
+                    self.cap.set(cv2.CAP_PROP_POS_FRAMES, self.frame_count)
                     continue
-                print(f"[VIDEO_END] Stopped after {_consecutive_read_failures} consecutive read failures at f{self.frame_count}")
-                break
+                recovered_read = try_recover_video_read(self.frame_count)
+                if recovered_read is not None:
+                    self.frame_count, frame = recovered_read
+                    _consecutive_read_failures = 0
+                    ret = True
+                else:
+                    print(f"[VIDEO_END] Stopped after {_consecutive_read_failures} consecutive read failures at f{self.frame_count}")
+                    if game_state == "TRACKING_POINT" and self.tracking and self.ball_center is not None:
+                        last_known = self.ball_center
+                        vel = self.last_motion['distance'] if self.last_motion else 0.0
+                        vel_hist_tail = [round(v, 1) for v in getattr(self, 'ball_velocity_history', [])[-5:]]
+                        print(
+                            f"[POINT_END] f{self.frame_count}: reason=VIDEO_READ_FAILURE "
+                            f"pos={last_known} vel={vel:.1f}px vel_hist={vel_hist_tail}"
+                        )
+                        self._record_point_result(
+                            "VIDEO_READ_FAILURE",
+                            end_position=last_known,
+                            frame=last_frame_for_debug,
+                        )
+                    break
             _consecutive_read_failures = 0  # reset on successful read
             if max_frames > 0 and (self.frame_count - self.start_frame) >= max_frames:
                 print(f"[MAX_FRAMES] Reached {max_frames} frames limit, stopping.")
@@ -15374,10 +16524,15 @@ class InteractiveBallAnalyzer:
                 self.using_alt6_hsv = False
                 far_top_serve_scan = far_top_serve_active()
                 if far_top_serve_scan:
-                    candidate = self.detect_serve_position(frame)
+                    candidate = self.detect_serve_position(
+                        frame,
+                        lock_history=serve_position_history if serve_candidate_lock_active else None,
+                        lock_miss_frames=serve_candidate_lock_miss_frames,
+                    )
                 else:
                     candidate = self.track_ball_in_frame(frame, allow_inactive=True)
                 if candidate is not None:
+                    serve_candidate_lock_miss_frames = 0
                     if hasattr(self, 'serve_area_x_min'):
                         if not (self.serve_area_x_min <= candidate[0] <= self.serve_area_x_max and
                                 self.serve_area_y_min <= candidate[1] <= self.serve_area_y_max):
@@ -15393,6 +16548,7 @@ class InteractiveBallAnalyzer:
                         candidate_detail = dict(candidate_detail)
                         candidate_detail.setdefault('frame', int(self.frame_count))
                         serve_candidate_details_history.append(dict(candidate_detail))
+                        maybe_lock_serve_candidate(candidate, candidate_detail)
                         if len(serve_position_history) > 20:
                             serve_position_history = serve_position_history[-20:]
                         if len(serve_candidate_details_history) > 20:
@@ -15447,6 +16603,21 @@ class InteractiveBallAnalyzer:
                             log_tracking_start_position()
                             clear_waiting_serve_history()
                 else:
+                    if serve_candidate_lock_active:
+                        serve_candidate_lock_miss_frames += 1
+                        miss_limit = 8 if far_top_serve_scan else 2
+                        if serve_candidate_lock_miss_frames == 1:
+                            print(
+                                f"[SERVE_LOCK_MISS] f{self.frame_count}: preserving locked serve path "
+                                f"last={last_serve_candidate}"
+                            )
+                        elif serve_candidate_lock_miss_frames > miss_limit:
+                            print(
+                                f"[SERVE_LOCK_LOST] f{self.frame_count}: lost locked serve path after "
+                                f"{serve_candidate_lock_miss_frames} misses"
+                            )
+                            clear_waiting_serve_history()
+                            continue
                     early_toss_context = low_to_up_serve_toss_context(
                         serve_position_history,
                         details=serve_candidate_details_history,
@@ -15722,12 +16893,16 @@ class InteractiveBallAnalyzer:
                             getattr(self, '_last_motion_reacq_frame', -1000000) == self.frame_count and
                             getattr(self, '_last_motion_reacq_pos', None) == tracked_position
                         )
+                        trusted_rally_launch = (
+                            getattr(self, '_trusted_rally_launch_frame', -1000000) == self.frame_count and
+                            getattr(self, '_trusted_rally_launch_pos', None) == tracked_position
+                        )
                         # Allow a larger jump when re-acquiring after being stuck for 5+ frames:
                         # a racket hit can send the ball 800+ px in one frame, so we use 1500px
                         # to let motion-based re-acquisition recover across the full court.
                         max_jump = 1500 if (
                             prev_stuck >= 5 or prev_top_return_wait or prev_back_return_wait or
-                            motion_reacq_this_frame
+                            motion_reacq_this_frame or trusted_rally_launch
                         ) else 400
                         if jump > max_jump:
                             print(f"[JUMP_REJECTED] f{self.frame_count}: jumped {jump:.0f}px from {prev_ball_center} to {tracked_position} (limit={max_jump}px, prev_stuck={prev_stuck}), keeping previous")
@@ -15805,7 +16980,7 @@ class InteractiveBallAnalyzer:
                                 )
                             wait_for_next_serve = any(
                                 token in reason_lower
-                                for token in ("net", "bounce", "stopped", "lost", "fence")
+                                for token in ("net", "bounce", "stopped", "lost", "fence", "let")
                             )
                             if wait_for_next_serve:
                                 if "net" in reason.lower():
@@ -15881,8 +17056,13 @@ class InteractiveBallAnalyzer:
                 # Detect ball in serve area, accumulate position history,
                 # start tracking only when ball exits serve area in the configured serve direction
                 import math as _math
-                potential_serve = self.detect_serve_position(frame)
+                potential_serve = self.detect_serve_position(
+                    frame,
+                    lock_history=serve_position_history if serve_candidate_lock_active else None,
+                    lock_miss_frames=serve_candidate_lock_miss_frames,
+                )
                 if potential_serve:
+                    serve_candidate_lock_miss_frames = 0
                     self.waiting_serve_candidate = potential_serve
                     self.waiting_serve_candidate_frame = self.frame_count
                     if last_serve_candidate is not None:
@@ -15908,6 +17088,7 @@ class InteractiveBallAnalyzer:
                         serve_candidate_details_history.append(current_serve_detail)
                     else:
                         serve_candidate_details_history.append({'pos': potential_serve, 'frame': int(self.frame_count)})
+                    maybe_lock_serve_candidate(potential_serve, current_serve_detail)
                     if len(serve_position_history) > 20:
                         serve_position_history = serve_position_history[-20:]
                     if len(serve_candidate_details_history) > 20:
@@ -16218,6 +17399,21 @@ class InteractiveBallAnalyzer:
                     # Ball exited serve area — only start tracking if it was moving at serve speed
                     # in the configured serve direction.
                     # A ball just sitting/bouncing in the area (false positive like f492) has near-zero speed.
+                    if serve_candidate_lock_active:
+                        serve_candidate_lock_miss_frames += 1
+                        miss_limit = 8 if far_top_serve_active() else 2
+                        if serve_candidate_lock_miss_frames == 1:
+                            print(
+                                f"[SERVE_LOCK_MISS] f{self.frame_count}: preserving locked serve path "
+                                f"last={last_serve_candidate}"
+                            )
+                        elif serve_candidate_lock_miss_frames > miss_limit:
+                            print(
+                                f"[SERVE_LOCK_LOST] f{self.frame_count}: lost locked serve path after "
+                                f"{serve_candidate_lock_miss_frames} misses"
+                            )
+                            clear_waiting_serve_history()
+                            continue
                     preserve_far_top_gap = False
                     if (far_top_serve_active() and serve_tracking_frames >= 1 and
                             last_serve_candidate is not None):
@@ -16403,6 +17599,18 @@ class InteractiveBallAnalyzer:
                 continue
             elif key == ord(' '):
                 play_mode = not play_mode
+                continue
+            elif key in (ord('h'), ord('H')):
+                debug_point = self.ball_center or last_ball_center_for_debug or prev_ball_center_for_debug
+                debug_frame = frame
+                debug_frame_index = self.frame_count
+                if self.ball_center is None and last_frame_for_debug is not None:
+                    debug_frame = last_frame_for_debug
+                    debug_frame_index = last_frame_index_for_debug or self.frame_count
+                if debug_point is None:
+                    print("[HSV_DEBUG] No tracked point available for active/Alt2/S9 debug.")
+                else:
+                    self.open_tracking_hsv_debug_focus(debug_frame, debug_point, debug_frame_index)
                 continue
             elif key == ord('d'):
                 # Advance to next frame and automatically track

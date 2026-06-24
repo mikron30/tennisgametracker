@@ -60,7 +60,7 @@
         "h_max": 72,
         "s_min": 30,
         "s_max": 255,
-        "v_min": 130,
+        "v_min": 181,
         "v_max": 255
     },
     "h_10": {
@@ -72,10 +72,10 @@
         "v_max": 255
     },
     "alts9_11": {
-        "h_min": 55,
+        "h_min": 33,
         "h_max": 77,
-        "s_min": 9,
-        "s_max": 11,
+        "s_min": 42,
+        "s_max": 67,
         "v_min": 125,
         "v_max": 255
     },
@@ -115,6 +115,28 @@
     "serve_area_x_max": 2900,
     "serve_area_y_min": 650,
     "serve_area_y_max": 1100,
+    "far_serve_area_points": [
+        [
+            1580,
+            0
+        ],
+        [
+            2180,
+            0
+        ],
+        [
+            2180,
+            145
+        ],
+        [
+            1580,
+            145
+        ]
+    ],
+    "far_serve_area_x_min": 1580,
+    "far_serve_area_x_max": 2180,
+    "far_serve_area_y_min": 0,
+    "far_serve_area_y_max": 145,
     "serve_width_ratio": 0.8,
     "direction_change_min_degrees": 30,
     "serve_player_position": "auto",
