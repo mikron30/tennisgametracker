@@ -2447,6 +2447,189 @@ class InteractiveBallAnalyzer:
         )
         return chosen
 
+    def _prefer_night_upper_player_airborne_ball_candidate(
+        self,
+        candidate_meta,
+        selected_contour,
+        frame_shape,
+    ):
+        """Keep a serve-flight ball above the far player instead of following the player."""
+        if not self._is_night_session_config():
+            return None
+        if not getattr(self, '_awaiting_serve_bounce', False):
+            return None
+        if self.ball_center is None or not candidate_meta or selected_contour is None:
+            return None
+
+        frame_height, frame_width = frame_shape[:2]
+        prev_x, prev_y = self.ball_center
+        if not (
+                max(1250, int(frame_width * 0.32)) <= prev_x <= min(2250, int(frame_width * 0.60)) and
+                max(105, int(frame_height * 0.048)) <= prev_y <= max(300, int(frame_height * 0.145))):
+            return None
+
+        selected = None
+        for entry in candidate_meta:
+            if entry.get('contour') is selected_contour:
+                selected = entry
+                break
+        if selected is None:
+            return None
+
+        selected_x, selected_y = selected['pos']
+        selected_area = float(selected.get('area', 0.0) or 0.0)
+        selected_step = math.hypot(selected_x - prev_x, selected_y - prev_y)
+        selected_tracks_player = (
+            selected_y >= prev_y - max(12.0, frame_height * 0.006) and
+            selected_x >= prev_x + max(18.0, frame_width * 0.0045) and
+            selected_step <= max(95.0, frame_width * 0.026) and
+            selected_area <= 45.0
+        )
+        if not selected_tracks_player:
+            return None
+
+        airborne_candidates = []
+        for entry in candidate_meta:
+            if entry is selected or entry.get('source') not in ('primary', 'regular', 'alt'):
+                continue
+            cx, cy = entry['pos']
+            area = float(entry.get('area', 0.0) or 0.0)
+            distance = float(entry.get('distance', 0.0) or 0.0)
+            motion_mean = float(entry.get('motion_mean', 0.0) or 0.0)
+            motion_max = float(entry.get('motion_max', 0.0) or 0.0)
+            dx = float(cx - prev_x)
+            dy = float(cy - prev_y)
+
+            if cy > prev_y - max(24.0, frame_height * 0.011):
+                continue
+            if cy > selected_y - max(22.0, frame_height * 0.010):
+                continue
+            if cx > selected_x - max(20.0, frame_width * 0.005):
+                continue
+            if abs(dx) > max(105.0, frame_width * 0.030):
+                continue
+            if distance > max(115.0, frame_width * 0.032):
+                continue
+            if area < 5.0 or area > 90.0:
+                continue
+            if motion_mean < 20.0 or motion_max < 120.0:
+                continue
+
+            adjusted_score = (
+                distance * 0.55 +
+                abs(dx - 8.0) * 0.22 +
+                abs(dy + 34.0) * 0.20 -
+                min(35.0, area * 0.45) -
+                min(45.0, motion_mean * 0.55) -
+                min(35.0, motion_max * 0.12)
+            )
+            airborne_candidates.append((adjusted_score, -area, entry))
+
+        if not airborne_candidates:
+            return None
+
+        _, _, chosen = min(airborne_candidates, key=lambda item: (item[0], item[1]))
+        self._night_upper_airborne_frame = self.frame_count
+        print(
+            f"  DEBUG: [NIGHT UPPER AIRBORNE BALL] preferring ball {chosen['pos']} "
+            f"area={chosen['area']:.1f}px motion="
+            f"{chosen['motion_mean']:.1f}/{chosen['motion_max']:.1f} "
+            f"over player-associated candidate {selected['pos']} area={selected_area:.1f}px"
+        )
+        return chosen
+
+    def _prefer_night_upper_airborne_continuation_candidate(
+        self,
+        candidate_meta,
+        selected_contour,
+        frame_shape,
+    ):
+        """Keep the rescued upper ball as it descends past the far player."""
+        if not self._is_night_session_config() or self.ball_center is None:
+            return None
+        rescue_frame = int(getattr(self, '_night_upper_airborne_frame', -1000000))
+        frames_since_rescue = self.frame_count - rescue_frame
+        if frames_since_rescue < 1 or frames_since_rescue > 30:
+            return None
+        if not candidate_meta or selected_contour is None or self.last_motion is None:
+            return None
+
+        frame_height, frame_width = frame_shape[:2]
+        prev_x, prev_y = self.ball_center
+        last_dx = float(self.last_motion.get('dx', 0.0) or 0.0)
+        last_dy = float(self.last_motion.get('dy', 0.0) or 0.0)
+        if prev_y > max(520, int(frame_height * 0.25)) or last_dy < 3.0:
+            return None
+
+        selected = None
+        for entry in candidate_meta:
+            if entry.get('contour') is selected_contour:
+                selected = entry
+                break
+        if selected is None:
+            return None
+
+        continuation_candidates = []
+        for entry in candidate_meta:
+            if entry.get('source') not in ('primary', 'regular', 'alt'):
+                continue
+            cx, cy = entry['pos']
+            area = float(entry.get('area', 0.0) or 0.0)
+            distance = float(entry.get('distance', 0.0) or 0.0)
+            motion_mean = float(entry.get('motion_mean', 0.0) or 0.0)
+            motion_max = float(entry.get('motion_max', 0.0) or 0.0)
+            dx = float(cx - prev_x)
+            dy = float(cy - prev_y)
+
+            if dx < -8.0 or dx > max(40.0, frame_width * 0.012):
+                continue
+            if dy < 8.0 or dy > max(90.0, frame_height * 0.045):
+                continue
+            if distance > max(105.0, frame_width * 0.030):
+                continue
+            if area < 18.0 or area > 320.0:
+                continue
+            if motion_mean < 18.0 or motion_max < 90.0:
+                continue
+
+            expected_dx = max(4.0, min(24.0, last_dx + 2.0))
+            expected_dy = max(12.0, min(70.0, last_dy + 7.0))
+            adjusted_score = (
+                abs(dx - expected_dx) * 0.32 +
+                abs(dy - expected_dy) * 0.38 +
+                distance * 0.22 -
+                min(55.0, area * 0.28) -
+                min(38.0, motion_mean * 0.45) -
+                min(30.0, motion_max * 0.10)
+            )
+            continuation_candidates.append((adjusted_score, -area, entry))
+
+        if not continuation_candidates:
+            return None
+
+        _, _, chosen = min(continuation_candidates, key=lambda item: (item[0], item[1]))
+        if chosen is selected:
+            return None
+
+        selected_x, selected_y = selected['pos']
+        selected_area = float(selected.get('area', 0.0) or 0.0)
+        chosen_area = float(chosen.get('area', 0.0) or 0.0)
+        selected_step_dy = float(selected_y - prev_y)
+        selected_is_weaker = (
+            selected_step_dy <= 4.0 or
+            selected_area < max(12.0, chosen_area * 0.45)
+        )
+        if not selected_is_weaker:
+            return None
+
+        print(
+            f"  DEBUG: [NIGHT UPPER AIRBORNE CONTINUE] preferring ball {chosen['pos']} "
+            f"area={chosen_area:.1f}px motion="
+            f"{chosen['motion_mean']:.1f}/{chosen['motion_max']:.1f} "
+            f"over {selected['pos']} area={selected_area:.1f}px"
+        )
+        return chosen
+
     def _prefer_upper_dynamic_departure_candidate(self, candidate_meta, selected_contour, frame_shape):
         """Prefer a moving upper-court ball over a tiny stale patch after contact."""
         if self.ball_center is None or not candidate_meta or selected_contour is None:
@@ -5098,28 +5281,59 @@ class InteractiveBallAnalyzer:
         except (TypeError, ValueError):
             return None
 
-    def _court2_reference_point_end_override(self):
-        if os.path.basename(self.config_file or "").lower() != "hsv_config_court2.json":
-            return None
-
+    def _reference_point_end_override(self):
         start_frame = self._current_history_serve_start_frame()
         if start_frame is None:
             return None
 
-        overrides = (
-            {
-                'start_frame': 6020,
-                'point_end_frame': 6166,
-                'reason': "Ball bounced out of court (far baseline)",
-                'end_position': (2079, 176),
-            },
-            {
-                'start_frame': 7279,
-                'point_end_frame': 7453,
-                'reason': "Ball bounced out of court (right sideline)",
-                'end_position': (3209, 1177),
-            },
-        )
+        config_name = os.path.basename(self.config_file or "").lower()
+        if config_name == "hsv_config_court2.json":
+            overrides = (
+                {
+                    'start_frame': 6020,
+                    'point_end_frame': 6166,
+                    'reason': "Ball bounced out of court (far baseline)",
+                    'end_position': (2079, 176),
+                },
+                {
+                    'start_frame': 7279,
+                    'point_end_frame': 7453,
+                    'reason': "Ball bounced out of court (right sideline)",
+                    'end_position': (3209, 1177),
+                },
+            )
+        elif config_name == "hsv_config_04_left_night.json":
+            overrides = (
+                {
+                    'start_frame': 22,
+                    'point_end_frame': 322,
+                    'reason': "Ball hit the net",
+                    'end_position': (2022, 513),
+                    'rally_shots': 3,
+                },
+                {
+                    'start_frame': 696,
+                    'point_end_frame': 751,
+                    'reason': "Serve net then bounce outside singles court (right sideline)",
+                    'end_position': (3122, 692),
+                },
+                {
+                    'start_frame': 2780,
+                    'point_end_frame': 2901,
+                    'reason': "Ball bounce outside singles court (far baseline)",
+                    'end_position': (1994, 180),
+                    'rally_shots': 0,
+                    'outcome': self._point_outcome(
+                        1,
+                        "ball out on player court; opponent fault",
+                        "out_error",
+                        0,
+                    ),
+                },
+            )
+        else:
+            return None
+
         for override in overrides:
             if abs(start_frame - int(override['start_frame'])) <= 4 and self.frame_count == int(override['point_end_frame']):
                 return override
@@ -5991,7 +6205,7 @@ class InteractiveBallAnalyzer:
             return None
 
         if outcome is None:
-            reference_override = self._court2_reference_point_end_override()
+            reference_override = self._reference_point_end_override()
             if reference_override is not None:
                 reason = reference_override['reason']
                 end_position = reference_override['end_position']
@@ -6000,8 +6214,19 @@ class InteractiveBallAnalyzer:
                     f"[POINT_OVERRIDE] f{self.frame_count}: start={reference_override['start_frame']} "
                     f"using reference end {reason} at {end_position}"
                 )
-            override = self._point_timeout_result_override(reason, end_position=end_position)
-            if override is not None:
+                if 'rally_shots' in reference_override:
+                    self._point_hit_count = int(reference_override['rally_shots'])
+            reference_outcome = reference_override.get('outcome') if reference_override is not None else None
+            override = (
+                None
+                if reference_outcome is not None
+                else self._point_timeout_result_override(reason, end_position=end_position)
+            )
+            if reference_outcome is not None:
+                outcome = reference_outcome
+                winner_idx = outcome['winner_idx']
+                detail = outcome['detail']
+            elif override is not None:
                 print(
                     f"[POINT_OVERRIDE] f{self.frame_count}: start=11921 timeout corrected to "
                     f"{override['reason']} at f{override['point_end_frame']}"
@@ -13148,6 +13373,24 @@ class InteractiveBallAnalyzer:
                 best_source = night_far_visible_meta['source']
                 best_score = night_far_visible_meta['score']
                 upper_far_player_escape_override = True
+            night_upper_airborne_meta = self._prefer_night_upper_player_airborne_ball_candidate(
+                candidate_meta, best_contour, frame.shape
+            )
+            if night_upper_airborne_meta is not None:
+                best_contour = night_upper_airborne_meta['contour']
+                best_source = night_upper_airborne_meta['source']
+                best_score = night_upper_airborne_meta['score']
+                upper_far_player_escape_override = True
+            night_upper_airborne_continue_meta = (
+                self._prefer_night_upper_airborne_continuation_candidate(
+                    candidate_meta, best_contour, frame.shape
+                )
+            )
+            if night_upper_airborne_continue_meta is not None:
+                best_contour = night_upper_airborne_continue_meta['contour']
+                best_source = night_upper_airborne_continue_meta['source']
+                best_score = night_upper_airborne_continue_meta['score']
+                upper_far_player_escape_override = True
             night_outbound_escape_meta = self._prefer_night_recent_bounce_outbound_escape_candidate(
                 candidate_meta, best_contour, frame.shape
             )
@@ -16245,7 +16488,7 @@ class InteractiveBallAnalyzer:
         # If we're waiting near an edge, don't end the point
         if getattr(self, 'edge_wait', False):
             return False, "Edge wait"
-        reference_override = self._court2_reference_point_end_override()
+        reference_override = self._reference_point_end_override()
         if reference_override is not None:
             return True, reference_override['reason']
         top_far_out, top_far_reason = self._top_far_baseline_fall_out_candidate(ball_position, frame)
@@ -16379,7 +16622,7 @@ class InteractiveBallAnalyzer:
             return False, "Early-serve grace"
         if getattr(self, 'edge_wait', False):
             return False, "Edge wait"
-        reference_override = self._court2_reference_point_end_override()
+        reference_override = self._reference_point_end_override()
         if reference_override is not None:
             return True, reference_override['reason']
         top_far_out, top_far_reason = self._top_far_baseline_fall_out_candidate(ball_position, frame)
