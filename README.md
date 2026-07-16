@@ -58,6 +58,45 @@ pip install opencv-python numpy
 python interactive_ball_analyzer.py
 ```
 
+### Visual Point Audit Agent
+
+Every normal tracker run automatically compares point starts/ends with temporal image sheets.
+An explicit equivalent command is:
+
+```bash
+python interactive_ball_analyzer.py --court night --auto-play --headless --audit-points
+```
+
+Use `--no-audit-points` when you intentionally want to skip report generation.
+
+The audit writes an HTML report, CSV/JSON verdicts, and start/end contact sheets under
+`tmp/point_audits/`. During an integrated tracker run, a green cross marks the tracked
+position on every sampled frame and a red cross marks the reported center frame. The local
+audit also checks the toss-to-contact handoff and flags a serve that fails to launch back
+toward the court; optional vision review checks for player, racket, and static-point capture.
+
+Local mode needs no extra dependency and performs image-motion, HSV, serve-area, and net
+geometry checks:
+
+```bash
+python point_visual_auditor.py --video VIDEO.mp4 --history POINT_HISTORY.csv \
+  --config hsv_config_04_left_night.json --provider local
+```
+
+Vision mode also asks a multimodal model to judge whether the start, end frame, and end
+reason match the images. Install the optional dependency and set an API key first:
+
+```bash
+pip install -r requirements-vision.txt
+$env:OPENAI_API_KEY = "your_key_here"
+python point_visual_auditor.py --video VIDEO.mp4 --history POINT_HISTORY.csv \
+  --config hsv_config_04_left_night.json --provider openai
+```
+
+Use `--fail-on-review` on the standalone auditor or `--audit-fail-on-review` on the tracker
+to return exit status 2 when any point needs review. Use `--from-frame`, `--to-frame`, or
+`--points 2,4` to audit a smaller set.
+
 ### Controls
 - **D**: Advance to next frame
 - **Q**: Quit
@@ -138,6 +177,39 @@ tennisgametracker/
    - Candidate evaluation (position, area, distance, size_ratio, score)
    - Selected contour with source filter
    - HSV values at ball position
+
+## Player and racket context
+
+Player/racket context tracking is enabled by default. It detects near/far
+player boxes, estimates head and shoe regions, traces a likely racket line,
+and records a conservative forehand/backhand label for each inferred racket
+contact. The learned profile is saved as
+`player_tracking_<config-name>.json`.
+
+Player candidates are restricted to the configured main-court sideline region;
+players on the adjacent court are ignored.
+
+During a serve, the server is selected geometrically as the main-court player
+below and closest to the serve ball, rather than whichever persistent track is
+nearest to the ball mask. The receiver is selected from the opposite side of
+the net and its receiving area; both positions and selection sources are
+stored in point history.
+
+Point-history rows now include the server's tracked court position and ball
+serve position, racket side, net-player context, per-shot stroke JSON, and a
+player-tracking summary JSON field.
+
+The context layer applies a conservative player-head guard by default so a
+small head/hat blob cannot replace a nearby ball. Full shoe/racket candidate
+protection remains opt-in; after validating a court, run with:
+
+```text
+python interactive_ball_analyzer.py --enable-player-ball-protection
+```
+
+Use `--disable-player-tracking` to turn off the overlays/detector,
+`--disable-player-learning` to keep the persistent profile unchanged, or
+`--player-tracking-interval N` to change detector frequency.
 
 ## Troubleshooting
 

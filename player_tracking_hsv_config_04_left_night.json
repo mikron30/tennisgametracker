@@ -1,0 +1,39 @@
+{
+  "net_contacts": {
+    "P1": 0,
+    "P2": 0
+  },
+  "racket_sides": {
+    "P1": {
+      "left": 9,
+      "right": 9
+    },
+    "P2": {
+      "left": 4,
+      "right": 5
+    }
+  },
+  "serve_sides": {
+    "P1": {
+      "left": 1471,
+      "right": 1886
+    },
+    "P2": {
+      "left": 901,
+      "right": 1112
+    }
+  },
+  "shots": {
+    "P1": {
+      "backhand": 10,
+      "forehand": 8,
+      "unknown": 30
+    },
+    "P2": {
+      "backhand": 2,
+      "forehand": 7,
+      "unknown": 1
+    }
+  },
+  "version": 1
+}
