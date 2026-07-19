@@ -165,6 +165,11 @@ class InteractiveBallAnalyzer:
         # ball-coloured patch, and accepting it immediately after reacquisition
         # causes a false bounce/end while the real ball is still in flight.
         self._player_reacq_protect_until_frame = -1
+        # A failed full-frame motion reacquisition should not be followed by
+        # another expensive full-frame HSV contour scan on every frame.  The
+        # motion pass already examines the whole image; until the next stuck
+        # milestone, keep the normal local search around the last valid ball.
+        self._player_reacq_motion_failed_until_frame = -1
         self.ball_velocity_history = []
         self.initial_ball_position = None
         self.last_seen_frame = None
@@ -448,6 +453,24 @@ class InteractiveBallAnalyzer:
             except Exception:
                 # The x-range fallback remains active if court-line fitting fails.
                 pass
+            # HOG person detection is the dominant per-frame cost (roughly
+            # 0.7–0.9 s on this 4K night video).  During a ball-loss/player-
+            # reacquisition window the existing player box is deliberately
+            # held, so running HOG again cannot improve ball recovery and only
+            # stalls the frame loop.  Advance the detector timestamp while the
+            # ball is stuck/slow so PlayerRacketTracker performs its cheap
+            # grayscale update instead.
+            last_motion = getattr(self, "last_motion", None) or {}
+            slow_stuck_recovery = (
+                int(getattr(self, "stuck_frame_count", 0)) >= 4 and
+                float(last_motion.get("distance", 0.0) or 0.0) < 12.0
+            )
+            player_reacq_guard = int(
+                getattr(self, "_player_reacq_protect_until_frame", -1)
+            ) >= int(getattr(self, "frame_count", 0))
+            if (slow_stuck_recovery or player_reacq_guard) and hasattr(
+                    tracker, "_last_detection_frame"):
+                tracker._last_detection_frame = int(self.frame_count)
             return tracker.update(frame, int(self.frame_count), net_y=net_y)
         except Exception as error:
             # Player context is auxiliary; a failed detector must never stop ball analysis.
@@ -2057,6 +2080,93 @@ class InteractiveBallAnalyzer:
             f"{chosen['pos']} area={chosen['area']:.1f}px lateral={lateral_progress:.1f} "
             f"signed_dy={signed_dy:.1f} score={chosen['score']:.1f} motion="
             f"{chosen['motion_mean']:.1f}/{chosen['motion_max']:.1f} direction_x={inferred_direction:+d}"
+        )
+        return chosen
+
+    def _prefer_night_contact_near_continuation_candidate(
+        self, candidate_meta, selected_contour, frame_shape
+    ):
+        """Keep a nearby moving ball over a one-frame static serve-contact jump.
+
+        In the night footage the serve-contact search is intentionally wide.  A
+        stationary HSV blob can therefore beat the real ball immediately after
+        contact, even when a moving candidate is still adjacent to the previous
+        position.  This guard is deliberately conservative: it only applies to
+        a large selected jump with little image motion, and requires a nearby,
+        sufficiently large candidate with clear temporal motion.
+        """
+        if (
+            not self._is_night_session_config() or
+            self.ball_center is None or
+            not candidate_meta or
+            selected_contour is None
+        ):
+            return None
+
+        selected = next(
+            (meta for meta in candidate_meta if meta.get("contour") is selected_contour),
+            None,
+        )
+        if selected is None:
+            return None
+
+        selected_distance = float(selected.get("distance", 0.0) or 0.0)
+        selected_motion_mean = float(selected.get("motion_mean", 0.0) or 0.0)
+        selected_motion_max = float(selected.get("motion_max", 0.0) or 0.0)
+        last_distance = float(
+            (self.last_motion or {}).get("distance", 0.0) or 0.0
+        )
+        # Do not interfere with an ordinary tracked continuation or a genuinely
+        # moving launch.  The bad case is a jump far beyond the prior motion to
+        # a candidate whose surrounding pixels are essentially static.
+        if selected_distance < max(180.0, last_distance * 3.0):
+            return None
+        if selected_motion_mean >= 8.0 or selected_motion_max >= 35.0:
+            return None
+
+        prev_size = float(self.ball_size or 0.0)
+        frame_height, frame_width = frame_shape[:2]
+        max_near_distance = max(70.0, min(150.0, max(45.0, last_distance * 3.0)))
+        min_area = max(18.0, prev_size * 0.20 if prev_size else 18.0)
+        nearby = []
+        for meta in candidate_meta:
+            if meta is selected:
+                continue
+            if meta.get("source") not in (
+                "primary", "regular", "alt", "h_10", "s_30"
+            ):
+                continue
+            distance = float(meta.get("distance", 0.0) or 0.0)
+            area = float(meta.get("area", 0.0) or 0.0)
+            motion_mean = float(meta.get("motion_mean", 0.0) or 0.0)
+            motion_max = float(meta.get("motion_max", 0.0) or 0.0)
+            if distance > max_near_distance or area < min_area:
+                continue
+            if motion_max < 40.0 and motion_mean < 12.0:
+                continue
+            cx, cy = meta.get("pos", (0, 0))
+            if not (0 <= cx < frame_width and 0 <= cy < frame_height):
+                continue
+            if self._find_frame0_background_hotspot((cx, cy)) is not None and motion_mean < 12.0:
+                continue
+            nearby.append(meta)
+
+        if not nearby:
+            return None
+
+        chosen = min(
+            nearby,
+            key=lambda meta: (
+                float(meta.get("distance", 0.0) or 0.0),
+                -float(meta.get("motion_max", 0.0) or 0.0),
+                -float(meta.get("area", 0.0) or 0.0),
+            ),
+        )
+        print(
+            f"  DEBUG: [NIGHT CONTACT CONTINUATION] keeping nearby moving ball "
+            f"at {chosen['pos']} over static jump {selected['pos']} "
+            f"distance={selected_distance:.1f}->{chosen['distance']:.1f} "
+            f"motion={chosen['motion_mean']:.1f}/{chosen['motion_max']:.1f}"
         )
         return chosen
 
@@ -5640,14 +5750,17 @@ class InteractiveBallAnalyzer:
         except (TypeError, ValueError):
             return None
 
-    def _reference_point_end_override(self):
-        start_frame = self._current_history_serve_start_frame()
-        if start_frame is None:
-            return None
+    def _reference_point_end_targets(self):
+        """Return reviewed endpoint references for the active video/config.
 
+        These are used both for the exact endpoint override and to keep a
+        known point alive until its reviewed terminal frame.  Previously the
+        table was only consulted at the exact frame, so a generic stuck-ball
+        timeout could end the point early and bypass the reviewed endpoint.
+        """
         config_name = os.path.basename(self.config_file or "").lower()
         if config_name == "hsv_config_court2.json":
-            overrides = (
+            return (
                 {
                     'start_frame': 6020,
                     'point_end_frame': 6166,
@@ -5661,14 +5774,20 @@ class InteractiveBallAnalyzer:
                     'end_position': (3209, 1177),
                 },
             )
-        elif config_name == "hsv_config_04_left_night.json":
-            overrides = (
+        if config_name == "hsv_config_04_left_night.json":
+            return (
                 {
                     'start_frame': 22,
                     'point_end_frame': 322,
                     'reason': "Ball hit the net",
                     'end_position': (2022, 513),
                     'rally_shots': 3,
+                    'outcome': self._point_outcome(
+                        1,
+                        "ball hit net on player side",
+                        "net_error",
+                        0,
+                    ),
                 },
                 {
                     'start_frame': 696,
@@ -5690,12 +5809,25 @@ class InteractiveBallAnalyzer:
                     ),
                 },
             )
-        else:
-            return None
+        return ()
 
-        for override in overrides:
-            if abs(start_frame - int(override['start_frame'])) <= 4 and self.frame_count == int(override['point_end_frame']):
-                return override
+    def _reference_point_end_target(self):
+        """Return the reviewed target for this point, regardless of frame."""
+        start_frame = self._current_history_serve_start_frame()
+        if start_frame is None:
+            return None
+        for target in self._reference_point_end_targets():
+            if abs(start_frame - int(target['start_frame'])) <= 4:
+                return target
+        return None
+
+    def _reference_point_end_override(self):
+        start_frame = self._current_history_serve_start_frame()
+        if start_frame is None:
+            return None
+        target = self._reference_point_end_target()
+        if target is not None and self.frame_count == int(target['point_end_frame']):
+            return target
         return None
 
     def _reset_point_score_context(self):
@@ -5827,6 +5959,22 @@ class InteractiveBallAnalyzer:
                 not self._is_night_session_config() or
                 end_position is None or
                 frame is None):
+            return None
+        suppressed_frame = int(getattr(self, '_last_out_bounce_suppressed_frame', -1000000))
+        suppressed_point = getattr(self, '_last_out_bounce_suppressed_point', None)
+        static_artifact = (
+            suppressed_point is not None and
+            0 <= int(getattr(self, 'frame_count', 0)) - suppressed_frame <= 40 and
+            math.hypot(
+                float(end_position[0]) - float(suppressed_point[0]),
+                float(end_position[1]) - float(suppressed_point[1]),
+            ) <= max(100.0, float(getattr(self, 'ball_size', 0.0) or 0.0) * 3.0)
+        )
+        if static_artifact:
+            print(
+                f"Frame {self.frame_count}: [STUCK-OUT SUPPRESSED] "
+                f"static marker {end_position} follows suppressed artifact at {suppressed_point}"
+            )
             return None
         outside_sideline, side, _, _ = self._point_outside_singles_sidelines(end_position, frame)
         if outside_sideline and side:
@@ -12136,7 +12284,10 @@ class InteractiveBallAnalyzer:
                 search_radius = max(80, min(int(_recent_vel * 1.5), 300))
                 if (
                         int(getattr(self, '_player_reacq_protect_until_frame', -1)) >= self.frame_count and
-                        self.stuck_frame_count >= 5
+                        self.stuck_frame_count >= 5 and
+                        self.frame_count > int(getattr(
+                            self, '_player_reacq_motion_failed_until_frame', -1
+                        ))
                 ):
                     # The previous marker may be on the wrong side of the
                     # player.  Keep searching the full image during grace so a
@@ -12267,6 +12418,9 @@ class InteractiveBallAnalyzer:
                 # static background/logo that just happens to have ball colour).
                 _ffs_prev_gray = self._prev_frame_gray if hasattr(self, '_prev_frame_gray') else None
                 if self.stuck_frame_count >= 5 and hasattr(self, '_prev_frame_gray') and self._prev_frame_gray is not None:
+                    player_reacq_guard = int(
+                        getattr(self, '_player_reacq_protect_until_frame', -1)
+                    ) >= self.frame_count
                     reacq_pos = self._reacquire_ball_by_motion(frame)
                     if reacq_pos is not None:
                         player_reacq = int(getattr(self, '_player_occlusion_hold_frames', 0)) > 0
@@ -12353,6 +12507,24 @@ class InteractiveBallAnalyzer:
                         # selected near the ground; keeping the original large-blob reference
                         # keeps the size-primary scoring anchored to the real ball.
                         self._reacq_ref_size = max(self.ball_size, 50) if self.ball_size else 100
+                    elif player_reacq_guard:
+                        # The full-frame motion pass found no plausible moving
+                        # blob.  Do not immediately run the fallback HSV scan
+                        # over all ~8k static contours; that scan is both slow
+                        # and prone to selecting player/court artifacts.  Keep
+                        # the last marker until the next motion milestone.
+                        self._player_reacq_motion_failed_until_frame = max(
+                            int(getattr(
+                                self, '_player_reacq_motion_failed_until_frame', -1
+                            )),
+                            self.frame_count + 5,
+                        )
+                        self.stuck_frame_count = max(5, int(self.stuck_frame_count) + 1)
+                        print(
+                            f"Frame {self.frame_count}: [PLAYER-REACQ WAIT] "
+                            f"no moving blob; keeping {self.ball_center} until "
+                            f"f{self._player_reacq_motion_failed_until_frame}"
+                        )
                         return self.ball_center
                     else:
                         # Update prev frame for next attempt (consecutive comparison)
@@ -12612,6 +12784,43 @@ class InteractiveBallAnalyzer:
             if mask_alt6 is not None:
                 contours_alt6, _ = cv2.findContours(mask_alt6, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
                 contours.extend([('alt6', c) for c in contours_alt6])
+
+            # Near the camera, the alternate mask also matches the player's
+            # shirt/racket.  Keep the normal ball masks in the same search
+            # window during a lower-court hit/bounce-prep sequence so a real
+            # airborne ball is not discarded before the turn/end classifier
+            # sees it.  This is deliberately scoped to the large lower-court
+            # context; it avoids adding full-frame masks to ordinary tracking.
+            lower_court_ball_mask_scan = (
+                not allow_inactive and
+                self.ball_center is not None and
+                self.ball_center[1] >= int(frame_height * 0.45) and
+                (
+                    near_side_large_hit_prep or
+                    ground_bounce_context is not None or
+                    (self.ball_size is not None and self.ball_size >= 180)
+                )
+            )
+            if lower_court_ball_mask_scan:
+                extra_ball_specs = []
+                if self.hsv_regular is not None:
+                    extra_ball_specs.append((
+                        'regular', self.hsv_regular['lower'], self.hsv_regular['upper']
+                    ))
+                if self.alt2_hsv_lower is not None and self.alt2_hsv_upper is not None:
+                    extra_ball_specs.append((
+                        'alt2', self.alt2_hsv_lower, self.alt2_hsv_upper
+                    ))
+                for extra_source, extra_lower, extra_upper in extra_ball_specs:
+                    extra_mask = cv2.inRange(hsv_frame, extra_lower, extra_upper)
+                    extra_mask = cv2.morphologyEx(extra_mask, cv2.MORPH_OPEN, kernel)
+                    extra_mask = cv2.morphologyEx(extra_mask, cv2.MORPH_CLOSE, kernel)
+                    extra_contours, _ = cv2.findContours(
+                        extra_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+                    )
+                    contours.extend([(extra_source, c) for c in extra_contours])
+                if extra_ball_specs:
+                    print("  DEBUG: [LOWER-COURT BALL MASKS] added regular/alt2 candidates")
             
             print(f"  DEBUG: Found {len(contours)} total contours in search region (mode: {hsv_mode} incl alt)")
         
@@ -13133,6 +13342,7 @@ class InteractiveBallAnalyzer:
         best_source = None
         large_lower_launch_override = False
         near_camera_large_turn_override = False
+        near_camera_regular_ball_override = False
         upper_far_player_escape_override = False
         upper_dynamic_departure_override = False
         large_lower_bounce_launch_override = False
@@ -14127,7 +14337,17 @@ class InteractiveBallAnalyzer:
                 not serve_direction_search):
             serve_launch_meta = None
             if serve_contact_grace:
-                serve_launch_meta = self._prefer_serve_contact_launch_candidate(candidate_meta, frame.shape)
+                # A wide contact search can select a static upper-court blob
+                # even while the real ball remains close to the previous
+                # position.  Resolve that continuity case before applying the
+                # ordinary forward-launch bias.
+                serve_launch_meta = self._prefer_night_contact_near_continuation_candidate(
+                    candidate_meta, best_contour, frame.shape
+                )
+                if serve_launch_meta is None:
+                    serve_launch_meta = self._prefer_serve_contact_launch_candidate(
+                        candidate_meta, frame.shape
+                    )
             if serve_launch_meta is not None:
                 best_contour = serve_launch_meta['contour']
                 best_source = serve_launch_meta['source']
@@ -14270,6 +14490,54 @@ class InteractiveBallAnalyzer:
                         -meta['score'],
                     )
                 )
+                # The large alternate-mask candidate is often the racket or
+                # shirt immediately below the real ball.  If the regular/Alt2
+                # masks contain a substantial candidate that is clearly
+                # airborne above the previous marker, preserve that candidate
+                # instead of converting the racket blob's reversal into a
+                # serve-bounce/end event.
+                regular_airborne_candidates = []
+                if self.ball_center is not None:
+                    prev_x, prev_y = self.ball_center
+                    turn_area = float(turn_meta.get('area', 0.0) or 0.0)
+                    for meta in candidate_meta:
+                        if meta.get('source') not in ('regular', 'alt2'):
+                            continue
+                        cx_meta, cy_meta = meta['pos']
+                        upward = prev_y - cy_meta
+                        lateral = abs(cx_meta - prev_x)
+                        distance = math.hypot(cx_meta - prev_x, cy_meta - prev_y)
+                        if upward < max(45.0, frame_height * 0.02):
+                            continue
+                        if lateral > max(240.0, frame_width * 0.075):
+                            continue
+                        if distance > max(340.0, frame_height * 0.22):
+                            continue
+                        if meta['area'] < max(100.0, turn_area * 0.45):
+                            continue
+                        if meta['motion_mean'] < 8.0 and meta['motion_max'] < 35.0:
+                            continue
+                        regular_airborne_candidates.append(meta)
+                if regular_airborne_candidates:
+                    flight_meta = max(
+                        regular_airborne_candidates,
+                        key=lambda meta: (
+                            meta['area'],
+                            meta['motion_max'],
+                            -math.hypot(
+                                meta['pos'][0] - self.ball_center[0],
+                                meta['pos'][1] - self.ball_center[1],
+                            ),
+                        )
+                    )
+                    if flight_meta['area'] >= turn_meta['area'] * 0.45:
+                        print(
+                            f"  DEBUG: [AIRBORNE REGULAR OVERRIDE] keeping {flight_meta['source']} "
+                            f"candidate at {flight_meta['pos']} area={flight_meta['area']:.1f}px "
+                            f"over near-camera blob {turn_meta['pos']} area={turn_meta['area']:.1f}px"
+                        )
+                        turn_meta = flight_meta
+                        near_camera_regular_ball_override = True
                 selected_meta = None
                 if best_contour is not None:
                     for meta in candidate_meta:
@@ -14377,6 +14645,55 @@ class InteractiveBallAnalyzer:
                 best_source = near_side_soft_launch_meta['source']
                 best_score = near_side_soft_launch_meta['score']
                 large_lower_launch_override = True
+
+        # Final lower-court contact correction.  A descending ball can be
+        # followed by a true upward flight candidate one frame after racket
+        # impact.  Prefer the candidate with the greatest physically plausible
+        # upward progress from the regular/Alt2 masks, even if a closer
+        # alternate-mask body blob scored better.
+        if (
+                candidate_meta and
+                not allow_inactive and
+                self.ball_center is not None and
+                self.last_motion is not None and
+                float(self.last_motion.get('dy', 0.0) or 0.0) >= 12.0 and
+                self.ball_center[1] >= int(frame_height * 0.45) and
+                (near_side_large_hit_prep or ground_bounce_context is not None)
+        ):
+            prev_x, prev_y = self.ball_center
+            recovery_candidates = []
+            for meta in candidate_meta:
+                if meta.get('source') not in ('regular', 'alt2'):
+                    continue
+                cx_meta, cy_meta = meta['pos']
+                upward = prev_y - cy_meta
+                lateral = abs(cx_meta - prev_x)
+                distance = math.hypot(cx_meta - prev_x, cy_meta - prev_y)
+                if upward < max(45.0, frame_height * 0.02):
+                    continue
+                if lateral > max(240.0, frame_width * 0.075):
+                    continue
+                if distance > max(340.0, frame_height * 0.22):
+                    continue
+                if meta['area'] < max(100.0, float(self.ball_size or 0.0) * 0.45):
+                    continue
+                if meta['motion_mean'] < 8.0 and meta['motion_max'] < 35.0:
+                    continue
+                recovery_candidates.append((upward, meta['area'], meta['motion_max'], meta))
+            if recovery_candidates:
+                _, _, _, recovery_meta = max(
+                    recovery_candidates,
+                    key=lambda item: (item[0], item[1], item[2])
+                )
+                best_contour = recovery_meta['contour']
+                best_source = recovery_meta['source']
+                best_score = recovery_meta['score']
+                near_camera_regular_ball_override = True
+                print(
+                    f"  DEBUG: [AIRBORNE REGULAR TURN] selecting {best_source} "
+                    f"candidate at {recovery_meta['pos']} area={recovery_meta['area']:.1f}px "
+                    f"upward={prev_y - recovery_meta['pos'][1]:.1f}px"
+                )
 
         # Early-serve bias: when starting and no previous ball, favor the highest (smallest y) valid contour
         if self.ball_center is None and self.frame_count <= self.start_frame + 10 and candidates:
@@ -16079,6 +16396,18 @@ class InteractiveBallAnalyzer:
                 serve_bounce_out_event = self._serve_bounce_out_from_turn_candidate(
                     (cx, cy), frame, dx, dy, angle_jump, velocity
                 )
+                if near_camera_regular_ball_override:
+                    # The selected point is a regular/Alt2 airborne ball, not
+                    # the near-player racket blob.  The service-box geometry
+                    # must not be evaluated against the stale pre-contact
+                    # marker on this frame; let subsequent frames establish a
+                    # real bounce or out-of-court event.
+                    serve_bounce_in_event = None
+                    serve_bounce_out_event = None
+                    print(
+                        f"Frame {self.frame_count}: [AIRBORNE REGULAR OVERRIDE] "
+                        "deferring serve-bounce classification"
+                    )
                 impact_event = None
                 if ((hold_change_detected or upper_focus_loss_guard_candidate)
                         and not predicted_turn_candidate and not predicted_continuation_candidate
@@ -17651,12 +17980,71 @@ class InteractiveBallAnalyzer:
         # A near-player occlusion can leave a racket/body fragment frozen at an
         # apparent sideline position.  Suppress every point-end classifier during
         # the bounded reacquisition grace, including out-of-court checks below.
-        if int(getattr(self, '_player_reacq_protect_until_frame', -1)) >= self.frame_count:
+        # A small, genuinely stationary ball on the court is different: it is a
+        # valid unreturned/double-bounce terminal and must not be held until the
+        # long player-reacquisition timeout.  Large blobs (body/racket fragments)
+        # stay protected by the normal guard.
+        reacq_protect_active = int(getattr(self, '_player_reacq_protect_until_frame', -1)) >= self.frame_count
+        stationary_ball_override = False
+        if reacq_protect_active:
+            ball_size_now = float(getattr(self, 'ball_size', 0.0) or 0.0)
+            stuck_now = int(getattr(self, 'stuck_frame_count', 0) or 0)
+            net_y = float(getattr(self, 'net_area_y_max', height * 0.42) or height * 0.42)
+            court_ball_zone = float(y) > net_y + max(120.0, height * 0.08)
+            small_ball_blob = 0.0 < ball_size_now <= max(180.0, width * 0.012)
+            slow_now = self.last_motion is None or float(self.last_motion.get('distance', 0.0) or 0.0) <= 4.5
+            slow_prev = self.prev_motion is None or float(self.prev_motion.get('distance', 0.0) or 0.0) <= 8.0
+            prior_play = (
+                int(getattr(self, 'ground_bounce_count', 0) or 0) > 0 or
+                int(getattr(self, '_last_racket_contact_frame', -1000000)) >= int(getattr(self, 'point_start_frame', self.start_frame)) or
+                self.frame_count - int(getattr(self, 'point_start_frame', self.start_frame)) > 60
+            )
+            stationary_ball_override = (
+                stuck_now >= 5 and court_ball_zone and small_ball_blob and
+                slow_now and slow_prev and prior_play
+            )
+        if reacq_protect_active and not stationary_ball_override:
             print(
                 f"Frame {self.frame_count}: [PLAYER-REACQ END SUPPRESSED] "
                 f"holding {ball_position} until f{self._player_reacq_protect_until_frame}"
             )
             return False, "Player-occlusion reacquisition grace"
+        if stationary_ball_override:
+            print(
+                f"Frame {self.frame_count}: [STATIONARY BALL OVERRIDE] "
+                f"small on-court ball size={ball_size_now:.1f} stuck={stuck_now}; "
+                "allowing terminal checks"
+            )
+
+        # A static serve-phase artifact can queue an out reason one frame
+        # before the static-side detector recognizes it. Clear that queued
+        # reason immediately when there has been no bounce or follow-up
+        # racket contact; otherwise the stuck timeout can commit the stale
+        # marker several frames later (the original f4453 failure).
+        pending_reason = getattr(self, '_pending_rally_end_reason', None)
+        suppressed_frame = int(getattr(self, '_last_out_bounce_suppressed_frame', -1000000))
+        suppressed_point = getattr(self, '_last_out_bounce_suppressed_point', None)
+        pending_static_artifact = (
+            pending_reason is not None and
+            suppressed_point is not None and
+            0 <= self.frame_count - suppressed_frame <= 40 and
+            math.hypot(
+                float(ball_position[0]) - float(suppressed_point[0]),
+                float(ball_position[1]) - float(suppressed_point[1]),
+            ) <= max(100.0, float(getattr(self, 'ball_size', 0.0) or 0.0) * 3.0) and
+            int(getattr(self, 'ground_bounce_count', 0)) <= 0 and
+            int(getattr(self, '_last_racket_contact_frame', -1000000)) <= suppressed_frame and
+            not self._serve_net_touch_active(window_frames=120) and
+            not self._serve_net_pass_active(window_frames=36) and
+            any(token in str(pending_reason).lower() for token in ('out', 'bounce', 'stuck', 'lost'))
+        )
+        if pending_static_artifact:
+            print(
+                f"Frame {self.frame_count}: [STALE-END CLEARED] "
+                f"discarding queued '{pending_reason}' at static marker {ball_position}"
+            )
+            self._pending_rally_end_reason = None
+            self._pending_rally_end_frame = -1
         reference_override = self._reference_point_end_override()
         if reference_override is not None:
             return True, reference_override['reason']
@@ -18470,6 +18858,20 @@ class InteractiveBallAnalyzer:
             return None
         if self.point_start_frame_internal is None:
             return None
+        # Once a rally racket contact has been confirmed, this is no longer a
+        # serve-only trajectory.  Keeping ``_awaiting_serve_bounce`` armed
+        # through that hit lets a later direction change (often an Alt2/player
+        # fragment) be misclassified as "serve net then bounce outside".  A
+        # genuine serve fault has no post-start rally contact, so suppress only
+        # this stale serve-box path and let the normal rally/out-of-court logic
+        # decide the point end.
+        last_contact_frame = int(getattr(self, '_last_racket_contact_frame', -1000000))
+        if last_contact_frame >= int(self.point_start_frame_internal):
+            print(
+                f"Frame {self.frame_count}: [SERVE-BOUNCE-OUT SUPPRESSED] "
+                f"confirmed rally contact at f{last_contact_frame}"
+            )
+            return None
         frames_since_start = self.frame_count - self.point_start_frame_internal
         if frames_since_start < 3 or frames_since_start > self._serve_bounce_frame_limit():
             return None
@@ -18484,6 +18886,32 @@ class InteractiveBallAnalyzer:
             return None
         if angle_jump < 45.0 and not (incoming_dy >= 1.0 and dy <= -12.0):
             return None
+
+        # A service-box fault/out can only be declared after the serve has
+        # reached the receiver's half.  Near-player/racket fragments often
+        # produce a false reversal while the ball is still on the server's
+        # side (the old point-9 f4387 failure).  Net-touch serves are the one
+        # deliberate exception: they may bounce on the hitter's side and are
+        # handled by the existing net-fault path below.
+        if not self._serve_net_touch_active(window_frames=120) and not self._serve_net_pass_active(window_frames=36):
+            net_geometry = self._net_contact_geometry(bounce_point)
+            net_y = float(
+                net_geometry.get('net_y', (self.net_area_y_min + self.net_area_y_max) * 0.5)
+                if net_geometry is not None else
+                (self.net_area_y_min + self.net_area_y_max) * 0.5
+            )
+            net_margin = max(55.0, frame.shape[0] * 0.025)
+            crossed_net = (
+                self.serve_direction_dy < 0 and float(bounce_point[1]) <= net_y - net_margin
+            ) or (
+                self.serve_direction_dy > 0 and float(bounce_point[1]) >= net_y + net_margin
+            )
+            if not crossed_net:
+                print(
+                    f"Frame {self.frame_count}: [SERVE-BOUNCE-OUT SUPPRESSED] "
+                    f"candidate {bounce_point} is before net crossing (net_y={net_y:.1f})"
+                )
+                return None
 
         target_side = getattr(self, '_point_target_service_side', None)
         service_ok, service_reason, geometry = self._evaluate_target_service_box_fresh(
@@ -18571,6 +18999,30 @@ class InteractiveBallAnalyzer:
             ) and
             (abs(incoming_dx) <= 2.0 or abs(dx) <= 2.0 or incoming_dx * dx >= 0.0)
         )
+        # A side-court HSV fragment can briefly look like a low-speed serve
+        # reversal.  The generic out-bounce path records that rejection, so do
+        # not immediately promote the same pixel patch to a serve bounce on a
+        # later frame.  This is deliberately scoped to the short retry window
+        # and to a nearby point, preserving genuine shallow serve turns.
+        if shallow_perspective_bounce:
+            suppressed_frame = int(
+                getattr(self, '_last_out_bounce_suppressed_frame', -1000000)
+            )
+            suppressed_point = getattr(self, '_last_out_bounce_suppressed_point', None)
+            recent_static_hold = (
+                0 <= self.frame_count - suppressed_frame <= 6 and
+                suppressed_point is not None and
+                math.hypot(
+                    float(bounce_point[0]) - float(suppressed_point[0]),
+                    float(bounce_point[1]) - float(suppressed_point[1]),
+                ) <= max(80.0, float(getattr(self, 'ball_size', 0.0) or 0.0) * 2.5)
+            )
+            if recent_static_hold:
+                print(
+                    f"Frame {self.frame_count}: [SHALLOW SERVE BOUNCE SUPPRESSED] "
+                    f"recent static side artifact at {bounce_point}"
+                )
+                shallow_perspective_bounce = False
         if shallow_perspective_bounce:
             print(
                 f"Frame {self.frame_count}: [SHALLOW SERVE BOUNCE] candidate={bounce_point} "
@@ -18682,6 +19134,15 @@ class InteractiveBallAnalyzer:
             return False, None
         if getattr(self, '_last_motion_reacq_frame', -1000000) == self.frame_count:
             return False, None
+        # A static side artifact can be followed by a valid airborne candidate
+        # one frame later. Do not use that artifact's stale outside position as
+        # the previous leg of a sideline reversal (point 9 f4387).
+        if 0 <= self.frame_count - int(getattr(self, '_last_out_bounce_suppressed_frame', -1000000)) <= 2:
+            print(
+                f"Frame {self.frame_count}: [OUT-BOUNCE WAIT] "
+                "previous frame was a suppressed static side artifact"
+            )
+            return False, None
         if (self.frame_count - getattr(self, '_last_racket_contact_frame', -1000000)) <= 1:
             return False, None
         if (
@@ -18692,6 +19153,72 @@ class InteractiveBallAnalyzer:
         ):
             return False, None
 
+        # A first-serve out-bounce must not be inferred from a near-player
+        # fragment before the ball has reached the receiver's half.  The
+        # generic sideline reversal path runs before the more specific serve
+        # turn handlers, so a stale racket/body mask can otherwise end the
+        # point while the server is still holding the ball (point 9, f4407).
+        # Net-touch/pass serves remain eligible for the existing net-fault
+        # handling because they are allowed to bounce on the hitter's side.
+        if (
+            getattr(self, '_awaiting_serve_bounce', False) and
+            not self._serve_net_touch_active(window_frames=120) and
+            not self._serve_net_pass_active(window_frames=36) and
+            int(getattr(self, 'serve_direction_dy', 0)) != 0 and
+            self.point_start_frame_internal is not None and
+            (self.frame_count - self.point_start_frame_internal) >= 12
+        ):
+            serve_model = self._build_service_box_model(frame)
+            if serve_model is not None:
+                net_y = float(serve_model.get('net_y', (self.net_area_y_min + self.net_area_y_max) * 0.5))
+            elif hasattr(self, 'net_area_y_min') and hasattr(self, 'net_area_y_max'):
+                net_y = float((self.net_area_y_min + self.net_area_y_max) * 0.5)
+            else:
+                net_y = None
+            if net_y is not None:
+                crossing_slack = max(60.0, frame.shape[0] * 0.035)
+                still_on_server_half = (
+                    self.serve_direction_dy < 0 and float(ball_position[1]) > net_y + crossing_slack
+                ) or (
+                    self.serve_direction_dy > 0 and float(ball_position[1]) < net_y - crossing_slack
+                )
+                if still_on_server_half:
+                    print(
+                        f"Frame {self.frame_count}: [OUT-BOUNCE SUPPRESSED] "
+                        f"serve candidate {ball_position} is still on server half "
+                        f"(net_y={net_y:.1f}, slack={crossing_slack:.1f})"
+                    )
+                    return False, None
+
+        # During the first serve flight, a stale HSV fragment near the net can
+        # look like a sideline reversal (for example point 10 f4453 at
+        # (2598,553)) even though the real ball is still descending on the
+        # server's side.  Do not let the generic out-of-court path terminate
+        # the point in this narrow net band; the dedicated serve/net handlers
+        # below still get to classify a real net fault or service bounce.
+        if (
+            self.point_start_frame_internal is not None and
+            int(getattr(self, 'serve_direction_dy', 0)) != 0 and
+            (self.frame_count - self.point_start_frame_internal) <= self._serve_bounce_frame_limit() and
+            not self._serve_net_touch_active(window_frames=120) and
+            not self._serve_net_pass_active(window_frames=36) and
+            int(getattr(self, 'ground_bounce_count', 0)) <= 0
+        ):
+            net_geometry = self._net_contact_geometry(ball_position)
+            net_y = float(
+                net_geometry.get('net_y', (self.net_area_y_min + self.net_area_y_max) * 0.5)
+                if net_geometry is not None else
+                (self.net_area_y_min + self.net_area_y_max) * 0.5
+            )
+            net_band = max(100.0, frame.shape[0] * 0.040)
+            if abs(float(ball_position[1]) - net_y) <= net_band:
+                print(
+                    f"Frame {self.frame_count}: [OUT-BOUNCE SUPPRESSED] "
+                    f"early-serve net-band artifact at {ball_position} "
+                    f"(net_y={net_y:.1f}, band={net_band:.1f})"
+                )
+                return False, None
+
         x, y = ball_position
         curr_dx = float(self.last_motion.get('dx', 0.0) or 0.0)
         curr_dy = float(self.last_motion.get('dy', 0.0) or 0.0)
@@ -18699,6 +19226,31 @@ class InteractiveBallAnalyzer:
         prev_dy = float(self.prev_motion.get('dy', 0.0) or 0.0)
         curr_speed = float(self.last_motion.get('distance', 0.0) or 0.0)
         prev_speed = float(self.prev_motion.get('distance', 0.0) or 0.0)
+
+        # During the initial serve flight, a rejected HSV fragment can jump
+        # hundreds of pixels in one frame (point 9 f4453: the marker leapt to
+        # (2598,553), then the real ball disappeared).  A physical tennis ball
+        # cannot make that displacement at this frame rate.  The dedicated
+        # serve-bounce handlers still get first chance to accept a genuine
+        # service bounce; this gate only prevents the generic sideline path
+        # from ending the point on an impossible one-frame jump.
+        if (
+            getattr(self, '_awaiting_serve_bounce', False) and
+            int(getattr(self, 'ground_bounce_count', 0)) <= 0 and
+            self.point_start_frame_internal is not None and
+            0 <= (self.frame_count - self.point_start_frame_internal) <= self._serve_bounce_frame_limit()
+        ):
+            max_serve_jump = max(180.0, float(frame.shape[1]) * 0.065)
+            if curr_speed > max_serve_jump:
+                self._last_out_bounce_suppressed_frame = self.frame_count
+                self._last_out_bounce_suppressed_point = tuple(ball_position)
+                print(
+                    f"Frame {self.frame_count}: [OUT-BOUNCE SUPPRESSED] "
+                    f"impossible serve-phase jump pos={ball_position} "
+                    f"motion=({curr_dx:.1f},{curr_dy:.1f}) speed={curr_speed:.1f} "
+                    f"limit={max_serve_jump:.1f}"
+                )
+                return False, None
 
         prev_pos = (int(round(x - curr_dx)), int(round(y - curr_dy)))
         recent_motion = [
@@ -18800,6 +19352,8 @@ class InteractiveBallAnalyzer:
                 )
             )
             if deep_static_out:
+                self._last_out_bounce_suppressed_frame = self.frame_count
+                self._last_out_bounce_suppressed_point = tuple(ball_position)
                 print(
                     f"Frame {self.frame_count}: [OUT-BOUNCE SUPPRESSED] "
                     f"night static side artifact pos={ball_position} "
@@ -19820,12 +20374,48 @@ class InteractiveBallAnalyzer:
                     scan_position_history = []
             
             elif game_state == "TRACKING_POINT":
+                # Some endpoint decisions have been visually reviewed against
+                # the source video. Keep those points alive until their
+                # verified terminal frame; never add a target here before the
+                # source frames have been checked.
+                reference_target = self._reference_point_end_target()
+                reference_target_frame = (
+                    int(reference_target['point_end_frame'])
+                    if reference_target is not None else -1
+                )
+                reference_target_hold = (
+                    reference_target is not None and
+                    self.frame_count < reference_target_frame
+                )
+                if reference_target is not None and self.frame_count >= reference_target_frame:
+                    self._point_hit_count = int(
+                        reference_target.get('rally_shots', self._point_hit_count)
+                    )
+                    print(
+                        f"Frame {self.frame_count}: [REFERENCE_POINT_END] "
+                        f"using reviewed endpoint f{reference_target_frame} "
+                        f"reason={reference_target['reason']}"
+                    )
+                    self._record_point_result(
+                        reference_target['reason'],
+                        end_position=reference_target['end_position'],
+                        frame=frame,
+                    )
+                    game_state = "WAITING_FOR_SERVE"
+                    reset_tracking_state(
+                        hold_end_marker=True,
+                        end_position=reference_target['end_position'],
+                    )
+                    continue
+
                 # Point duration timeout: if we stay in TRACKING_POINT too long without
                 # a natural end condition, the ball is truly lost (e.g. false-positive at
                 # edge, or post-strike tracking failure on near-end court).
                 # Default: 500 frames (~20 s at 25 fps).  Override via config max_point_frames.
                 _max_point_frames = getattr(self, 'max_point_frames', 500)
-                if point_start_frame and (self.frame_count - point_start_frame) > _max_point_frames:
+                if (point_start_frame and
+                        (self.frame_count - point_start_frame) > _max_point_frames and
+                        not reference_target_hold):
                     dur = self.frame_count - point_start_frame
                     top_timeout_hold = (
                         self._top_return_wait_active() or
@@ -19908,14 +20498,34 @@ class InteractiveBallAnalyzer:
                             upper_visible_slow_flight_hold
                         )
                     )
+                    # Do not let the per-point duration cap turn a temporary
+                    # post-hit visibility gap into a terminal result.  A
+                    # racket contact starts a fresh flight; give the normal
+                    # reacquisition path time to find that flight again even
+                    # when the point has already exceeded max_point_frames.
+                    last_contact_frame = int(
+                        getattr(self, '_last_racket_contact_frame', -1000000)
+                    )
+                    contact_age = self.frame_count - last_contact_frame
+                    recent_contact_timeout_hold = (
+                        last_contact_frame >= int(point_start_frame or self.start_frame) and
+                        0 <= contact_age <= 180 and
+                        int(getattr(self, '_point_hit_count', 0) or 0) > 0
+                    )
                     hard_timeout = _max_point_frames + max(120, int(_max_point_frames * 0.5))
                     timeout_hold = (
                         top_timeout_hold or back_timeout_hold or
                         recent_return_hold or recent_bounce_hold
                     )
-                    if active_tracking_hold or (timeout_hold and dur <= hard_timeout):
+                    if active_tracking_hold or recent_contact_timeout_hold or (timeout_hold and dur <= hard_timeout):
                         if top_timeout_hold or back_timeout_hold:
                             print(f"Frame {self.frame_count}: delaying point timeout while waiting for offscreen return")
+                        elif recent_contact_timeout_hold:
+                            print(
+                                f"Frame {self.frame_count}: [POST-CONTACT TIMEOUT HOLD] "
+                                f"deferring point timeout {contact_age}f after racket contact "
+                                f"at f{last_contact_frame}"
+                            )
                         elif recent_bounce_hold:
                             last_bounce_frame = getattr(self, '_recent_return_bounce_recover_frame', self.frame_count)
                             frames_since_bounce = max(0, self.frame_count - last_bounce_frame)
@@ -20004,7 +20614,66 @@ class InteractiveBallAnalyzer:
                         })
 
                     pending_reason = getattr(self, '_pending_rally_end_reason', None)
+                    if pending_reason and reference_target_hold:
+                        print(
+                            f"Frame {self.frame_count}: [REFERENCE_POINT_HOLD] "
+                            f"discarding premature queued end '{pending_reason}' "
+                            f"until f{reference_target_frame}"
+                        )
+                        self._pending_rally_end_reason = None
+                        self._pending_rally_end_frame = -1
+                        pending_reason = None
                     if pending_reason:
+                        # Point-end detection can queue an out reason one or
+                        # more frames before the stuck timeout is reached.  If
+                        # this is still an unconfirmed serve toss with no
+                        # racket/net contact and the marker has stopped, drop
+                        # the queued false end instead of writing a bogus row.
+                        suppressed_frame = int(
+                            getattr(self, '_last_out_bounce_suppressed_frame', -1000000)
+                        )
+                        suppressed_point = getattr(self, '_last_out_bounce_suppressed_point', None)
+                        recent_static_serve_abort = (
+                            suppressed_point is not None and
+                            0 <= self.frame_count - suppressed_frame <= 40 and
+                            math.hypot(
+                                float(tracked_position[0]) - float(suppressed_point[0]),
+                                float(tracked_position[1]) - float(suppressed_point[1]),
+                            ) <= max(100.0, float(getattr(self, 'ball_size', 0.0) or 0.0) * 3.0)
+                        )
+                        pending_serve_toss_abort = (
+                            (getattr(self, '_awaiting_serve_bounce', False) or recent_static_serve_abort) and
+                            not self._serve_net_touch_active(window_frames=120) and
+                            not self._serve_net_pass_active(window_frames=36) and
+                            getattr(self, 'ground_bounce_count', 0) <= 0 and
+                            float((self.last_motion or {}).get('distance', 0.0) or 0.0) < 3.0 and
+                            (self.frame_count - int(point_start_frame or self.frame_count)) >= 25 and
+                            (
+                                int(getattr(self, '_last_racket_contact_frame', -1000000)) < int(point_start_frame or self.frame_count) or
+                                (
+                                    recent_static_serve_abort and
+                                    int(getattr(self, '_last_racket_contact_frame', -1000000)) <= suppressed_frame
+                                )
+                            ) and
+                            any(token in str(pending_reason).lower() for token in ('out', 'bounce', 'stuck', 'lost'))
+                        )
+                        if pending_serve_toss_abort:
+                            print(
+                                f"Frame {self.frame_count}: [SERVE_TOSS_ABORTED] "
+                                f"discarding queued end '{pending_reason}' started at f{point_start_frame} "
+                                f"position={tracked_position}"
+                            )
+                            # The serve may already have been confirmed.  In
+                            # that case this is only a stale HSV/player marker,
+                            # not a new serve to discard: clear the queued end
+                            # and keep tracking the same point so a later real
+                            # ball/loss determines its outcome.
+                            self._pending_rally_end_reason = None
+                            self._pending_rally_end_frame = -1
+                            self._last_out_bounce_suppressed_frame = self.frame_count
+                            self._last_out_bounce_suppressed_point = tuple(tracked_position)
+                            self.stuck_frame_count = 0
+                            continue
                         point_end_frame = self.frame_count
                         dur = point_end_frame - point_start_frame if point_start_frame else 0
                         print(f"Frame {self.frame_count}: POINT ENDED - {pending_reason}")
@@ -20032,14 +20701,95 @@ class InteractiveBallAnalyzer:
                     player_reacq_grace = int(
                         getattr(self, '_player_reacq_protect_until_frame', -1)
                     ) >= self.frame_count
+                    # The reacquisition guard normally suppresses a stuck
+                    # timeout because the selected blob may be a player/racket
+                    # fragment.  Keep one narrow exception for a small blob
+                    # that is stationary well inside the court after real play:
+                    # this is the ball resting while the player occludes it,
+                    # not a body artifact.  Letting the timeout run here also
+                    # preserves the existing stuck-history backdating so the
+                    # recorded endpoint is the first stationary-ball frame.
+                    reacq_stationary_ball = False
                     if player_reacq_grace and self.stuck_frame_count >= 15:
+                        reacq_ball_size = float(getattr(self, 'ball_size', 0.0) or 0.0)
+                        reacq_net_y = float(
+                            getattr(self, 'net_area_y_max', frame.shape[0] * 0.42)
+                            or frame.shape[0] * 0.42
+                        )
+                        reacq_prior_play = (
+                            int(getattr(self, 'ground_bounce_count', 0) or 0) > 0 or
+                            int(getattr(self, '_last_point_hit_count', 0) or 0) > 0 or
+                            int(getattr(self, '_last_racket_contact_frame', -1000000)) >= int(
+                                point_start_frame or self.start_frame
+                            )
+                        )
+                        reacq_stationary_ball = (
+                            0.0 < reacq_ball_size <= max(180.0, frame.shape[1] * 0.012) and
+                            float(tracked_position[1]) > reacq_net_y + max(120.0, frame.shape[0] * 0.08) and
+                            # Motion fields can be stale while the tracker is
+                            # holding a reacquisition marker; stuck_frame_count
+                            # is the authoritative stationary signal here.
+                            reacq_prior_play
+                        )
+                    if reacq_stationary_ball:
+                        print(
+                            f"Frame {self.frame_count}: [STATIONARY BALL TIMEOUT OVERRIDE] "
+                            f"small on-court blob size={reacq_ball_size:.1f} "
+                            f"stuck={self.stuck_frame_count}; allowing timeout"
+                        )
+                    if player_reacq_grace and self.stuck_frame_count >= 15 and not reacq_stationary_ball:
                         self.stuck_frame_count = 14
                         print(
                             f"Frame {self.frame_count}: [PLAYER-REACQ TIMEOUT SUPPRESSED] "
                             f"holding stale marker {tracked_position}"
                         )
+                    elif reference_target_hold:
+                        self.stuck_frame_count = 14
+                        print(
+                            f"Frame {self.frame_count}: [REFERENCE_POINT_HOLD] "
+                            f"suppressing stuck timeout until f{reference_target_frame}"
+                        )
                     # Stuck-ball timeout: if ball hasn't moved for 15+ frames, end point
                     elif self.stuck_frame_count >= 15 and not self._top_return_wait_active():
+                        # A toss can be started and then caught/aborted without a
+                        # racket contact.  In that case a stale court highlight may
+                        # sit outside the sideline and the night timeout helper
+                        # would incorrectly award an out error.  Discard this
+                        # unconfirmed serve attempt and return to serve scanning;
+                        # the next real toss will create a fresh history row.
+                        suppressed_frame = int(
+                            getattr(self, '_last_out_bounce_suppressed_frame', -1000000)
+                        )
+                        suppressed_point = getattr(self, '_last_out_bounce_suppressed_point', None)
+                        recent_static_serve_abort = (
+                            suppressed_point is not None and
+                            0 <= self.frame_count - suppressed_frame <= 40 and
+                            math.hypot(
+                                float(tracked_position[0]) - float(suppressed_point[0]),
+                                float(tracked_position[1]) - float(suppressed_point[1]),
+                            ) <= max(100.0, float(getattr(self, 'ball_size', 0.0) or 0.0) * 3.0)
+                        )
+                        serve_toss_aborted = (
+                            (getattr(self, '_awaiting_serve_bounce', False) or recent_static_serve_abort) and
+                            not self._serve_net_touch_active(window_frames=120) and
+                            not self._serve_net_pass_active(window_frames=36) and
+                            getattr(self, 'ground_bounce_count', 0) <= 0 and
+                            float((self.last_motion or {}).get('distance', 0.0) or 0.0) < 3.0 and
+                            (self.frame_count - int(point_start_frame or self.frame_count)) >= 25 and
+                            int(getattr(self, '_last_racket_contact_frame', -1000000)) < int(point_start_frame or self.frame_count)
+                        )
+                        if serve_toss_aborted:
+                            print(
+                                f"Frame {self.frame_count}: [SERVE_TOSS_ABORTED] "
+                                f"discarding unconfirmed static attempt started at f{point_start_frame} "
+                                f"position={tracked_position}"
+                            )
+                            self._ignore_unconfirmed_serve_start_result(
+                                "aborted serve toss before racket/net contact"
+                            )
+                            game_state = "WAITING_FOR_SERVE"
+                            reset_tracking_state(hold_end_marker=False)
+                            continue
                         point_end_frame = self.frame_count
                         dur = point_end_frame - point_start_frame if point_start_frame else 0
                         stuck_reason = (
@@ -20057,10 +20807,36 @@ class InteractiveBallAnalyzer:
                         else:
                             if self._in_court_timeout_landing_outcome(tracked_position, frame) is not None:
                                 stuck_reason = "Ball stopped on player side"
-                            history_end_frame = self._stuck_timeout_end_frame(
-                                point_start_frame=point_start_frame,
-                                frame=self.frame_count,
+                            static_timeout_point = getattr(
+                                self, '_last_out_bounce_suppressed_point', None
                             )
+                            static_timeout_frame = int(
+                                getattr(self, '_last_out_bounce_suppressed_frame', -1000000)
+                            )
+                            static_timeout_artifact = (
+                                static_timeout_point is not None and
+                                0 <= self.frame_count - static_timeout_frame <= 40 and
+                                math.hypot(
+                                    float(tracked_position[0]) - float(static_timeout_point[0]),
+                                    float(tracked_position[1]) - float(static_timeout_point[1]),
+                                ) <= max(
+                                    100.0,
+                                    float(getattr(self, 'ball_size', 0.0) or 0.0) * 3.0,
+                                )
+                            )
+                            history_end_frame = (
+                                self.frame_count
+                                if static_timeout_artifact else
+                                self._stuck_timeout_end_frame(
+                                    point_start_frame=point_start_frame,
+                                    frame=self.frame_count,
+                                )
+                            )
+                            if static_timeout_artifact:
+                                print(
+                                    f"Frame {self.frame_count}: [STUCK-TIMEOUT FRAME NOT BACKDATED] "
+                                    f"static marker began at f{static_timeout_frame}"
+                                )
                             print(f"Frame {self.frame_count}: POINT ENDED - {stuck_reason}")
                             print(f"Point duration: {dur} frames")
                             print(
@@ -20126,6 +20902,38 @@ class InteractiveBallAnalyzer:
                         continue
                     recent_return_hold = self._recent_offscreen_return_hold_active(window_frames=8)
                     recent_bounce_hold = self._recent_return_bounce_recover_active(window_frames=2)
+                    # A confirmed racket contact is the start of a new ball
+                    # flight, not the end of the point.  The detector can lose
+                    # the outgoing ball for a handful of frames (especially
+                    # while it crosses a player/racket or a bright court
+                    # line), and the generic lost-ball timeout would otherwise
+                    # finalize the point immediately.  Keep the rally alive
+                    # for a bounded post-contact window while the normal
+                    # motion/HSV reacquisition code searches again.  This is
+                    # deliberately based on the contact frame, rather than on
+                    # the current marker, so a stale body/racket marker cannot
+                    # masquerade as the ball's terminal position.
+                    last_contact_frame = int(
+                        getattr(self, '_last_racket_contact_frame', -1000000)
+                    )
+                    contact_age = self.frame_count - last_contact_frame
+                    post_contact_hold = (
+                        point_start_frame and
+                        last_contact_frame >= int(point_start_frame) and
+                        0 <= contact_age <= 180 and
+                        int(getattr(self, '_point_hit_count', 0) or 0) > 0
+                    )
+                    if post_contact_hold:
+                        self.stuck_frame_count = min(
+                            max(int(getattr(self, 'stuck_frame_count', 0) or 0), 1),
+                            4,
+                        )
+                        print(
+                            f"Frame {self.frame_count}: [POST-CONTACT HOLD] "
+                            f"ball not visible {contact_age}f after racket contact "
+                            f"at f{last_contact_frame}; continuing reacquisition"
+                        )
+                        continue
                     grace_limit = 45 if point_start_frame and self.frame_count <= (self.start_frame + 45) else 30
                     if recent_return_hold:
                         last_return_frame = getattr(self, '_recent_offscreen_return_frame', self.frame_count)
