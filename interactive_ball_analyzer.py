@@ -2,6 +2,7 @@ import argparse
 import contextlib
 import csv
 import os
+import sys
 os.environ.setdefault("OPENCV_FFMPEG_LOGLEVEL", "-8")
 import cv2
 import numpy as np
@@ -93,6 +94,54 @@ def suppress_native_stderr():
         yield
     finally:
         _restore_native_stderr(state)
+
+
+class _QuietTrackerOutput:
+    """Drop contour-by-contour diagnostics while preserving audit heartbeats.
+
+    Headless regressions need ``[TRACK]`` and point-end lines to update their
+    progress/audit reports.  Sending every HSV contour rejection through a
+    pipe, however, can create multi-megabyte logs and make a single frame take
+    minutes.  This lightweight stream filter is used by ``--quiet``: tracker
+    behaviour stays identical, but only the lines needed for progress and
+    endpoint diagnosis are forwarded.
+    """
+
+    def __init__(self, target):
+        self._target = target
+        self._buffer = ""
+
+    @staticmethod
+    def _keep(line):
+        text = line.strip()
+        return (
+            text.startswith("Frame ") or
+            text.startswith("[TRACK]") or
+            text.startswith("[POINT_END]") or
+            text.startswith("[TRACKING_START]") or
+            text.startswith("[BALL_LOST]") or
+            text.startswith("[BALL_LOSS_DIAGNOSTIC]") or
+            text.startswith("[JUMP_REJECTED]") or
+            text.startswith("[POINT_IGNORED]") or
+            text.startswith("[MAX_FRAMES]") or
+            text.startswith("[VIDEO_END]") or
+            text.startswith("Analysis complete!")
+        )
+
+    def write(self, text):
+        self._buffer += text
+        while "\n" in self._buffer:
+            line, self._buffer = self._buffer.split("\n", 1)
+            if self._keep(line):
+                self._target.write(line + "\n")
+        return len(text)
+
+    def flush(self):
+        if self._buffer:
+            if self._keep(self._buffer):
+                self._target.write(self._buffer)
+            self._buffer = ""
+        self._target.flush()
 
 
 class InteractiveBallAnalyzer:
@@ -3675,6 +3724,25 @@ class InteractiveBallAnalyzer:
         if gray_frame.shape[:2] != prev_gray.shape[:2]:
             return None
 
+        # This helper is called for every HSV contour.  A bright/noisy night
+        # frame can produce hundreds of contours, so repeatedly calculating
+        # ``absdiff`` for each tiny patch made one video frame take minutes.
+        # The difference image is identical for every candidate in the same
+        # tracker frame; cache it and only slice the already-computed result.
+        cache_frame = getattr(self, '_motion_metrics_cache_frame', None)
+        if cache_frame != self.frame_count:
+            self._motion_metrics_cache_frame = self.frame_count
+            self._motion_metrics_cache = {}
+            self._motion_metrics_diff = cv2.absdiff(prev_gray, gray_frame)
+        cache = getattr(self, '_motion_metrics_cache', None)
+        if cache is None:
+            cache = {}
+            self._motion_metrics_cache = cache
+        key = (int(cx), int(cy), int(radius))
+        cached = cache.get(key)
+        if cached is not None:
+            return cached
+
         x1 = max(0, cx - radius)
         y1 = max(0, cy - radius)
         x2 = min(gray_frame.shape[1], cx + radius + 1)
@@ -3682,16 +3750,16 @@ class InteractiveBallAnalyzer:
         if x2 <= x1 or y2 <= y1:
             return None
 
-        curr_patch = gray_frame[y1:y2, x1:x2]
-        prev_patch = prev_gray[y1:y2, x1:x2]
-        if curr_patch.size == 0 or prev_patch.shape != curr_patch.shape:
+        diff_patch = self._motion_metrics_diff[y1:y2, x1:x2]
+        if diff_patch.size == 0:
             return None
 
-        diff = cv2.absdiff(prev_patch, curr_patch)
-        return {
-            'mean': float(np.mean(diff)),
-            'max': float(np.max(diff)),
+        result = {
+            'mean': float(np.mean(diff_patch)),
+            'max': float(np.max(diff_patch)),
         }
+        cache[key] = result
+        return result
 
     def _night_static_side_artifact(self, pos, area, motion_mean, motion_max, frame_shape):
         if not self._is_night_session_config() or frame_shape is None:
@@ -3739,6 +3807,14 @@ class InteractiveBallAnalyzer:
             return None
 
         frame_height, frame_width = frame.shape[:2]
+        player_reacq_active = int(
+            getattr(self, '_player_reacq_protect_until_frame', -1)
+        ) >= self.frame_count
+        # A close, motion-blurred post-hit ball can occupy 400-500 contour
+        # pixels (f103 is ~430px).  Keep the normal night recovery cap tight,
+        # but permit that larger compact blob only while recovering from a
+        # known player occlusion.
+        area_cap = 650.0 if player_reacq_active else 340.0
         hsv_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         mask = cv2.inRange(
             hsv_frame,
@@ -3752,13 +3828,14 @@ class InteractiveBallAnalyzer:
         candidates = []
         for contour in contours:
             area = cv2.contourArea(contour)
-            if area < 18.0 or area > 340.0:
+            if area < 18.0 or area > area_cap:
                 continue
             moments = cv2.moments(contour)
             if moments["m00"] == 0:
                 continue
             cx = int(moments["m10"] / moments["m00"])
             cy = int(moments["m01"] / moments["m00"])
+            _, _, contour_width, contour_height = cv2.boundingRect(contour)
 
             if cy < max(150, int(frame_height * 0.07)) or cy > int(frame_height * 0.78):
                 continue
@@ -3770,9 +3847,43 @@ class InteractiveBallAnalyzer:
             motion_metrics = self._candidate_motion_metrics(frame_gray, cx, cy)
             motion_mean = motion_metrics['mean'] if motion_metrics is not None else 0.0
             motion_max = motion_metrics['max'] if motion_metrics is not None else 0.0
+            player_zone = self._player_point_zone((cx, cy))
+            upward_progress = (
+                float(self.ball_center[1] - cy)
+                if self.ball_center is not None else 0.0
+            )
+            near_player_launch = (
+                player_reacq_active and
+                self.ball_center is not None and
+                # The first visible post-contact frame can still be low in
+                # the player box, while each following frame is already above
+                # that box.  Keep recognizing the same launch by its compact,
+                # local, upward step instead of requiring the stale marker to
+                # remain in the bottom 40% of the image.  The lower 60 px
+                # bound admits the real f103-f105 flight; the lateral and
+                # upper-distance bounds still reject the distant player/net
+                # artifacts that originally caused the false endpoint.
+                upward_progress >= max(60.0, frame_height * 0.025) and
+                upward_progress <= max(650.0, frame_height * 0.30) and
+                abs(cx - self.ball_center[0]) <= max(450.0, frame_width * 0.12) and
+                max(contour_width, contour_height) <=
+                max(3.0, min(contour_width, contour_height) * 2.6)
+            )
+            if player_zone in (
+                    'player_head_hat', 'player_body', 'player_shoes', 'racket_fragment'):
+                # The recovery window deliberately accepts a larger ball, so
+                # compensate by refusing player pixels unless their local
+                # frame difference is unequivocally dynamic.  The exception
+                # is a compact blob launching sharply upward from a known
+                # near-player contact; frame differencing can read zero here
+                # because the preceding motion pass refreshes its reference.
+                if ((motion_mean < 16.0 or motion_max < 70.0) and
+                        not near_player_launch):
+                    continue
             if motion_max < 35.0 and motion_mean < 6.0 and area < 95.0:
                 continue
-            if self.ball_center is not None and motion_max < 12.0 and motion_mean < 3.5:
+            if (self.ball_center is not None and motion_max < 12.0 and motion_mean < 3.5 and
+                    not near_player_launch):
                 prev_dist = math.hypot(cx - self.ball_center[0], cy - self.ball_center[1])
                 last_dist = (
                     float(self.last_motion.get('distance', 0.0) or 0.0)
@@ -3789,7 +3900,8 @@ class InteractiveBallAnalyzer:
                     continue
 
             frame0_hotspot = self._find_frame0_background_hotspot((cx, cy))
-            if frame0_hotspot is not None and motion_mean < 12.0 and motion_max < 55.0:
+            if (frame0_hotspot is not None and motion_mean < 12.0 and motion_max < 55.0 and
+                    not near_player_launch):
                 continue
 
             local_hsv = hsv_frame[cy, cx]
@@ -3802,6 +3914,12 @@ class InteractiveBallAnalyzer:
                 min(90.0, motion_max * 0.24) -
                 min(55.0, motion_mean * 0.9)
             )
+            if near_player_launch:
+                # At a near-player return, distinguish the outgoing ball from
+                # the residual contact smear by how far it has launched away
+                # from the racket.  This makes the real f103 ball at y~1053
+                # beat the nearer smear at y~1229.
+                score -= min(120.0, upward_progress * 0.35)
             candidates.append((score, -area, {
                 'pos': (cx, cy),
                 'area': area,
@@ -3815,6 +3933,526 @@ class InteractiveBallAnalyzer:
 
         _, _, chosen = min(candidates, key=lambda item: (item[0], item[1]))
         return chosen
+
+    def _find_night_startup_regular_candidate(self, frame, frame_gray=None):
+        """Recover a visible ball during a bounded night-camera flight.
+
+        The night camera's narrow pre-focus mask can miss the ball for a few
+        frames while the regular mask still sees it.  The generic full-frame
+        motion fallback is unsafe here: it can select a yellow player/racket
+        patch.  Search the regular (and the two known ball-friendly masks)
+        directly, anchored to the previous ball position.  The ball becomes
+        only a handful of pixels when it is far from the camera, so this path
+        must allow small contours while still requiring continuity.
+        """
+        if not self._is_night_session_config() or frame is None or self.ball_center is None:
+            return None
+        # Keep this bounded to a real flight, not to the beginning of the
+        # *video*.  The old limit was ``video_start + 96``.  In the first
+        # night rally P1 hits at f103, then the visible ball crosses the net
+        # through f113-f130; the fallback was already disabled and the stale
+        # marker at f112 was held instead.  Start a new short continuity
+        # window after every verified racket contact, while retaining the
+        # point-start window for the opening serve.
+        point_anchor = int(
+            getattr(self, 'point_start_frame_internal', None)
+            or getattr(self, 'start_frame', 0)
+            or 0
+        )
+        flight_anchor = point_anchor
+        last_contact = int(getattr(self, '_last_racket_contact_frame', -1) or -1)
+        if last_contact >= flight_anchor:
+            flight_anchor = last_contact
+        # The first cross-court return can still be in flight after the
+        # opening 96-frame serve window but before contact metadata becomes
+        # reliable.  Keep the same strict contour/trajectory checks for that
+        # short opening-rally extension, rather than falling back to a stale
+        # point near the net (night frames 120+).  The same opening return
+        # continues into the far half through roughly f220 in this camera;
+        # stopping at +180 cut off a still-continuous ball at f203 and caused
+        # a later jump to wall/static noise.  This only widens the time
+        # window: the contour, motion, and player-exclusion gates below still
+        # decide whether a candidate is accepted.
+        frame_height, frame_width = frame.shape[:2]
+        startup_limit = max(point_anchor + 240, flight_anchor + 96)
+        # A point can contain a second, fully visible cross-court flight well
+        # after the opening serve window.  At f269 in the first night rally
+        # the ball is still a compact regular-mask contour only 29 px from
+        # f268, yet the fixed +240 frame limit disables this local search and
+        # the generic full-frame motion pass jumps to static noise at
+        # (901, 639).  Permit a bounded extension only when the *previous*
+        # accepted ball is already in a coherent in-court flight.  This is
+        # not a broad late-point search: every candidate below must still
+        # pass the small jump, compact-shape, motion, and player-exclusion
+        # checks, so it naturally ends when that physical chain disappears.
+        continuity_extension = (
+            self.ball_center is not None and
+            self.last_motion is not None and
+            point_anchor + 240 < self.frame_count <= point_anchor + 360 and
+            8.0 <= float(self.last_motion.get('distance', 0.0) or 0.0) <= 120.0 and
+            int(frame_width * 0.20) <= self.ball_center[0] <= int(frame_width * 0.80) and
+            int(frame_height * 0.07) <= self.ball_center[1] <= int(frame_height * 0.72)
+        )
+        if self.frame_count > startup_limit and not continuity_extension:
+            return None
+        previous_size = float(self.ball_size or 0.0)
+        # At the far-player contact the real ball can compress to a 6-7 px
+        # regular-mask contour for one frame.  Treating every contour below
+        # 8 px as unusable disables this continuity search exactly when the
+        # ball leaves the racket (night f69), after which the generic recovery
+        # holds the player's body until f85.  The contour loop below still
+        # requires at least 6 px plus motion/shape continuity, so a 4 px state
+        # gate preserves the real contact without admitting isolated pixels.
+        if previous_size < 4.0:
+            return None
+
+        previous = self.ball_center
+        last_distance = float((self.last_motion or {}).get('distance', 0.0) or 0.0)
+        last_dx = float((self.last_motion or {}).get('dx', 0.0) or 0.0)
+        startup_last_dy = float((self.last_motion or {}).get('dy', 0.0) or 0.0)
+        last_dy = startup_last_dy
+        # A fast upward ball cannot become a nearby static yellow blob on the
+        # next frame.  In the first night rally this caused f184 to hold
+        # (898, 823), instead of following the visible flight from f183
+        # (891, 820) towards (951, 726).  This deliberately applies only to
+        # an unambiguous upward flight, so ground bounces and racket contact
+        # are free to change direction.
+        # The ball decelerates as it rises toward the far court.  It can
+        # therefore make a still-clear upward step of roughly 75 px after a
+        # previous 90+ px step (night f187 -> f188).  Keep this as a
+        # *sustained upward* test rather than requiring another 90 px step:
+        # otherwise the 130 px local window rejects the real ball 138 px
+        # ahead and a nearby static court blob takes over.
+        fast_upward_flight = (
+            last_distance >= 60.0 and
+            math.hypot(last_dx, last_dy) >= 60.0 and
+            last_dy <= -50.0
+        )
+        # At the top of a normal arc the ball decelerates: f189 -> f190 is
+        # only about (42, -46), and the later steps are smaller again.  It is
+        # still a valid upward/right flight, not permission to select an
+        # almost stationary court feature.  This narrower continuation stays
+        # out of the lower court and requires both forward components.
+        decelerating_upper_flight = (
+            previous[1] <= int(frame_height * 0.30) and
+            last_distance >= 20.0 and
+            last_dx >= 8.0 and
+            last_dy <= -8.0
+        )
+        upward_flight_continuation = fast_upward_flight or decelerating_upper_flight
+        # The lower player is positioned left of the ordinary flight lane in
+        # this camera.  Retain a small, trajectory-gated extension of the
+        # regular-mask search there only while a large ball is descending
+        # toward that player.  The old 22%-of-width floor excluded the real
+        # contact ball at x=560 (f178), so the relaxed HSV fallback later
+        # substituted a shoe/body contour at x=1151.
+        lower_contact_flight = (
+            previous[1] >= int(frame_height * 0.60) and
+            startup_last_dy >= max(45.0, frame_height * 0.020) and
+            last_distance >= 45.0 and
+            previous_size >= 120.0
+        )
+        jump_cap = max(220.0, min(420.0, last_distance * 3.0 + 90.0))
+        hsv_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        specs = []
+        if self.hsv_regular is not None:
+            specs.append(('regular', self.hsv_regular['lower'], self.hsv_regular['upper']))
+        if self.h10_hsv_lower is not None and self.h10_hsv_upper is not None:
+            specs.append(('h_10', self.h10_hsv_lower, self.h10_hsv_upper))
+        if self.s30_hsv_lower is not None and self.s30_hsv_upper is not None:
+            specs.append(('s_30', self.s30_hsv_lower, self.s30_hsv_upper))
+        if not specs:
+            return None
+
+        kernel = np.ones((2, 2), np.uint8)
+        candidates = []
+        for source, lower, upper in specs:
+            mask = cv2.inRange(hsv_frame, lower, upper)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            for contour in contours:
+                area = float(cv2.contourArea(contour))
+                # Perspective and compression can reduce the visible ball to
+                # 6-10 contour pixels.  A relative floor preserves it without
+                # admitting isolated single-pixel noise.
+                if area < max(6.0, previous_size * 0.06) or area > 1800.0:
+                    continue
+                moments = cv2.moments(contour)
+                if moments['m00'] == 0:
+                    continue
+                cx = int(moments['m10'] / moments['m00'])
+                cy = int(moments['m01'] / moments['m00'])
+                # The center net post is yellow in this camera and remains in
+                # every mask as a tall 10-25 x 80-110 px contour.  It is often
+                # closer/larger than the ball exactly as the ball crosses the
+                # net.  A ball blob is compact (even with motion blur), so do
+                # not let a strongly elongated contour win the local-area
+                # tie-break below.
+                _, _, contour_width, contour_height = cv2.boundingRect(contour)
+                if (
+                        contour_height >= max(36, contour_width * 3.0) or
+                        contour_width >= max(36, contour_height * 3.0)
+                ):
+                    continue
+                min_candidate_x = int(frame_width * (0.10 if lower_contact_flight else 0.22))
+                if not (min_candidate_x <= cx <= int(frame_width * 0.90)):
+                    continue
+                # The serve continues into the far upper court; once the ball
+                # rises above the service line it can legitimately be below
+                # 10% of the image height.  Keep the search bounded away from
+                # the timestamp/header area, but do not cut off this flight.
+                if not (int(frame_height * 0.05) <= cy <= int(frame_height * 0.82)):
+                    continue
+                distance = math.hypot(cx - previous[0], cy - previous[1])
+                if distance > jump_cap:
+                    continue
+                player_zone = self._player_point_zone((cx, cy))
+                # The descending ball can briefly overlap the lower player's
+                # arm/racket immediately before a return.  This is not a
+                # generic player-zone exception: it is accepted only for the
+                # calibrated regular mask when the contour is exactly where
+                # the established *descending* trajectory predicts it.  It
+                # preserves the incoming ball at the contact frame (night
+                # f178) so the next frame can search for the upward launch,
+                # rather than replacing it with a player-body blob.
+                predicted_contact = (previous[0] + last_dx, previous[1] + last_dy)
+                contact_prediction_error = math.hypot(
+                    cx - predicted_contact[0], cy - predicted_contact[1]
+                )
+                if upward_flight_continuation and self._player_point_zone((cx, cy)) is None:
+                    step_x = cx - previous[0]
+                    step_y = cy - previous[1]
+                    forward_progress = (
+                        (step_x * last_dx + step_y * last_dy) /
+                        max(last_distance, 1.0)
+                    )
+                    # Permit a modest speed change, but not a blob that sits
+                    # on (or moves backward from) the last confirmed ball.
+                    minimum_forward_progress = (
+                        max(42.0, last_distance * 0.35)
+                        if fast_upward_flight else
+                        max(10.0, last_distance * 0.25)
+                    )
+                    if forward_progress < minimum_forward_progress:
+                        continue
+                lower_player_contact_approach = (
+                    source == 'regular' and
+                    lower_contact_flight and
+                    last_dy >= max(45.0, frame_height * 0.020) and
+                    last_distance >= 45.0 and
+                    distance <= max(115.0, last_distance * 1.70) and
+                    contact_prediction_error <= max(58.0, last_distance * 0.90) and
+                    area >= max(20.0, min(previous_size * 0.25, 120.0)) and
+                    area <= max(850.0, previous_size * 2.50)
+                )
+                if player_zone in (
+                        'player_head_hat', 'player_body', 'player_shoes', 'racket_fragment'):
+                    # During this serve the ball passes directly beside the
+                    # far player's shoes.  A regular-mask, compact contour
+                    # that remains within one frame of the established ball
+                    # trajectory is allowed through; relaxed-mask player
+                    # fragments remain rejected.
+                    if not (
+                            (source == 'regular' and distance <= 65.0) or
+                            lower_player_contact_approach
+                    ):
+                        continue
+                motion = self._candidate_motion_metrics(frame_gray, cx, cy)
+                motion_mean = float(motion.get('mean', 0.0) or 0.0) if motion else 0.0
+                motion_max = float(motion.get('max', 0.0) or 0.0) if motion else 0.0
+                # A compact yellow contour that does not change at all from
+                # the previous frame is a court/net highlight, not the ball.
+                # This is especially important at the net where the post and
+                # line can be closer than the real ball.  Keep candidates with
+                # clear local frame-to-frame change; the ball remains moving
+                # even when its HSV area is only a few pixels.
+                if (
+                        motion is not None and motion_mean < 5.0 and motion_max < 25.0 and
+                        # A genuine ball may have weak frame-difference energy
+                        # when it is only a few pixels wide, but it should
+                        # still be a short step from the last ball position.
+                        # Do not admit a distant static court highlight.
+                        (source != 'regular' or distance > 65.0)
+                ):
+                    continue
+                size_ratio = abs(area - previous_size) / max(previous_size, 1.0)
+                source_penalty = 0.0 if source == 'regular' else 8.0
+                score = distance + min(120.0, size_ratio * 55.0) + source_penalty
+                if lower_player_contact_approach:
+                    # Make the physically predicted contact contour win over
+                    # a similarly coloured racket/body fragment.
+                    score -= min(55.0, max(0.0, 58.0 - contact_prediction_error))
+                candidates.append((score, -area, {
+                    'pos': (cx, cy),
+                    'area': area,
+                    'hsv': hsv_frame[cy, cx],
+                    'motion_mean': motion_mean,
+                    'motion_max': motion_max,
+                    'source': source,
+                    'lower_contact_approach': lower_player_contact_approach,
+                    'recovery_label': (
+                        'NIGHT LOWER CONTACT APPROACH'
+                        if lower_player_contact_approach else
+                        'NIGHT STARTUP REGULAR RECOVER'
+                    ),
+                }))
+        if not candidates:
+            return None
+        # A player/racket mask can produce a second candidate only a few
+        # pixels from the ball (notably during the serve follow-through).  The
+        # regular court mask is the calibrated ball mask; the relaxed masks
+        # are useful only when the regular mask has no viable contour.  Prefer
+        # a regular candidate in the local continuity window instead of
+        # letting a larger yellow racket/body patch win on area alone.
+        local_cap = max(70.0, min(130.0, last_distance * 1.5 + 45.0))
+        if upward_flight_continuation:
+            # Permit the one remaining long perspective step in a verified
+            # upper-flight.  The forward-progress gate above still rejects
+            # static blobs that happen to be closer to the prior position.
+            local_cap = max(local_cap, min(165.0, last_distance * 1.85 + 45.0))
+        local_candidates = [item for item in candidates if item[2]['pos'] and
+                            math.hypot(item[2]['pos'][0] - previous[0], item[2]['pos'][1] - previous[1]) <= local_cap]
+        if local_candidates:
+            regular_local = [
+                item for item in local_candidates
+                if item[2].get('source') == 'regular'
+            ]
+            if regular_local:
+                local_candidates = regular_local
+            _, _, chosen = min(
+                local_candidates,
+                key=lambda item: (
+                    item[0],
+                    -item[2]['motion_mean'],
+                    -item[2]['area'],
+                ),
+            )
+        else:
+            _, _, chosen = min(candidates, key=lambda item: (item[0], item[1]))
+        return chosen
+
+    def _find_night_lower_contact_launch_candidate(
+            self, frame, frame_gray, lower_contact_launch_context
+    ):
+        """Find the first upward ball after a verified lower-player contact.
+
+        This is deliberately a short-lived, trajectory-only recovery.  It
+        runs after the incoming ball has been accepted in the racket/player
+        overlap and before the broad HSV scorer can replace the real launch
+        with a nearby shoe or shirt contour.
+        """
+        if (
+                not self._is_night_session_config() or frame is None or
+                lower_contact_launch_context is None or self.ball_center is None
+        ):
+            return None
+
+        hsv_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        specs = []
+        if self.hsv_regular is not None:
+            specs.append(('regular', self.hsv_regular['lower'], self.hsv_regular['upper']))
+        if self.h10_hsv_lower is not None and self.h10_hsv_upper is not None:
+            specs.append(('h_10', self.h10_hsv_lower, self.h10_hsv_upper))
+        if self.s30_hsv_lower is not None and self.s30_hsv_upper is not None:
+            specs.append(('s_30', self.s30_hsv_lower, self.s30_hsv_upper))
+        if not specs:
+            return None
+
+        candidates = []
+        kernel = np.ones((2, 2), np.uint8)
+        for source, lower, upper in specs:
+            mask = cv2.inRange(hsv_frame, lower, upper)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            for contour in contours:
+                area = float(cv2.contourArea(contour))
+                if area < 8.0 or area > 1800.0:
+                    continue
+                moments = cv2.moments(contour)
+                if moments['m00'] == 0:
+                    continue
+                cx = int(moments['m10'] / moments['m00'])
+                cy = int(moments['m01'] / moments['m00'])
+                _, _, width, height = cv2.boundingRect(contour)
+                if (
+                        height >= max(36, width * 3.0) or
+                        width >= max(36, height * 3.0)
+                ):
+                    continue
+                if not self._lower_contact_launch_candidate_ok(
+                        (cx, cy), area, lower_contact_launch_context, frame.shape
+                ):
+                    continue
+                motion = self._candidate_motion_metrics(frame_gray, cx, cy)
+                motion_mean = float(motion.get('mean', 0.0) or 0.0) if motion else 0.0
+                motion_max = float(motion.get('max', 0.0) or 0.0) if motion else 0.0
+                expected_x, expected_y = lower_contact_launch_context['expected']
+                expected_distance = math.hypot(cx - expected_x, cy - expected_y)
+                candidates.append((
+                    expected_distance + (0.0 if source == 'regular' else 8.0),
+                    -motion_max,
+                    -area,
+                    {
+                        'pos': (cx, cy),
+                        'area': area,
+                        'hsv': hsv_frame[cy, cx],
+                        'motion_mean': motion_mean,
+                        'motion_max': motion_max,
+                        'source': source,
+                        'recovery_label': 'NIGHT LOWER CONTACT LAUNCH',
+                    },
+                ))
+        if not candidates:
+            return None
+        return min(candidates, key=lambda item: item[:3])[3]
+
+    def _find_night_contact_outbound_continuation(self, frame, frame_gray):
+        """Follow the first upward frames after a verified lower-player hit."""
+        if (
+                not self._is_night_session_config() or frame is None or
+                self.ball_center is None or self.last_motion is None or
+                int(getattr(self, '_rally_contact_grace_frames', 0)) <= 0
+        ):
+            return None
+
+        dx = float(self.last_motion.get('dx', 0.0) or 0.0)
+        dy = float(self.last_motion.get('dy', 0.0) or 0.0)
+        speed = float(self.last_motion.get('distance', 0.0) or 0.0)
+        if dy >= -max(45.0, frame.shape[0] * 0.020) or speed < 60.0:
+            return None
+        expected = (self.ball_center[0] + dx, self.ball_center[1] + dy)
+        max_prediction_error = max(110.0, min(180.0, speed * 0.95))
+        hsv_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        specs = []
+        if self.hsv_regular is not None:
+            specs.append(('regular', self.hsv_regular['lower'], self.hsv_regular['upper']))
+        if self.h10_hsv_lower is not None and self.h10_hsv_upper is not None:
+            specs.append(('h_10', self.h10_hsv_lower, self.h10_hsv_upper))
+        if self.s30_hsv_lower is not None and self.s30_hsv_upper is not None:
+            specs.append(('s_30', self.s30_hsv_lower, self.s30_hsv_upper))
+
+        kernel = np.ones((2, 2), np.uint8)
+        candidates = []
+        nearby_debug = []
+        for source, lower, upper in specs:
+            mask = cv2.inRange(hsv_frame, lower, upper)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            for contour in contours:
+                area = float(cv2.contourArea(contour))
+                if area < 8.0 or area > 1800.0:
+                    continue
+                moments = cv2.moments(contour)
+                if moments['m00'] == 0:
+                    continue
+                cx = int(moments['m10'] / moments['m00'])
+                cy = int(moments['m01'] / moments['m00'])
+                _, _, width, height = cv2.boundingRect(contour)
+                if (
+                        height >= max(36, width * 3.0) or
+                        width >= max(36, height * 3.0) or
+                        cy >= self.ball_center[1] - 20
+                ):
+                    continue
+                prediction_error = math.hypot(cx - expected[0], cy - expected[1])
+                if prediction_error > max_prediction_error:
+                    continue
+                player_zone = self._player_point_zone((cx, cy))
+                nearby_debug.append(
+                    f"{source}@({cx},{cy}) a={area:.1f} err={prediction_error:.1f} "
+                    f"zone={player_zone or 'none'}"
+                )
+                # The first upward frame is still inside the lower player's
+                # conservative bbox.  Keep it only when the calibrated
+                # regular mask is tightly on the post-contact prediction;
+                # all other player-zone fragments remain excluded.
+                if player_zone is not None and not (
+                        source == 'regular' and
+                        prediction_error <= min(65.0, max_prediction_error * 0.55) and
+                        area >= 40.0
+                ):
+                    continue
+                motion = self._candidate_motion_metrics(frame_gray, cx, cy)
+                motion_mean = float(motion.get('mean', 0.0) or 0.0) if motion else 0.0
+                motion_max = float(motion.get('max', 0.0) or 0.0) if motion else 0.0
+                # A yellow ball laid over a white sideline can be reduced to
+                # just a few HSV pixels and therefore has almost no frame-
+                # difference signal.  During the one-to-four-frame verified
+                # post-contact window, an extremely tight physical prediction
+                # is stronger evidence than that missing motion signal.  This
+                # is intentionally limited to the compact alternate masks so
+                # static regular-HSV court artifacts cannot use this escape.
+                line_overlap_continuation = (
+                    source in ('h_10', 's_30') and
+                    area <= 80.0 and
+                    prediction_error <= min(60.0, max_prediction_error * 0.60)
+                )
+                # The ball is often momentarily measured against its own
+                # previous blurred image immediately after the lower-player
+                # contact, so frame difference can be near zero even though
+                # the regular mask has the real, sizeable outgoing blob.  In
+                # the first night rally these are a compact sequence:
+                # f179 (692,1173), f180 (759,1043), f181 (827,925), and
+                # f182 (891,819).  The former line-overlap escape admitted a
+                # tiny alternate-HSV contour instead and the tracker lagged
+                # behind the visible ball.  Admit the large *regular* blob
+                # only when it is very close to the physical post-contact
+                # prediction; the four-frame grace window and shape/player
+                # gates above keep this from becoming a general static-artifact
+                # exception.
+                tight_regular_contact_continuation = (
+                    source == 'regular' and
+                    area >= 100.0 and
+                    prediction_error <= max_prediction_error
+                )
+                if (
+                        motion is not None and motion_mean < 4.0 and
+                        motion_max < 22.0 and not (
+                            line_overlap_continuation or
+                            tight_regular_contact_continuation
+                        )
+                ):
+                    continue
+                # The first decoded frame after a racket hit can be delayed
+                # relative to the last compact launch blob, so a sizeable
+                # regular candidate may be 80-110 px past a simple
+                # constant-velocity prediction.  Its size/shape is stronger
+                # evidence than a tiny line fragment which happens to be
+                # nearer to that stale prediction.  Apply this preference
+                # only to the explicit four-frame post-contact continuation.
+                continuation_score = prediction_error + (
+                    0.0 if source == 'regular' else 7.0
+                )
+                if tight_regular_contact_continuation:
+                    continuation_score -= min(90.0, area * 0.20)
+                candidates.append((
+                    continuation_score,
+                    -motion_max,
+                    -area,
+                    {
+                        'pos': (cx, cy), 'area': area, 'hsv': hsv_frame[cy, cx],
+                        'motion_mean': motion_mean, 'motion_max': motion_max,
+                        'source': source,
+                        'recovery_label': 'NIGHT LOWER CONTACT CONTINUATION',
+                    },
+                ))
+        if not candidates:
+            print(
+                f"Frame {self.frame_count}: [LOWER-HIT OUTBOUND MISS] "
+                f"expected=({expected[0]:.0f},{expected[1]:.0f}) "
+                f"nearby={' | '.join(nearby_debug[:8]) or 'none'}"
+            )
+            return None
+        # This helper returns before the normal grace-window decrement below.
+        # Consume one frame here so a good contact continuation cannot extend
+        # the special relaxed rules indefinitely into unrelated court blobs.
+        self._rally_contact_grace_frames = max(
+            0, int(getattr(self, '_rally_contact_grace_frames', 0)) - 1
+        )
+        return min(candidates, key=lambda item: item[:3])[3]
 
     def _commit_night_visible_ball_recovery(self, candidate, frame):
         prev_pos = self.ball_center
@@ -3835,10 +4473,28 @@ class InteractiveBallAnalyzer:
         self._last_tracked_candidate_motion_mean = float(candidate.get('motion_mean', 0.0) or 0.0)
         self._last_tracked_candidate_motion_max = float(candidate.get('motion_max', 0.0) or 0.0)
         self._activate_regular_hsv()
+        if candidate.get('lower_contact_approach', False):
+            # Keep a tightly bounded launch prediction for the frame after
+            # the incoming ball overlaps the player's racket.
+            launch_context = self._get_lower_contact_launch_context(frame.shape)
+            if launch_context is not None:
+                self._pending_lower_contact_launch_context = launch_context
+                self._pending_lower_contact_launch_until_frame = self.frame_count + 3
+        elif candidate.get('recovery_label') == 'NIGHT LOWER CONTACT LAUNCH':
+            # The launch is now verified; allow its fast upward continuation
+            # through the normal tracker without retaining the contact window.
+            self._pending_lower_contact_launch_context = None
+            self._pending_lower_contact_launch_until_frame = -1000000
+            self._rally_contact_grace_frames = max(
+                getattr(self, '_rally_contact_grace_frames', 0), 4
+            )
+            self._rally_contact_origin = prev_pos
+            self._rally_contact_expected = new_pos
         if frame is not None:
             self._prev_frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        recovery_label = candidate.get('recovery_label', 'NIGHT VISIBLE BALL RECOVER')
         print(
-            f"Frame {self.frame_count}: [NIGHT VISIBLE BALL RECOVER] Ball at {new_pos} "
+            f"Frame {self.frame_count}: [{recovery_label}] Ball at {new_pos} "
             f"area={candidate['area']:.1f}px motion="
             f"{candidate.get('motion_mean', 0.0):.1f}/{candidate.get('motion_max', 0.0):.1f}"
         )
@@ -3872,6 +4528,28 @@ class InteractiveBallAnalyzer:
         # Keep a static candidate only when it is essentially on the predicted
         # path; a distant static blob is an artifact even if its area is large.
         return prev_distance > 100.0 and predicted_distance > 90.0
+
+    def _night_stuck_player_artifact_candidate(
+            self, position, motion_mean, motion_max, distance):
+        """Reject a static player/body contour during a stuck re-acquisition.
+
+        Candidate scoring already penalizes player regions, but if every real
+        ball contour is temporarily occluded the penalized body contour can
+        still be the only candidate and therefore win.  A genuine ball that
+        reappears after contact has local frame motion; the f97 neck/body
+        takeover has none and is more than 500 px from the last ball.
+        """
+        if not self._is_night_session_config() or position is None:
+            return False
+        zone = self._player_point_zone(position)
+        if zone not in (
+                'player_head_hat', 'player_body', 'player_shoes', 'racket_fragment'):
+            return False
+        return (
+            float(distance or 0.0) > 120.0 and
+            float(motion_mean or 0.0) < 6.0 and
+            float(motion_max or 0.0) < 25.0
+        )
 
     def _collect_override_candidate_metrics(self, pos, area, prev_pos, predicted_point, frame_gray):
         motion_metrics = self._candidate_motion_metrics(frame_gray, pos[0], pos[1])
@@ -6828,6 +7506,15 @@ class InteractiveBallAnalyzer:
                         (x + w) <= width - 350):
                     continue
                 cx, cy = (float(static_centers[idx, 0]), float(static_centers[idx, 1]))
+                # Endpoint repair runs outside the normal candidate-selection
+                # path, so it must apply the same learned/background false
+                # point protection itself.  Without this, the repair can
+                # repeatedly turn a fixed yellow fixture (notably the night
+                # session's (3049, 40) hotspot) into a fake "moving ball".
+                static_pos = (int(round(cx)), int(round(cy)))
+                if (self._find_persistent_false_point(static_pos, filter_key=None) is not None or
+                        self._find_frame0_background_hotspot(static_pos) is not None):
+                    continue
                 roi = hsv[y:y + h_box, x:x + w]
                 valid = ball_mask[y:y + h_box, x:x + w] > 0
                 pixels = roi[valid]
@@ -6845,7 +7532,7 @@ class InteractiveBallAnalyzer:
                     # near a court boundary.  Give that compact, saturated
                     # blob precedence over a larger moving racket fragment.
                     score += 600.0
-                static_candidates.append((score, (int(round(cx)), int(round(cy))), area))
+                static_candidates.append((score, static_pos, area))
             candidates.sort(key=lambda item: item[0], reverse=True)
             static_candidates.sort(key=lambda item: item[0], reverse=True)
             if static_candidates and (not candidates or static_candidates[0][0] > candidates[0][0]):
@@ -6975,6 +7662,112 @@ class InteractiveBallAnalyzer:
             )
             return tuple(int(v) for v in candidate)
         return end_position
+
+    def _resume_from_terminal_motion_candidate(self, reason, end_position, frame=None):
+        """Cancel an ambiguous terminal decision when local vision sees the ball moving.
+
+        A timeout is an *inference*, unlike a verified net/out/bounce event.
+        Before scoring that inference, inspect the two decoded frames already
+        held by the tracker.  When their motion mask and ball-colour mask
+        agree on a compact moving candidate away from the stale endpoint,
+        that candidate is stronger evidence than the timeout.  Continue from
+        it and let normal point-end logic decide the rally later.
+
+        This is deliberately local and conditional: no model is run on every
+        frame, and verified bounce/net/out decisions are untouched.
+        """
+        reason_text = str(reason or "").lower()
+        ambiguous_timeout = any(token in reason_text for token in (
+            "stuck", "stopped", "lost", "timeout",
+        ))
+        if not ambiguous_timeout or end_position is None:
+            return False
+
+        current_image = getattr(self, "_terminal_current_frame", None)
+        previous_gray = getattr(self, "_terminal_previous_gray", None)
+        current_gray = getattr(self, "_terminal_current_gray", None)
+        candidate = self._terminal_moving_ball_candidate(
+            end_position,
+            current_image,
+            previous_gray,
+            current_gray,
+            # A terminal decision must be supported by an actually moving
+            # candidate. Do not let a static yellow line/edge component
+            # cancel an otherwise valid timeout.
+            allow_static_anywhere=False,
+            allow_small_static=False,
+        )
+        if candidate is None:
+            return False
+
+        previous = tuple(int(v) for v in end_position)
+        recovered = tuple(int(v) for v in candidate)
+        # A candidate must show local change in the decoded frame pair. This
+        # rejects persistent yellow fixtures at the image edge, which can
+        # otherwise look like a stopped ball to a colour-only check.
+        height, width = current_gray.shape[:2]
+        radius = 12
+        x1, x2 = max(0, recovered[0] - radius), min(width, recovered[0] + radius + 1)
+        y1, y2 = max(0, recovered[1] - radius), min(height, recovered[1] + radius + 1)
+        local_diff = cv2.absdiff(previous_gray[y1:y2, x1:x2], current_gray[y1:y2, x1:x2])
+        motion_ratio = float(np.count_nonzero(local_diff >= 18)) / max(1, local_diff.size)
+        if motion_ratio < 0.035:
+            return False
+        displacement = math.hypot(recovered[0] - previous[0], recovered[1] - previous[1])
+        # Ignore a near-identical result: it only confirms the existing
+        # terminal marker rather than revealing a separate ball flight.
+        if displacement < max(70.0, min(180.0, float(getattr(self, "ball_size", 0.0) or 0.0) * 1.5)):
+            return False
+
+        dx = recovered[0] - previous[0]
+        dy = recovered[1] - previous[1]
+        distance = math.hypot(dx, dy)
+        direction = math.degrees(math.atan2(dy, dx)) if distance > 0 else None
+        self.ball_center = recovered
+        self.last_delta = (dx, dy)
+        self.last_motion = {
+            "distance": distance,
+            "dx": dx,
+            "dy": dy,
+            "direction_deg": direction,
+        }
+        if distance >= 3.0:
+            self.last_nonzero_motion = dict(self.last_motion)
+        velocity_history = getattr(self, "ball_velocity_history", None)
+        if isinstance(velocity_history, list):
+            velocity_history.append(distance)
+            del velocity_history[:-20]
+        motion_history = getattr(self, "motion_history", None)
+        if isinstance(motion_history, list):
+            motion_history.append({
+                "frame": int(self.frame_count),
+                "distance": distance,
+                "direction_deg": direction,
+                "pos": recovered,
+                "prev_pos": previous,
+            })
+            del motion_history[:-200]
+        self.last_seen_frame = int(self.frame_count)
+        self.stuck_frame_count = 0
+        self.edge_wait = False
+        self._player_reacq_protect_until_frame = -1
+        self._player_reacq_motion_failed_until_frame = -1
+        context = getattr(self, "_point_history_current", None)
+        if isinstance(context, dict):
+            context.setdefault("tracking_trace", []).append({
+                "frame": int(self.frame_count),
+                "pos": [recovered[0], recovered[1]],
+                "size": float(self.ball_size) if self.ball_size is not None else None,
+                "stuck": 0,
+                "source": "terminal_motion_recovery",
+            })
+        print(
+            f"Frame {self.frame_count}: [TERMINAL VERIFY CONTINUE] "
+            f"suppressed '{reason}' at {previous}; local motion recovered "
+            f"ball={recovered} displacement={displacement:.1f}px "
+            f"motion={motion_ratio:.3f}"
+        )
+        return True
 
     def _record_point_result(self, reason, end_position=None, frame=None, history_end_frame=None):
         if self._last_scored_point_end_frame == self.frame_count:
@@ -12061,6 +12854,29 @@ class InteractiveBallAnalyzer:
 
             score = motion_area * 0.3 + edge_penalty + y_score + dist_penalty
 
+            # A lower-court night-flight has a particularly reliable local
+            # trajectory over the 1--3 frames before the player reaches the
+            # ball.  The generic motion score above prefers tiny blobs, which
+            # made f176 choose a 35px player fragment 374px away over the
+            # 404px ball only 74px from the predicted path.  Add this only
+            # when the current track is already a sustained descending flight;
+            # a serve/contact can still legitimately break the prediction.
+            last_motion = self.last_motion or {}
+            last_dx = float(last_motion.get('dx', 0.0) or 0.0)
+            last_dy = float(last_motion.get('dy', 0.0) or 0.0)
+            last_distance = float(last_motion.get('distance', 0.0) or 0.0)
+            night_lower_flight = (
+                self._is_night_session_config() and
+                stuck_y >= int(frame_height * 0.35) and
+                25.0 <= last_distance <= 130.0 and
+                last_dy >= 15.0
+            )
+            if night_lower_flight:
+                expected_x = stuck_x + last_dx
+                expected_y = stuck_y + last_dy
+                predicted_distance = math.hypot(mx - expected_x, my - expected_y)
+                score += predicted_distance * 0.80
+
             print(f"  DEBUG: [REACQ] Motion+HSV at ({mx},{my}) area={motion_area:.0f}, "
                   f"H={h} S={s} V={v}, dist_stuck={dist_from_stuck:.0f}, score={score:.1f}")
 
@@ -12095,9 +12911,57 @@ class InteractiveBallAnalyzer:
         if hasattr(self, '_prev_frame_gray') and self._prev_frame_gray is not None:
             frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
+        outbound_contact_ball = self._find_night_contact_outbound_continuation(
+            frame, frame_gray
+        )
+        if outbound_contact_ball is not None:
+            print(
+                f"Frame {self.frame_count}: [LOWER-HIT OUTBOUND HOLD] "
+                f"keeping predicted upward ball {outbound_contact_ball['pos']}"
+            )
+            return self._commit_night_visible_ball_recovery(outbound_contact_ball, frame)
+
+        # A verified lower-player contact has a one-to-three-frame protected
+        # launch window.  Examine that upward trajectory before ordinary
+        # tracking/reacquisition, whose relaxed masks also see the player's
+        # shoes and shirt.  This fixes the f178/f180 class of jump without
+        # broadening normal player-zone acceptance.
+        pending_lower_launch = getattr(self, '_pending_lower_contact_launch_context', None)
+        if (
+                not allow_inactive and pending_lower_launch is not None and
+                self.frame_count <= int(getattr(
+                    self, '_pending_lower_contact_launch_until_frame', -1000000
+                ))
+        ):
+            lower_launch = self._find_night_lower_contact_launch_candidate(
+                frame, frame_gray, pending_lower_launch
+            )
+            if lower_launch is not None:
+                print(
+                    f"Frame {self.frame_count}: [LOWER-HIT LAUNCH HOLD] "
+                    f"keeping upward ball {lower_launch['pos']} through contact handoff"
+                )
+                return self._commit_night_visible_ball_recovery(lower_launch, frame)
+
+        # When the local search has already been stuck for several frames,
+        # inspect the startup regular-mask flight before any full-frame motion
+        # reacquisition.  The latter can otherwise lock onto a static court
+        # patch (for example at the top of the image) and discard the visible
+        # ball that is still following the serve path.
+        if not allow_inactive and self.stuck_frame_count >= 4:
+            startup_regular = self._find_night_startup_regular_candidate(frame, frame_gray)
+            if startup_regular is not None:
+                return self._commit_night_visible_ball_recovery(startup_regular, frame)
+
         # Default: no saved previous frame for FFS motion check (overwritten in normal
         # tracking path before the reacquire call).
         _ffs_prev_gray = None
+        # Set only when a motion candidate is rejected during player
+        # occlusion and we intentionally fall back to the local HSV search in
+        # the same frame.  That search must not use the generic full-frame
+        # rule which discards every contour within 500px of the stale marker:
+        # a real post-hit ball commonly reappears 250-400px away.
+        _player_reacq_hsv_fallback = False
 
         # Post-reacquire flag: True for the window of frames immediately after a
         # motion-based re-acquisition, during which the serve contact can reverse the
@@ -12339,6 +13203,28 @@ class InteractiveBallAnalyzer:
                         search_radius = max(search_radius, self.max_ball_speed)
                         print(f"  DEBUG: [LOWER-HIT PREP] wide search radius={search_radius}px "
                               f"expected={lower_contact_launch_context['expected']}")
+                        # Preserve the final incoming-ball contour when it
+                        # overlaps the lower player.  This must happen before
+                        # the broad HSV fallback: that fallback sees a 29px
+                        # contact contour as too small, then chooses a relaxed
+                        # yellow player/shoe blob hundreds of pixels away.
+                        # The helper's player-zone exception is constrained to
+                        # the regular mask and the predicted descending path.
+                        lower_contact_approach = self._find_night_startup_regular_candidate(
+                            frame, frame_gray
+                        )
+                        if (
+                                lower_contact_approach is not None and
+                                lower_contact_approach.get('lower_contact_approach', False)
+                        ):
+                            print(
+                                f"Frame {self.frame_count}: [LOWER-HIT CONTACT HOLD] "
+                                f"keeping incoming ball {lower_contact_approach['pos']} "
+                                "through player/racket overlap"
+                            )
+                            return self._commit_night_visible_ball_recovery(
+                                lower_contact_approach, frame
+                            )
                     elif (
                             getattr(self, '_pending_lower_contact_launch_context', None) is not None and
                             self.frame_count <= int(getattr(
@@ -12417,13 +13303,22 @@ class InteractiveBallAnalyzer:
                 # Used later in the FFS candidate loop to verify motion (moving ball vs
                 # static background/logo that just happens to have ball colour).
                 _ffs_prev_gray = self._prev_frame_gray if hasattr(self, '_prev_frame_gray') else None
-                if self.stuck_frame_count >= 5 and hasattr(self, '_prev_frame_gray') and self._prev_frame_gray is not None:
-                    player_reacq_guard = int(
-                        getattr(self, '_player_reacq_protect_until_frame', -1)
-                    ) >= self.frame_count
+                player_reacq_guard = int(
+                    getattr(self, '_player_reacq_protect_until_frame', -1)
+                ) >= self.frame_count
+                motion_retry_due = self.frame_count > int(getattr(
+                    self, '_player_reacq_motion_failed_until_frame', -1
+                ))
+                if (self.stuck_frame_count >= 5 and
+                        hasattr(self, '_prev_frame_gray') and
+                        self._prev_frame_gray is not None and
+                        (not player_reacq_guard or motion_retry_due)):
                     reacq_pos = self._reacquire_ball_by_motion(frame)
                     if reacq_pos is not None:
-                        player_reacq = int(getattr(self, '_player_occlusion_hold_frames', 0)) > 0
+                        player_reacq = (
+                            int(getattr(self, '_player_occlusion_hold_frames', 0)) > 0 or
+                            int(getattr(self, '_player_reacq_protect_until_frame', -1)) >= self.frame_count
+                        )
                         reacq_area = float(getattr(self, '_last_reacq_candidate_area', 0.0) or 0.0)
                         reacq_jump = (
                             math.hypot(
@@ -12439,11 +13334,13 @@ class InteractiveBallAnalyzer:
                         # large one-frame jump.  A real launch has a coherent,
                         # ball-sized diff blob (as at f2312), while the bad
                         # f2351 candidate is only ~36 px and jumps ~300 px.
-                        if (
+                        provisional_reacq_rejected = (
                                 player_reacq and
                                 reacq_area < 70.0 and
                                 reacq_jump > 160.0
-                        ):
+                        )
+                        if provisional_reacq_rejected:
+                            _player_reacq_hsv_fallback = True
                             self.stuck_frame_count = max(int(self.stuck_frame_count), 5)
                             self._player_reacq_protect_until_frame = max(
                                 int(getattr(self, '_player_reacq_protect_until_frame', -1)),
@@ -12459,73 +13356,152 @@ class InteractiveBallAnalyzer:
                                 position=self.ball_center,
                                 recovery=f'rejected candidate {reacq_pos}',
                             )
-                            return self.ball_center
-
-                        print(
-                            f"Frame {self.frame_count}: [RE-ACQUIRED] Ball found at {reacq_pos} "
-                            f"after {self.stuck_frame_count} stuck frames (motion-based) "
-                            f"area={reacq_area:.1f} jump={reacq_jump:.1f}px"
-                        )
-                        if player_reacq:
-                            self._record_ball_loss_event(
-                                'player-occlusion artifact',
-                                position=self.ball_center,
-                                recovery=f'motion reacquired at {reacq_pos}',
-                            )
-                        self._maybe_handle_reacquire_ground_bounce(reacq_pos, frame)
-                        self.ball_velocity_history = []
-                        self.last_motion = None
-                        self.last_direction = None
-                        self.direction_change_streak = 0
-                        self.stuck_frame_count = 0
-                        self._recent_max_ball_size = 0
-                        self.ball_center = reacq_pos
-                        self._last_motion_reacq_frame = self.frame_count
-                        self._last_motion_reacq_pos = reacq_pos
-                        self._prev_frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                        # After re-acquisition the serve hit may cause a large jump in the
-                        # very next frames.  Arm a wide-search window so the tracker can
-                        # follow the ball even when it suddenly accelerates 200-400 px/frame.
-                        # 3 frames covers f49/f50/f51 (toss fall + serve contact) without
-                        # leaving the wide-search window open long enough to latch onto a
-                        # court-1 false positive and block STUCK_TIMEOUT.
-                        self._post_reacq_frames = 3
-                        if player_reacq:
-                            # Keep point-end logic in a grace state long enough
-                            # for the ball to reappear after a near-player hit.
-                            # The guard is cleared as soon as a later contour has
-                            # real frame motion, so this does not delay a genuine
-                            # end once the trajectory is reacquired.
-                            self._player_reacq_protect_until_frame = self.frame_count + 80
+                            # Do not return here.  The motion candidate can be a
+                            # moving player/racket fragment while the true yellow
+                            # ball is also present in the normal HSV search window
+                            # (the f103 post-contact case).  Falling through lets
+                            # the stricter local contour scorer choose the ball in
+                            # this same frame instead of holding a stale marker.
                             print(
-                                f"Frame {self.frame_count}: [PLAYER-REACQ GUARD] "
-                                f"rejecting distant static blobs until "
-                                f"f{self._player_reacq_protect_until_frame}"
+                                f"Frame {self.frame_count}: [PLAYER-REACQ HSV FALLBACK] "
+                                "checking local ball contours after motion rejection"
                             )
-                        # Freeze the ball-size reference at re-acquisition time.  In the
-                        # post-reacq window ball_size can drift toward small noise blobs
-                        # selected near the ground; keeping the original large-blob reference
-                        # keeps the size-primary scoring anchored to the real ball.
-                        self._reacq_ref_size = max(self.ball_size, 50) if self.ball_size else 100
+                        else:
+                            # In the night-camera first rally, a ball travelling
+                            # toward the lower player can overlap the player
+                            # detector for several frames.  The frame-difference
+                            # pass still sees the real, bright moving ball (for
+                            # example f174=(750,1257), f175=(699,1304)), but the
+                            # broad HSV pass below used to overwrite it with a
+                            # dim player/racket contour.  Trust only a large,
+                            # local motion candidate here; this is deliberately
+                            # tighter than the general re-acquisition path so a
+                            # genuine high-speed contact is not mistaken for a
+                            # player blob.
+                            recent_motion = max(
+                                [float(v or 0.0) for v in getattr(
+                                    self, 'ball_velocity_history', []
+                                )[-3:]] or [0.0]
+                            )
+                            night_motion_continuation = (
+                                self._is_night_session_config() and
+                                reacq_area >= 180.0 and
+                                reacq_jump <= max(110.0, recent_motion * 2.25) and
+                                self._player_point_zone(reacq_pos) is None
+                            )
+                            if night_motion_continuation:
+                                hsv_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+                                reacq_motion = self._candidate_motion_metrics(
+                                    frame_gray, reacq_pos[0], reacq_pos[1]
+                                )
+                                print(
+                                    f"Frame {self.frame_count}: [NIGHT MOTION CONTINUITY] "
+                                    f"keeping real motion ball {reacq_pos} "
+                                    f"area={reacq_area:.1f}px jump={reacq_jump:.1f}px "
+                                    "instead of broad HSV/player candidates"
+                                )
+                                return self._commit_night_visible_ball_recovery(
+                                    {
+                                        'pos': reacq_pos,
+                                        'area': reacq_area,
+                                        'hsv': hsv_frame[reacq_pos[1], reacq_pos[0]],
+                                        'motion_mean': (
+                                            reacq_motion.get('mean', 0.0)
+                                            if reacq_motion is not None else 0.0
+                                        ),
+                                        'motion_max': (
+                                            reacq_motion.get('max', 0.0)
+                                            if reacq_motion is not None else 0.0
+                                        ),
+                                        'recovery_label': 'NIGHT MOTION CONTINUITY',
+                                    },
+                                    frame,
+                                )
+                            print(
+                                f"Frame {self.frame_count}: [RE-ACQUIRED] Ball found at {reacq_pos} "
+                                f"after {self.stuck_frame_count} stuck frames (motion-based) "
+                                f"area={reacq_area:.1f} jump={reacq_jump:.1f}px"
+                            )
+                            if player_reacq:
+                                self._record_ball_loss_event(
+                                    'player-occlusion artifact',
+                                    position=self.ball_center,
+                                    recovery=f'motion reacquired at {reacq_pos}',
+                                )
+                            self._maybe_handle_reacquire_ground_bounce(reacq_pos, frame)
+                            self.ball_velocity_history = []
+                            self.last_motion = None
+                            self.last_direction = None
+                            self.direction_change_streak = 0
+                            self.stuck_frame_count = 0
+                            self._recent_max_ball_size = 0
+                            self.ball_center = reacq_pos
+                            self._last_motion_reacq_frame = self.frame_count
+                            self._last_motion_reacq_pos = reacq_pos
+                            self._prev_frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                            # After re-acquisition the serve hit may cause a large jump in the
+                            # very next frames.  Arm a wide-search window so the tracker can
+                            # follow the ball even when it suddenly accelerates 200-400 px/frame.
+                            # 3 frames covers f49/f50/f51 (toss fall + serve contact) without
+                            # leaving the wide-search window open long enough to latch onto a
+                            # court-1 false positive and block STUCK_TIMEOUT.
+                            self._post_reacq_frames = 3
+                            if player_reacq:
+                                # Keep point-end logic in a grace state long enough
+                                # for the ball to reappear after a near-player hit.
+                                # The guard is cleared as soon as a later contour has
+                                # real frame motion, so this does not delay a genuine
+                                # end once the trajectory is reacquired.
+                                self._player_reacq_protect_until_frame = self.frame_count + 80
+                                print(
+                                    f"Frame {self.frame_count}: [PLAYER-REACQ GUARD] "
+                                    f"rejecting distant static blobs until "
+                                    f"f{self._player_reacq_protect_until_frame}"
+                                )
+                            # Freeze the ball-size reference at re-acquisition time.  In the
+                            # post-reacq window ball_size can drift toward small noise blobs
+                            # selected near the ground; keeping the original large-blob reference
+                            # keeps the size-primary scoring anchored to the real ball.
+                            self._reacq_ref_size = max(self.ball_size, 50) if self.ball_size else 100
                     elif player_reacq_guard:
                         # The full-frame motion pass found no plausible moving
-                        # blob.  Do not immediately run the fallback HSV scan
-                        # over all ~8k static contours; that scan is both slow
-                        # and prone to selecting player/court artifacts.  Keep
-                        # the last marker until the next motion milestone.
-                        self._player_reacq_motion_failed_until_frame = max(
-                            int(getattr(
-                                self, '_player_reacq_motion_failed_until_frame', -1
-                            )),
-                            self.frame_count + 5,
+                        # blob.  Before holding the stale marker, run the
+                        # bounded night-visible search.  A motion-blurred ball
+                        # can have no usable frame-difference blob immediately
+                        # after racket contact (f104/f105), while remaining a
+                        # compact yellow contour on a physically continuous
+                        # upward path.  The helper applies player-zone, jump,
+                        # shape, and background-hotspot guards, so this does not
+                        # reopen the broad static-contour fallback.
+                        visible_ball = self._find_night_visible_ball_candidate(
+                            frame, frame_gray
+                        )
+                        if visible_ball is not None:
+                            print(
+                                f"Frame {self.frame_count}: [PLAYER-REACQ VISIBLE CONTINUE] "
+                                f"using {visible_ball['pos']} area="
+                                f"{visible_ball['area']:.1f}px before stale hold"
+                            )
+                            return self._commit_night_visible_ball_recovery(
+                                visible_ball, frame
+                            )
+                        # Do not extend this deadline on every frame.  The
+                        # previous behaviour produced an infinite stale-hold
+                        # loop: at f113 it held `(1791,426)` even though the
+                        # visibly moving ball progressed across the net.
+                        # Throttle only the expensive motion pass; leave the
+                        # directional HSV scorer below free to recover it.
+                        self._player_reacq_motion_failed_until_frame = (
+                            self.frame_count + 5
                         )
                         self.stuck_frame_count = max(5, int(self.stuck_frame_count) + 1)
                         print(
-                            f"Frame {self.frame_count}: [PLAYER-REACQ WAIT] "
-                            f"no moving blob; keeping {self.ball_center} until "
-                            f"f{self._player_reacq_motion_failed_until_frame}"
+                            f"Frame {self.frame_count}: [PLAYER-REACQ ALT SEARCH] "
+                            f"motion pass found no blob; using directional HSV "
+                            f"until next motion retry f"
+                            f"{self._player_reacq_motion_failed_until_frame}"
                         )
-                        return self.ball_center
+                        search_radius = max(search_radius, _stuck_expand)
                     else:
                         # Update prev frame for next attempt (consecutive comparison)
                         self._prev_frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -12533,6 +13509,24 @@ class InteractiveBallAnalyzer:
                         # but keep it bounded to avoid grabbing distant false positives
                         # (player bodies, logos) that just happen to match ball colour.
                         search_radius = max(search_radius, _stuck_expand)
+                elif self.stuck_frame_count >= 5 and player_reacq_guard:
+                    # Between throttled motion passes, do not report the old
+                    # coordinate as a successful tracking result.  First try
+                    # the compact night candidate, then continue into the
+                    # normal bounded HSV scorer with the last trajectory.
+                    visible_ball = self._find_night_visible_ball_candidate(
+                        frame, frame_gray
+                    )
+                    if visible_ball is not None:
+                        print(
+                            f"Frame {self.frame_count}: [PLAYER-REACQ ALT CONTINUE] "
+                            f"using {visible_ball['pos']} area="
+                            f"{visible_ball['area']:.1f}px between motion retries"
+                        )
+                        return self._commit_night_visible_ball_recovery(
+                            visible_ball, frame
+                        )
+                    search_radius = max(search_radius, _stuck_expand)
                 elif self.stuck_frame_count >= 1:
                     # Expand search radius so a sudden serve acceleration (ball jumps
                     # 150-200px after racket contact) is caught quickly.
@@ -12896,6 +13890,15 @@ class InteractiveBallAnalyzer:
                     print(f"Frame {self.frame_count}: [EARLY MOTION REACQ] Ball at {reacq_pos}")
                     return self.ball_center
                 self._prev_frame_gray = saved_prev_gray
+
+            # During the short night-camera startup flight, the regular HSV
+            # mask can still contain the real ball even when motion/primary
+            # recovery reports no contours.  Prefer that physically local,
+            # sufficiently large candidate before static alt2 fallbacks.
+            if not allow_inactive:
+                startup_regular = self._find_night_startup_regular_candidate(frame, frame_gray)
+                if startup_regular is not None:
+                    return self._commit_night_visible_ball_recovery(startup_regular, frame)
 
             if not allow_inactive:
                 upper_post_bounce_recover = (
@@ -13630,7 +14633,10 @@ class InteractiveBallAnalyzer:
             # Weighted score: distance + size penalty
             # Prefer candidates with similar size to previous ball
             # Distance is primary, but size consistency matters for fast-moving balls
-            full_frame_scan = self.stuck_frame_count >= 5
+            full_frame_scan = (
+                self.stuck_frame_count >= 5 and
+                not _player_reacq_hsv_fallback
+            )
             if full_frame_scan:
                 # In full-frame scan mode: prioritize size match over distance.
                 # Ball bounced off player so direction is unknown.
@@ -14924,6 +15930,14 @@ class InteractiveBallAnalyzer:
                         f"holding {self.ball_center} instead of ({cx},{cy}) "
                         f"motion={motion_mean:.1f}/{motion_max:.1f}"
                     )
+                    visible_ball = self._find_night_visible_ball_candidate(frame, frame_gray)
+                    if visible_ball is not None:
+                        print(
+                            f"Frame {self.frame_count}: [PLAYER-REACQ VISIBLE BALL] "
+                            f"using {visible_ball['pos']} area={visible_ball['area']:.1f}px "
+                            f"instead of static candidate ({cx},{cy})"
+                        )
+                        return self._commit_night_visible_ball_recovery(visible_ball, frame)
                     return self.ball_center
                 if top_return_search_context:
                     if (
@@ -15148,6 +16162,9 @@ class InteractiveBallAnalyzer:
                         reason,
                         source=best_source,
                     )
+                    startup_regular = self._find_night_startup_regular_candidate(frame, frame_gray)
+                    if startup_regular is not None:
+                        return self._commit_night_visible_ball_recovery(startup_regular, frame)
                     if night_static_side_artifact:
                         night_recover = self._find_night_visible_ball_candidate(frame, frame_gray)
                         if night_recover is not None:
@@ -16710,6 +17727,49 @@ class InteractiveBallAnalyzer:
             # Update tracking data
             # If re-acquiring after full-frame scan, reset velocity/direction state
             if self.stuck_frame_count >= 5:
+                reacq_distance = (
+                    math.hypot(cx - self.ball_center[0], cy - self.ball_center[1])
+                    if self.ball_center is not None else 0.0
+                )
+                reacq_motion = self._candidate_motion_metrics(frame_gray, cx, cy)
+                reacq_motion_mean = (
+                    float(reacq_motion.get('mean', 0.0) or 0.0)
+                    if reacq_motion is not None else 0.0
+                )
+                reacq_motion_max = (
+                    float(reacq_motion.get('max', 0.0) or 0.0)
+                    if reacq_motion is not None else 0.0
+                )
+                if self._night_stuck_player_artifact_candidate(
+                        (cx, cy), reacq_motion_mean, reacq_motion_max, reacq_distance):
+                    artifact_zone = self._player_point_zone((cx, cy))
+                    self._player_occlusion_hold_frames = max(
+                        int(getattr(self, '_player_occlusion_hold_frames', 0)), 4
+                    )
+                    self._player_reacq_protect_until_frame = max(
+                        int(getattr(self, '_player_reacq_protect_until_frame', -1)),
+                        self.frame_count + 80,
+                    )
+                    self._record_ball_loss_event(
+                        'player-occlusion artifact',
+                        position=self.ball_center,
+                        recovery=f'rejected static {artifact_zone} candidate ({cx}, {cy})',
+                    )
+                    print(
+                        f"Frame {self.frame_count}: [PLAYER-REACQ STATIC PLAYER REJECT] "
+                        f"holding {self.ball_center} instead of ({cx},{cy}) "
+                        f"zone={artifact_zone} jump={reacq_distance:.1f}px "
+                        f"motion={reacq_motion_mean:.1f}/{reacq_motion_max:.1f}"
+                    )
+                    visible_ball = self._find_night_visible_ball_candidate(frame, frame_gray)
+                    if visible_ball is not None:
+                        print(
+                            f"Frame {self.frame_count}: [PLAYER-REACQ VISIBLE BALL] "
+                            f"using {visible_ball['pos']} area={visible_ball['area']:.1f}px "
+                            f"instead of static {artifact_zone} candidate ({cx},{cy})"
+                        )
+                        return self._commit_night_visible_ball_recovery(visible_ball, frame)
+                    return self.ball_center
                 print(f"Frame {self.frame_count}: [RE-ACQUIRED] Ball found at ({cx},{cy}) after {self.stuck_frame_count} stuck frames")
                 player_reacq = int(getattr(self, '_player_occlusion_hold_frames', 0)) > 0
                 self._maybe_handle_reacquire_ground_bounce((cx, cy), frame)
@@ -20513,11 +21573,24 @@ class InteractiveBallAnalyzer:
                         int(getattr(self, '_point_hit_count', 0) or 0) > 0
                     )
                     hard_timeout = _max_point_frames + max(120, int(_max_point_frames * 0.5))
+                    timeout_marker_zone = self._player_point_zone(self.ball_center)
+                    stale_player_timeout_hold = (
+                        self.tracking and
+                        self.ball_center is not None and
+                        self.stuck_frame_count >= 5 and
+                        timeout_marker_zone in (
+                            'player_head_hat', 'player_body', 'player_shoes', 'racket_fragment'
+                        ) and
+                        dur <= hard_timeout
+                    )
                     timeout_hold = (
                         top_timeout_hold or back_timeout_hold or
                         recent_return_hold or recent_bounce_hold
                     )
-                    if active_tracking_hold or recent_contact_timeout_hold or (timeout_hold and dur <= hard_timeout):
+                    if (
+                            active_tracking_hold or recent_contact_timeout_hold or
+                            stale_player_timeout_hold or
+                            (timeout_hold and dur <= hard_timeout)):
                         if top_timeout_hold or back_timeout_hold:
                             print(f"Frame {self.frame_count}: delaying point timeout while waiting for offscreen return")
                         elif recent_contact_timeout_hold:
@@ -20525,6 +21598,12 @@ class InteractiveBallAnalyzer:
                                 f"Frame {self.frame_count}: [POST-CONTACT TIMEOUT HOLD] "
                                 f"deferring point timeout {contact_age}f after racket contact "
                                 f"at f{last_contact_frame}"
+                            )
+                        elif stale_player_timeout_hold:
+                            print(
+                                f"Frame {self.frame_count}: [STALE-PLAYER TIMEOUT HOLD] "
+                                f"deferring unresolved timeout at {self.ball_center} "
+                                f"zone={timeout_marker_zone} stuck={self.stuck_frame_count}"
                             )
                         elif recent_bounce_hold:
                             last_bounce_frame = getattr(self, '_recent_return_bounce_recover_frame', self.frame_count)
@@ -20557,6 +21636,14 @@ class InteractiveBallAnalyzer:
                             timeout_reason = "POINT_TIMEOUT"
                             if self._in_court_timeout_landing_outcome(self.ball_center, frame) is not None:
                                 timeout_reason = "Ball stopped on player side"
+                            # A duration timeout is only a fallback inference.  The
+                            # terminal verifier can still see a compact moving ball
+                            # in the just-decoded frame pair; continue the rally
+                            # rather than scoring a false timeout in that case.
+                            if self._resume_from_terminal_motion_candidate(
+                                timeout_reason, self.ball_center, frame=frame
+                            ):
+                                continue
                             print(
                                 f"[POINT_END] f{self.frame_count}: reason={timeout_reason} "
                                 f"duration={dur}f — returning to serve detection"
@@ -20807,6 +21894,14 @@ class InteractiveBallAnalyzer:
                         else:
                             if self._in_court_timeout_landing_outcome(tracked_position, frame) is not None:
                                 stuck_reason = "Ball stopped on player side"
+                            # Do this before choosing/backdating the endpoint.  A
+                            # timeout on a stale player/racket marker must never
+                            # win over a genuinely moving ball recovered from the
+                            # latest two frames.
+                            if self._resume_from_terminal_motion_candidate(
+                                stuck_reason, tracked_position, frame=frame
+                            ):
+                                continue
                             static_timeout_point = getattr(
                                 self, '_last_out_bounce_suppressed_point', None
                             )
@@ -21762,7 +22857,7 @@ if __name__ == "__main__":
             _cli_native_stderr_state = native_stderr_state
 
     if args.quiet:
-        with open(os.devnull, "w", encoding="utf-8") as devnull, contextlib.redirect_stdout(devnull):
+        with contextlib.redirect_stdout(_QuietTrackerOutput(sys.stdout)):
             run_analyzer()
     else:
         run_analyzer()

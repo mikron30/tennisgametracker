@@ -1,0 +1,36 @@
+{
+  "video": "04_Left_Court_tennis_20260623220627_20260623222559_1274169779.mp4",
+  "updated_at": "2026-07-20T18:36:00+03:00",
+  "scope": "Persistent visual endpoint regression ledger",
+  "frame_numbering": {
+    "tracker_to_zero_based_video_offset": -1,
+    "note": "Tracker frame N is the image decoded at zero-based video index N-1."
+  },
+  "validated_points": [
+    {
+      "point_index": 1,
+      "serve_start_frame": 22,
+      "point_end_frame": 322,
+      "end_position": [2022, 513],
+      "end_reason": "Ball hit the net",
+      "category": "net_error",
+      "winner": "P2",
+      "rally_shots": 3,
+      "status": "validated_correct",
+      "visual_evidence": {
+        "decoded_video_frame": 321,
+        "reviewed_video_frames": [318, 319, 320, 321, 322, 323, 324, 325, 326],
+        "finding": "The ball enters the net mesh at decoded frame 321 and continues downward inside the net afterward."
+      },
+      "regression": {
+        "output_directory": "tmp/tracking_audit_resume_f66_fix11",
+        "history": "tmp/tracking_audit_resume_f66_fix11/point_history_20260720_183241.csv",
+        "previous_output_directory": "tmp/tracking_audit_resume_f66_fix10",
+        "endpoint_unchanged": true,
+        "contact_flight_fixed": "Frames 104 and 105 now track (1519,1053) and (1574,908) instead of holding the player-associated marker."
+      }
+    }
+  ],
+  "false_points": [],
+  "pending_points": "All later points await the next full-video regression and visual review."
+}
