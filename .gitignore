@@ -62,6 +62,8 @@ ball_trace/
 diagnostic_frames/
 key_frames/
 zoom_frames/
+metadata/ball_dataset/
+.tools/
 
 # Claude Code config
 .claude/

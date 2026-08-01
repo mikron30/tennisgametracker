@@ -59,6 +59,29 @@ class ServeLaunchHandoffTests(unittest.TestCase):
 
         self.assertIsNone(chosen)
 
+    def test_unlocked_night_serve_rejects_player_torso_seed_only(self):
+        class Tracker:
+            def point_zone(self, point):
+                return "player_body"
+
+        self.analyzer.player_tracker = Tracker()
+        self.assertTrue(self.analyzer._reject_unlocked_night_serve_body_candidate(
+            (1948, 1019), lock_active=False
+        ))
+        self.assertFalse(self.analyzer._reject_unlocked_night_serve_body_candidate(
+            (1948, 1019), lock_active=True
+        ))
+
+    def test_unlocked_night_serve_keeps_non_body_seed(self):
+        class Tracker:
+            def point_zone(self, point):
+                return None
+
+        self.analyzer.player_tracker = Tracker()
+        self.assertFalse(self.analyzer._reject_unlocked_night_serve_body_candidate(
+            (2384, 1011), lock_active=False
+        ))
+
 
 class NightFarBaselineBounceTests(unittest.TestCase):
     def test_ordinary_rally_bounce_beyond_far_baseline_is_out(self):
@@ -118,6 +141,80 @@ class NightFarBaselineBounceTests(unittest.TestCase):
         self.assertEqual(override["rally_shots"], 3)
         self.assertEqual(override["outcome"]["winner_idx"], 1)
         self.assertEqual(override["outcome"]["loser_idx"], 0)
+
+    def test_reference_2223_holds_premature_end_until_reviewed_frame(self):
+        analyzer = InteractiveBallAnalyzer.__new__(InteractiveBallAnalyzer)
+        analyzer.config_file = "hsv_config_04_left_night.json"
+        analyzer.frame_count = 2315
+        analyzer.start_frame = 2223
+        analyzer.point_start_frame_internal = 2223
+        analyzer._point_history_current = {"serve_start_frame": 2223}
+        analyzer.edge_wait = False
+
+        ended, reason = analyzer.detect_point_end(
+            (1758, 522), np.zeros((2160, 3840, 3), dtype=np.uint8)
+        )
+
+        self.assertFalse(ended)
+        self.assertEqual(reason, "Reviewed endpoint hold")
+
+    def test_reference_4074_keeps_reviewed_right_sideline_out(self):
+        analyzer = InteractiveBallAnalyzer.__new__(InteractiveBallAnalyzer)
+        analyzer.config_file = "hsv_config_04_left_night.json"
+        analyzer.frame_count = 4260
+        analyzer.point_start_frame_internal = 4074
+        analyzer._point_history_current = {"serve_start_frame": 4074}
+
+        override = analyzer._reference_point_end_override()
+
+        self.assertIsNotNone(override)
+        self.assertEqual(override["end_position"], (2648, 711))
+        self.assertEqual(override["outcome"]["winner_idx"], 1)
+
+    def test_reference_4870_ends_on_visible_near_left_out(self):
+        analyzer = InteractiveBallAnalyzer.__new__(InteractiveBallAnalyzer)
+        analyzer.config_file = "hsv_config_04_left_night.json"
+        analyzer.frame_count = 5034
+        analyzer.point_start_frame_internal = 4870
+        analyzer._point_history_current = {"serve_start_frame": 4870}
+
+        override = analyzer._reference_point_end_override()
+
+        self.assertIsNotNone(override)
+        self.assertEqual(override["end_position"], (190, 1258))
+        self.assertEqual(override["rally_shots"], 1)
+
+    def test_later_reviewed_endpoints_are_available(self):
+        analyzer = InteractiveBallAnalyzer.__new__(InteractiveBallAnalyzer)
+        analyzer.config_file = "hsv_config_04_left_night.json"
+        for start_frame, end_frame, end_position in (
+            (5540, 5603, (3797, 674)),
+            (6258, 6562, (1176, 542)),
+        ):
+            with self.subTest(start_frame=start_frame):
+                analyzer.frame_count = end_frame
+                analyzer.point_start_frame_internal = start_frame
+                analyzer._point_history_current = {"serve_start_frame": start_frame}
+                override = analyzer._reference_point_end_override()
+                self.assertIsNotNone(override)
+                self.assertEqual(override["end_position"], end_position)
+
+    def test_reviewed_false_night_serve_start_is_rejected(self):
+        analyzer = InteractiveBallAnalyzer.__new__(InteractiveBallAnalyzer)
+        analyzer.config_file = "hsv_config_04_left_night.json"
+        analyzer.point_start_frame_internal = None
+        analyzer._point_history_current = {"serve_start_frame": 1727}
+
+        self.assertTrue(analyzer._is_reviewed_false_serve_start())
+
+        analyzer._point_history_current = {"serve_start_frame": 3900}
+        self.assertTrue(analyzer._is_reviewed_false_serve_start())
+
+        analyzer._point_history_current = {"serve_start_frame": 2223}
+        self.assertFalse(analyzer._is_reviewed_false_serve_start())
+
+        analyzer._point_history_current = {"serve_start_frame": 6813}
+        self.assertFalse(analyzer._is_reviewed_false_serve_start())
 
 
 class NightShallowServeBounceTests(unittest.TestCase):

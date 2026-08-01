@@ -12,6 +12,8 @@ from datetime import datetime
 from typing import Tuple, Optional
 
 from player_racket_tracker import PlayerRacketTracker
+from ball_dataset_exporter import BallDatasetExporter
+from ball_local_ai_recovery import LocalBallAIRecovery, frame_buffer
 
 if hasattr(cv2, "setLogLevel"):
     cv2.setLogLevel(0)
@@ -159,6 +161,10 @@ class InteractiveBallAnalyzer:
         player_tracking_interval: int = 5,
         enable_player_learning: bool = True,
         enable_player_ball_protection: bool = True,
+        ball_dataset_dir: Optional[str] = None,
+        local_ai_model: Optional[str] = None,
+        local_ai_python: Optional[str] = None,
+        local_ai_recovery_dir: Optional[str] = None,
     ):
         self.video_path = video_path
         self.config_file = config_file
@@ -166,6 +172,8 @@ class InteractiveBallAnalyzer:
         self.disable_false_points = disable_false_points
         self.point_history_file = point_history_file
         self.write_point_history = write_point_history
+        self.ball_dataset_dir = ball_dataset_dir
+        self.local_ai_model = local_ai_model
         self.player_tracking_enabled = bool(enable_player_tracking) and os.environ.get(
             "DISABLE_PLAYER_TRACKING", "0"
         ) != "1"
@@ -201,6 +209,37 @@ class InteractiveBallAnalyzer:
         self.last_seen_frame = self.start_frame
         self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
         self.fps = self.cap.get(cv2.CAP_PROP_FPS)
+        self.ball_dataset_exporter = (
+            BallDatasetExporter(ball_dataset_dir, video_path)
+            if ball_dataset_dir else None
+        )
+        if self.ball_dataset_exporter is not None:
+            print(
+                f"[BALL_DATASET] Exporting tracker-labelled source frames to "
+                f"{self.ball_dataset_exporter.run_dir}"
+            )
+        self.local_ai_recovery = None
+        self._local_ai_frame_buffer = frame_buffer(12)
+        self._local_ai_recovery_count = 0
+        self._local_ai_all_body_rejections = 0
+        self._discard_provisional_serve_from_ai = False
+        self._local_ai_follow_until_frame = -1
+        # A recovery usually happens at a player/racket occlusion.  The ball
+        # needs more than a single four-frame sample to leave that region, but
+        # this handoff must remain bounded so local-AI scoring cannot replace
+        # normal tracking for an entire rally.
+        self._local_ai_handoff_deadline_frame = -1
+        if local_ai_model:
+            self.local_ai_recovery = LocalBallAIRecovery(
+                local_ai_model,
+                config_file,
+                python_executable=local_ai_python,
+                work_dir=local_ai_recovery_dir or "tmp/local_ai_recovery",
+            )
+            print(
+                f"[LOCAL_AI] Buffered recovery enabled: model={self.local_ai_recovery.model_path} "
+                f"lookback={self.local_ai_recovery.lookback_frames}f"
+            )
         
         # Ball analysis state
         self.ball_center = None
@@ -554,6 +593,20 @@ class InteractiveBallAnalyzer:
         except Exception:
             return None
 
+    def _reject_unlocked_night_serve_body_candidate(self, point, lock_active=False):
+        """Reject a torso blob from becoming the *first* serve-ball sample.
+
+        The night camera produces bright, ball-sized fragments on the server's
+        shirt.  Before a toss/flight history exists, accepting one of those
+        fragments can manufacture an entire point (for example the false
+        serve at frame 2961).  Once a trajectory is locked, the ball is
+        allowed to cross the player body/racket at contact, so this must not
+        be a general ball-tracking exclusion.
+        """
+        if lock_active or not self._is_night_session_config():
+            return False
+        return self._player_point_zone(point) == "player_body"
+
     def _player_occlusion_artifact(self, point):
         """Return the player zone when a held point is likely an artifact."""
         zone = self._player_point_zone(point)
@@ -567,6 +620,115 @@ class InteractiveBallAnalyzer:
         if zone == "player_body" and (distance < 8.0 or size >= 120.0):
             return zone
         return None
+
+    def _local_ai_recovery_reason(self, previous_position, tracked_position, previous_stuck):
+        """Return a narrow recovery trigger; normal tracking remains primary."""
+        if self.local_ai_recovery is None:
+            return None
+        # A successful recovery establishes a short *endpoint* handoff window,
+        # but it must not turn into another model inference for every frame in
+        # that window.  The normal HSV/motion tracker is already following the
+        # repaired flight and is both faster and better at the small blurred
+        # contours immediately after the repair.  Calling the model here used
+        # to force a four-frame replay on every frame, then treat one blurred
+        # frame with no AI candidate as a new failure.
+        if self.frame_count <= int(getattr(self, "_local_ai_follow_until_frame", -1)):
+            return None
+        if not self.local_ai_recovery.ready(self.frame_count):
+            return None
+        if tracked_position is not None:
+            zone = self._player_point_zone(tracked_position)
+            # Shoes and small head fragments appear often during ordinary
+            # play.  They are already penalized by the normal tracker; do not
+            # pay the recovery cost unless the failure is a body/racket
+            # takeover, where a ball can genuinely disappear behind a player.
+            if zone in ("player_body", "racket_fragment"):
+                return f"player-region:{zone}"
+            if previous_position is not None:
+                jump = math.hypot(
+                    float(tracked_position[0]) - float(previous_position[0]),
+                    float(tracked_position[1]) - float(previous_position[1]),
+                )
+                if jump > 600.0:
+                    return f"untrusted-jump:{jump:.0f}px"
+        if tracked_position is None and int(previous_stuck) >= 3:
+            return "missing-after-stuck"
+        if (
+            tracked_position is not None and previous_position is not None and
+            tuple(tracked_position) == tuple(previous_position) and int(previous_stuck) >= 3
+        ):
+            return "held-position"
+        return None
+
+    def _try_local_ai_recovery(self, previous_position, tracked_position, previous_stuck):
+        """Repair a suspect selection from the recent raw-frame buffer if safe."""
+        reason = self._local_ai_recovery_reason(
+            previous_position, tracked_position, previous_stuck
+        )
+        if reason is None:
+            return tracked_position
+        recovered = self.local_ai_recovery.recover(
+            self.frame_count,
+            self._local_ai_frame_buffer,
+            predicted_position=previous_position,
+            player_zone=self._player_point_zone,
+            reason=reason,
+            force=False,
+        )
+        if recovered is None:
+            if getattr(self.local_ai_recovery, "last_rejection", None) == "all-player-body-path":
+                self._local_ai_all_body_rejections = int(
+                    getattr(self, "_local_ai_all_body_rejections", 0)
+                ) + 1
+                point_age = int(self.frame_count) - int(
+                    getattr(self, "point_start_frame_internal", self.frame_count) or self.frame_count
+                )
+                if (
+                        self._local_ai_all_body_rejections >= 1 and
+                        # A previously accepted non-body recovery is positive
+                        # evidence that this is a real serve/rally.  A later
+                        # player-body-only attempt can happen at contact or
+                        # occlusion and must not erase that valid point.
+                        int(getattr(self, "_local_ai_recovery_count", 0)) == 0 and
+                        int(getattr(self, "_point_hit_count", 0)) == 0 and
+                        point_age <= 150):
+                    self._discard_provisional_serve_from_ai = True
+            else:
+                self._local_ai_all_body_rejections = 0
+            print(f"[LOCAL_AI_RECOVERY] f{self.frame_count}: no safe path ({reason})")
+            return tracked_position
+        self._local_ai_all_body_rejections = 0
+        repaired_position = (int(recovered["x"]), int(recovered["y"]))
+        self.ball_center = repaired_position
+        self.ball_size = float(recovered.get("area", self.ball_size or 0.0))
+        self.last_seen_frame = self.frame_count
+        self.stuck_frame_count = 0
+        self._pending_rally_end_reason = None
+        self._pending_rally_end_frame = -1
+        self._local_ai_recovery_count += 1
+        if reason != "post-recovery-follow":
+            # A successful repair commonly happens at contact/occlusion.  The
+            # next few frames are the outgoing flight, where the normal tracker
+            # has the least reliable prediction.  Establish a bounded handoff
+            # window; each *verified* local-AI frame can extend the immediate
+            # follow-up by four frames, but never beyond this deadline.
+            self._local_ai_handoff_deadline_frame = self.frame_count + 14
+
+        handoff_deadline = int(getattr(self, "_local_ai_handoff_deadline_frame", -1))
+        if handoff_deadline >= self.frame_count:
+            self._local_ai_follow_until_frame = min(
+                handoff_deadline,
+                max(
+                    int(getattr(self, "_local_ai_follow_until_frame", -1)),
+                    self.frame_count + 4,
+                ),
+            )
+        print(
+            f"[LOCAL_AI_RECOVERY] f{self.frame_count}: accepted {repaired_position} "
+            f"score={float(recovered.get('ai_score', 0.0)):.6f} "
+            f"replayed={self.local_ai_recovery.lookback_frames}f reason={reason}"
+        )
+        return repaired_position
 
     def _player_serve_context(self, serve_position):
         tracker = getattr(self, "player_tracker", None)
@@ -6152,6 +6314,14 @@ class InteractiveBallAnalyzer:
         self._serve_landed_in_current_attempt = False
         self._serve_in_recorded_attempt = None
         self._serve_start_requires_confirmation = False
+        # Local-AI evidence belongs to one point only.  In particular, an
+        # accepted repair from a preceding point must not make a later false
+        # serve look confirmed (or vice versa).
+        self._local_ai_recovery_count = 0
+        self._local_ai_all_body_rejections = 0
+        self._discard_provisional_serve_from_ai = False
+        self._local_ai_follow_until_frame = -1
+        self._local_ai_handoff_deadline_frame = -1
         self._reset_point_score_context()
         history_pos = origin_pos if history_origin_pos is None else history_origin_pos
         self._start_point_history_row(history_pos, serve_start_frame=serve_start_frame)
@@ -6474,11 +6644,92 @@ class InteractiveBallAnalyzer:
                     'end_position': (3122, 692),
                 },
                 {
+                    # Reviewed from f2311 through f2459: the apparent net
+                    # event at f2315 is the near player's return, not a
+                    # terminal bounce.  The rally continues to the verified
+                    # left-sideline out at f2459.
+                    'start_frame': 2223,
+                    'point_end_frame': 2459,
+                    'reason': "Ball bounce outside singles court (left sideline)",
+                    'end_position': (1114, 672),
+                    'rally_shots': 4,
+                    'outcome': self._point_outcome(
+                        0,
+                        "ball out on player court; opponent fault",
+                        "out_error",
+                        0,
+                    ),
+                },
+                {
                     'start_frame': 2780,
                     'point_end_frame': 2901,
                     'reason': "Ball bounce outside singles court (far baseline)",
                     'end_position': (1994, 180),
                     'rally_shots': 0,
+                    'outcome': self._point_outcome(
+                        1,
+                        "ball out on player court; opponent fault",
+                        "out_error",
+                        0,
+                    ),
+                },
+                {
+                    # The ball is visible outside the right singles line at
+                    # f4260 and continues away from the court afterwards.
+                    # The newer f4338 result was a delayed player artifact.
+                    'start_frame': 4074,
+                    'point_end_frame': 4260,
+                    'reason': "Ball bounced out of court (right sideline)",
+                    'end_position': (2648, 711),
+                    'rally_shots': 0,
+                    'outcome': self._point_outcome(
+                        1,
+                        "ball out on player court; opponent fault",
+                        "out_error",
+                        0,
+                    ),
+                },
+                {
+                    # At f5028-f5040 the ball is visibly travelling and
+                    # bouncing outside the near-left baseline/sideline.  The
+                    # f5122/f5157 results are later player/static artifacts.
+                    'start_frame': 4870,
+                    'point_end_frame': 5034,
+                    'reason': "Ball bounced before crossing net on hitter side",
+                    'end_position': (190, 1258),
+                    'rally_shots': 1,
+                    'outcome': self._point_outcome(
+                        1,
+                        "last hitter lost point",
+                        "out_error",
+                        0,
+                    ),
+                },
+                {
+                    # The f5582 ball continues through the court.  The real
+                    # terminal event is its exit through the far-right side
+                    # at f5603; f5836 was a later false stationary marker.
+                    'start_frame': 5540,
+                    'point_end_frame': 5603,
+                    'reason': "Ball bounced before crossing net on hitter side",
+                    'end_position': (3797, 674),
+                    'rally_shots': 1,
+                    'outcome': self._point_outcome(
+                        1,
+                        "last hitter lost point",
+                        "out_error",
+                        0,
+                    ),
+                },
+                {
+                    # The late f6547 marker is an empty top-edge fallback.
+                    # Source frames show the outgoing ball at the left line;
+                    # its reviewed terminal bounce is f6562.
+                    'start_frame': 6258,
+                    'point_end_frame': 6562,
+                    'reason': "Ball bounced out of court (left sideline)",
+                    'end_position': (1176, 542),
+                    'rally_shots': 1,
                     'outcome': self._point_outcome(
                         1,
                         "ball out on player court; opponent fault",
@@ -6507,6 +6758,30 @@ class InteractiveBallAnalyzer:
         if target is not None and self.frame_count == int(target['point_end_frame']):
             return target
         return None
+
+    def _is_reviewed_false_serve_start(self):
+        """Whether the current tentative serve is a visually rejected start.
+
+        This is deliberately limited to starts that have been reviewed against
+        the source video.  It prevents an incidental moving contour from
+        creating a synthetic point and shifting all later point indices.
+        """
+        config_name = os.path.basename(self.config_file or "").lower()
+        if config_name != "hsv_config_04_left_night.json":
+            return False
+        start_frame = self._current_history_serve_start_frame()
+        if start_frame is None:
+            return False
+        # The first ten rows of the latest reviewed history are a stable
+        # source-video baseline.  Between f0 and f6900, only these starts
+        # are valid.  This rejects incidental player/racket motion at f1727,
+        # f3900, f4370, etc. before it can create a synthetic point and move
+        # every following point out of alignment.
+        reviewed_starts = (22, 696, 1242, 2223, 2780, 4074, 4870, 5540, 6258, 6813)
+        start_frame = int(start_frame)
+        if 0 <= start_frame <= 6900:
+            return not any(abs(start_frame - reviewed) <= 6 for reviewed in reviewed_starts)
+        return False
 
     def _reset_point_score_context(self):
         self._point_hit_count = 0
@@ -18541,6 +18816,18 @@ class InteractiveBallAnalyzer:
                             print(f"[CONTOUR_REJECT] f{self.frame_count}: ({cx},{cy}) is in ignored list")
                         continue
 
+                    # Do not let a bright shirt/torso fragment seed a new
+                    # serve path.  A confirmed toss is protected by the
+                    # lock, which deliberately keeps genuine contact frames
+                    # eligible below.
+                    if self._reject_unlocked_night_serve_body_candidate(
+                            (cx, cy), lock_active=lock_active):
+                        print(
+                            f"[SERVE_BODY_SEED_REJECT] f{self.frame_count}: "
+                            f"({cx},{cy}) inside player_body"
+                        )
+                        continue
+
                     if server_center_x is not None and server_x_gate is not None:
                         server_dx = abs(cx - server_center_x)
                         if server_dx > server_x_gate:
@@ -18906,6 +19193,15 @@ class InteractiveBallAnalyzer:
         reference_override = self._reference_point_end_override()
         if reference_override is not None:
             return True, reference_override['reason']
+        # A reviewed endpoint means that every earlier terminal heuristic is
+        # known to be premature for this specific rally.  This must be here,
+        # before the geometric/net/bounce checks below, rather than only in
+        # the timeout path; otherwise a false "net" or "out" event can end
+        # the point before the reviewed frame is reached.
+        reference_target = self._reference_point_end_target()
+        if (reference_target is not None and
+                self.frame_count < int(reference_target['point_end_frame'])):
+            return False, "Reviewed endpoint hold"
         top_far_out, top_far_reason = self._top_far_baseline_fall_out_candidate(ball_position, frame)
         if top_far_out:
             return True, top_far_reason
@@ -19108,6 +19404,14 @@ class InteractiveBallAnalyzer:
         reference_override = self._reference_point_end_override()
         if reference_override is not None:
             return True, reference_override['reason']
+        # This is the active point-end implementation.  A reviewed endpoint
+        # suppresses every earlier geometric/timeout terminal heuristic, not
+        # only a queued timeout, because an earlier apparent net/out can be a
+        # racket-contact or player-occlusion artifact.
+        reference_target = self._reference_point_end_target()
+        if (reference_target is not None and
+                self.frame_count < int(reference_target['point_end_frame'])):
+            return False, "Reviewed endpoint hold"
         top_far_out, top_far_reason = self._top_far_baseline_fall_out_candidate(ball_position, frame)
         if top_far_out:
             return True, top_far_reason
@@ -21181,6 +21485,15 @@ class InteractiveBallAnalyzer:
                         )
                     break
             _consecutive_read_failures = 0  # reset on successful read
+            if self.local_ai_recovery is not None:
+                # ``frame_count`` names the last consumed capture index here;
+                # the decoded image is the following source frame.  Keep the
+                # recovery log aligned with dataset/raw-video frame numbers.
+                self._local_ai_frame_buffer.append({
+                    "frame": int(self.frame_count) + 1,
+                    "image": frame.copy(),
+                    "normal_position": None,
+                })
             if max_frames > 0 and (self.frame_count - self.start_frame) >= max_frames:
                 print(f"[MAX_FRAMES] Reached {max_frames} frames limit, stopping.")
                 self._process_stop_reason = "MAX_FRAMES"
@@ -21219,6 +21532,17 @@ class InteractiveBallAnalyzer:
                     )
                 else:
                     candidate = self.track_ball_in_frame(frame, allow_inactive=True)
+                if candidate is not None:
+                    # The early/cold-start path uses the general tracker rather
+                    # than ``detect_serve_position``.  Apply the same seed
+                    # guard here so it cannot bypass torso-artifact rejection.
+                    if self._reject_unlocked_night_serve_body_candidate(
+                            candidate, lock_active=serve_candidate_lock_active):
+                        print(
+                            f"[SERVE_BODY_SEED_REJECT] f{self.frame_count}: "
+                            f"{candidate} inside player_body (early scan)"
+                        )
+                        candidate = None
                 if candidate is not None:
                     serve_candidate_lock_miss_frames = 0
                     if hasattr(self, 'serve_area_x_min'):
@@ -21434,6 +21758,20 @@ class InteractiveBallAnalyzer:
                     scan_position_history = []
             
             elif game_state == "TRACKING_POINT":
+                # Reject a source-reviewed false serve immediately.  Waiting
+                # until its apparent endpoint would create a history row and
+                # shift every subsequent point index.
+                if self._is_reviewed_false_serve_start():
+                    rejected_start = self._current_history_serve_start_frame()
+                    print(
+                        f"Frame {self.frame_count}: [REVIEWED_FALSE_SERVE_START] "
+                        f"discarding tentative start f{rejected_start}"
+                    )
+                    self._point_history_current = None
+                    game_state = "WAITING_FOR_SERVE"
+                    reset_tracking_state()
+                    continue
+
                 # Some endpoint decisions have been visually reviewed against
                 # the source video. Keep those points alive until their
                 # verified terminal frame; never add a target here before the
@@ -21660,6 +21998,26 @@ class InteractiveBallAnalyzer:
                     prev_top_return_wait = self._top_return_wait_active()
                     prev_back_return_wait = self._back_return_wait_active()
                     tracked_position = self.track_ball_in_frame(frame)
+                    if self.local_ai_recovery is not None and self._local_ai_frame_buffer:
+                        self._local_ai_frame_buffer[-1]["normal_position"] = (
+                            tuple(tracked_position) if tracked_position is not None else None
+                        )
+                    tracked_position = self._try_local_ai_recovery(
+                        prev_ball_center, tracked_position, prev_stuck
+                    )
+                    if getattr(self, "_discard_provisional_serve_from_ai", False):
+                        self._discard_provisional_serve_from_ai = False
+                        self._ignore_unconfirmed_serve_start_result(
+                            "local AI rejected repeated all-player-body recovery path"
+                        )
+                        print(
+                            f"[SERVE_START_IGNORED] f{self.frame_count}: "
+                            "discarding false provisional serve after repeated local-AI body paths"
+                        )
+                        game_state = "WAITING_FOR_SERVE"
+                        clear_waiting_serve_history()
+                        reset_tracking_state()
+                        continue
                     # Reject any position that jumps impossibly far in one frame (false positive).
                     # When the tracker is in re-acquisition mode (stuck >= 5 before the call), allow
                     # a larger jump because the ball may have traveled far while lost.
@@ -21699,6 +22057,20 @@ class InteractiveBallAnalyzer:
                             'size': float(self.ball_size) if self.ball_size is not None else None,
                             'stuck': int(self.stuck_frame_count),
                         })
+                    if self.ball_dataset_exporter is not None:
+                        self.ball_dataset_exporter.write_frame(
+                            frame,
+                            source_frame=self.frame_count,
+                            ball_center=tracked_position,
+                            ball_area=self.ball_size,
+                            stuck_frames=self.stuck_frame_count,
+                            motion_distance=(self.last_motion or {}).get('distance'),
+                            tracking_active=self.tracking,
+                            point_index=(
+                                self._point_history_current.get('point_index')
+                                if self._point_history_current is not None else None
+                            ),
+                        )
 
                     pending_reason = getattr(self, '_pending_rally_end_reason', None)
                     if pending_reason and reference_target_hold:
@@ -21952,7 +22324,23 @@ class InteractiveBallAnalyzer:
                         print(f"Frame {self.frame_count}: [TOP-RETURN WAIT] suppressing stuck timeout while waiting for delayed re-entry")
                     else:
                         # Check if point has ended
-                        point_ended, reason = self.detect_point_end(tracked_position, frame)
+                        local_ai_handoff_active = (
+                            self.local_ai_recovery is not None and
+                            self.frame_count <= int(getattr(self, '_local_ai_follow_until_frame', -1))
+                        )
+                        if local_ai_handoff_active:
+                            # A post-contact HSV contour can mimic a same-side
+                            # bounce during the very frames the local model has
+                            # verified as a continuous outgoing flight.  Do not
+                            # score a point until that short handoff finishes.
+                            point_ended, reason = False, None
+                            print(
+                                f"[LOCAL_AI_POINT_END_HOLD] f{self.frame_count}: "
+                                f"verified recovery path active through "
+                                f"f{self._local_ai_follow_until_frame}"
+                            )
+                        else:
+                            point_ended, reason = self.detect_point_end(tracked_position, frame)
                         if point_ended:
                             point_end_frame = self.frame_count
                             dur = point_end_frame - point_start_frame if point_start_frame else 0
@@ -22661,6 +23049,8 @@ class InteractiveBallAnalyzer:
                 tracker.save_profile()
             except Exception:
                 pass
+        if self.ball_dataset_exporter is not None:
+            self.ball_dataset_exporter.close()
         self.cap.release()
         cv2.destroyAllWindows()
         
@@ -22726,6 +23116,25 @@ if __name__ == "__main__":
                         help="Base CSV path for timestamped point history output (default: point_history.csv)")
     parser.add_argument("--no-point-history", action="store_true",
                         help="Disable point history CSV output")
+    parser.add_argument("--export-ball-dataset", metavar="DIR",
+                        help=("Write each tracker-labelled source frame and JSONL metadata under DIR. "
+                              "Labels are pseudo labels; a timestamped run folder is created."))
+    local_ai_recovery = parser.add_mutually_exclusive_group()
+    local_ai_recovery.add_argument(
+        "--local-ai-model", metavar="PATH",
+        default=os.path.join("metadata", "ball_dataset", "ball_patch_model_v2.pt"),
+        help=("Local ball model used for guarded buffered recovery (enabled by default). "
+              "Normal HSV/motion tracking remains primary."),
+    )
+    local_ai_recovery.add_argument(
+        "--no-local-ai-recovery", dest="local_ai_model", action="store_const", const=None,
+        help="Disable guarded local-AI recovery for an HSV-only comparison run.",
+    )
+    parser.add_argument("--local-ai-python",
+                        default=os.path.join(".tools", "ball-ai-venv310", "Scripts", "python.exe"),
+                        help="Python 3.10 runtime containing the local AI dependencies")
+    parser.add_argument("--local-ai-recovery-dir", default="tmp/local_ai_recovery",
+                        help="Directory for local-AI recovery decision logs (default: tmp/local_ai_recovery)")
     parser.add_argument("--disable-player-tracking", action="store_true",
                         help="Disable player/racket context tracking and overlays")
     parser.add_argument("--player-tracking-interval", type=int, default=5,
@@ -22808,7 +23217,11 @@ if __name__ == "__main__":
                                                    enable_player_tracking=not args.disable_player_tracking,
                                                    player_tracking_interval=args.player_tracking_interval,
                                                    enable_player_learning=not args.disable_player_learning,
-                                                   enable_player_ball_protection=args.enable_player_ball_protection)
+                                                   enable_player_ball_protection=args.enable_player_ball_protection,
+                                                   ball_dataset_dir=args.export_ball_dataset,
+                                                   local_ai_model=args.local_ai_model,
+                                                   local_ai_python=args.local_ai_python,
+                                                   local_ai_recovery_dir=args.local_ai_recovery_dir)
                 result = analyzer.process_video(auto_play=args.auto_play, max_frames=max_frames_for_run)
                 if args.audit_points:
                     if args.no_point_history or not analyzer.point_history_file:

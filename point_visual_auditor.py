@@ -82,6 +82,15 @@ class PointVisualAuditAgent:
         self.frames = {}
         self.frame_width = 0
         self.frame_height = 0
+        # Keeping every requested 4K source frame makes a whole-video audit
+        # consume many GB of RAM.  Review sheets are only 640px wide, so keep
+        # an audit-resolution copy and map reported full-resolution points to
+        # it for image operations.  Geometry checks continue to use the
+        # original coordinate system.
+        self.frame_scale = 1.0
+        # 640px is sufficient for the generated contact-sheet tiles and keeps
+        # a 36-point, 4K audit below roughly 0.5GB of decoded-frame memory.
+        self.max_cached_dimension = 640
         self.fps = 0.0
 
     @staticmethod
@@ -160,32 +169,70 @@ class PointVisualAuditAgent:
         if not self.video_path.exists():
             raise FileNotFoundError(f"Video not found: {self.video_path}")
 
+        # Some of the night-session HEVC recordings become unreliable after a
+        # long sequential decode from an arbitrary seek point.  Endpoint
+        # auditing needs only small temporal windows, so split widely-spaced
+        # requests and reopen the decoder for each window.
+        windows = []
+        current = [required[0]]
+        for frame_number in required[1:]:
+            if frame_number - current[-1] > 64:
+                windows.append(current)
+                current = [frame_number]
+            else:
+                current.append(frame_number)
+        windows.append(current)
+
         cap = cv2.VideoCapture(str(self.video_path))
         if not cap.isOpened():
             raise RuntimeError(f"Could not open video: {self.video_path}")
         self.frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
         self.frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+        largest_dimension = max(self.frame_width, self.frame_height, 1)
+        self.frame_scale = min(1.0, float(self.max_cached_dimension) / float(largest_dimension))
         self.fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
-
-        first_frame = required[0]
-        last_frame = required[-1]
-        required_set = set(required)
-        cap.set(cv2.CAP_PROP_POS_FRAMES, first_frame)
-        frame_index = first_frame
-        consecutive_failures = 0
-        while frame_index <= last_frame:
-            ok, frame = cap.read()
-            if not ok:
-                consecutive_failures += 1
-                if consecutive_failures >= 12:
-                    break
-                frame_index += 1
-                continue
-            consecutive_failures = 0
-            if frame_index in required_set:
-                self.frames[frame_index] = frame.copy()
-            frame_index += 1
         cap.release()
+
+        for window in windows:
+            first_frame = window[0]
+            last_frame = window[-1]
+            required_set = set(window)
+            cap = cv2.VideoCapture(str(self.video_path))
+            if not cap.isOpened():
+                continue
+            cap.set(cv2.CAP_PROP_POS_FRAMES, first_frame)
+            frame_index = first_frame
+            consecutive_failures = 0
+            while frame_index <= last_frame:
+                ok, frame = cap.read()
+                if not ok:
+                    consecutive_failures += 1
+                    if consecutive_failures >= 12:
+                        break
+                    frame_index += 1
+                    continue
+                consecutive_failures = 0
+                if frame_index in required_set:
+                    if self.frame_scale < 1.0:
+                        frame = cv2.resize(
+                            frame,
+                            None,
+                            fx=self.frame_scale,
+                            fy=self.frame_scale,
+                            interpolation=cv2.INTER_AREA,
+                        )
+                    self.frames[frame_index] = frame.copy()
+                frame_index += 1
+            cap.release()
+
+    def _frame_point(self, point):
+        """Map an original-video point into the cached audit frame."""
+        if point is None:
+            return None
+        return (
+            int(round(float(point[0]) * self.frame_scale)),
+            int(round(float(point[1]) * self.frame_scale)),
+        )
 
     @staticmethod
     def _draw_marker(frame, point, color=(0, 0, 255)):
@@ -232,14 +279,17 @@ class PointVisualAuditAgent:
 
             display = source.copy()
             is_center = frame_number == center_frame
-            tracked_point = (tracked_points or {}).get(frame_number, {}).get("pos")
+            tracked_point = self._frame_point(
+                (tracked_points or {}).get(frame_number, {}).get("pos")
+            )
+            display_point = self._frame_point(reported_point)
             if tracked_point is not None:
                 self._draw_marker(display, tracked_point, color=(0, 255, 0))
             if is_center:
-                self._draw_marker(display, reported_point)
+                self._draw_marker(display, display_point)
             image = self._resize_cover(display, tile_width, image_height)
 
-            crop_point = tracked_point or reported_point
+            crop_point = tracked_point or display_point
             if crop_point is not None:
                 px, py = crop_point
                 crop_radius = max(100, int(min(source.shape[:2]) * 0.08))
@@ -280,11 +330,10 @@ class PointVisualAuditAgent:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         cv2.imwrite(str(output_path), sheet, [cv2.IMWRITE_JPEG_QUALITY, 91])
 
-    @staticmethod
-    def _clip_patch(frame, point, radius):
+    def _clip_patch(self, frame, point, radius):
         if frame is None or point is None:
             return None
-        x, y = point
+        x, y = self._frame_point(point)
         if not (0 <= x < frame.shape[1] and 0 <= y < frame.shape[0]):
             return None
         x1 = max(0, x - radius)
