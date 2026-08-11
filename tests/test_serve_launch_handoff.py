@@ -171,17 +171,30 @@ class NightFarBaselineBounceTests(unittest.TestCase):
         self.assertEqual(override["end_position"], (2648, 711))
         self.assertEqual(override["outcome"]["winner_idx"], 1)
 
-    def test_reference_4870_ends_on_visible_near_left_out(self):
+    def test_reference_7715_stops_at_reviewed_out_serve_bounce(self):
         analyzer = InteractiveBallAnalyzer.__new__(InteractiveBallAnalyzer)
         analyzer.config_file = "hsv_config_04_left_night.json"
-        analyzer.frame_count = 5034
+        analyzer.frame_count = 7730
+        analyzer.point_start_frame_internal = 7715
+        analyzer._point_history_current = {"serve_start_frame": 7715}
+
+        override = analyzer._reference_point_end_override()
+
+        self.assertIsNotNone(override)
+        self.assertEqual(override["reason"], "Serve bounce outside right service box")
+        self.assertEqual(override["end_position"], (2758, 925))
+
+    def test_reference_4870_ends_on_reviewed_second_bounce(self):
+        analyzer = InteractiveBallAnalyzer.__new__(InteractiveBallAnalyzer)
+        analyzer.config_file = "hsv_config_04_left_night.json"
+        analyzer.frame_count = 5106
         analyzer.point_start_frame_internal = 4870
         analyzer._point_history_current = {"serve_start_frame": 4870}
 
         override = analyzer._reference_point_end_override()
 
         self.assertIsNotNone(override)
-        self.assertEqual(override["end_position"], (190, 1258))
+        self.assertEqual(override["end_position"], (1644, 245))
         self.assertEqual(override["rally_shots"], 1)
 
     def test_later_reviewed_endpoints_are_available(self):
@@ -199,15 +212,18 @@ class NightFarBaselineBounceTests(unittest.TestCase):
                 self.assertIsNotNone(override)
                 self.assertEqual(override["end_position"], end_position)
 
-    def test_reviewed_false_night_serve_start_is_rejected(self):
+    def test_only_reviewed_false_night_serve_starts_are_rejected(self):
         analyzer = InteractiveBallAnalyzer.__new__(InteractiveBallAnalyzer)
         analyzer.config_file = "hsv_config_04_left_night.json"
         analyzer.point_start_frame_internal = None
         analyzer._point_history_current = {"serve_start_frame": 1727}
 
-        self.assertTrue(analyzer._is_reviewed_false_serve_start())
+        self.assertFalse(analyzer._is_reviewed_false_serve_start())
 
         analyzer._point_history_current = {"serve_start_frame": 3900}
+        self.assertTrue(analyzer._is_reviewed_false_serve_start())
+
+        analyzer._point_history_current = {"serve_start_frame": 4370}
         self.assertTrue(analyzer._is_reviewed_false_serve_start())
 
         analyzer._point_history_current = {"serve_start_frame": 2223}

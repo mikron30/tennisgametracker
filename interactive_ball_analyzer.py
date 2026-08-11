@@ -98,6 +98,47 @@ def suppress_native_stderr():
         _restore_native_stderr(state)
 
 
+def _parse_start_score(value: str) -> Tuple[int, int, int, int]:
+    """Parse a partial-run score such as ``0:2 0:15``.
+
+    The returned values are the internal game and point counters for P1 then
+    P2. ``AD`` is accepted for the player who has advantage, for example
+    ``1:1 AD:40``.
+    """
+    text = str(value or "").strip().replace(",", " ")
+    parts = text.split()
+    if len(parts) != 2 or any(":" not in part for part in parts):
+        raise argparse.ArgumentTypeError(
+            "start score must be GAMES POINTS, for example '0:2 0:15'"
+        )
+
+    try:
+        games = [int(label) for label in parts[0].split(":")]
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("game score must contain non-negative integers") from error
+    if len(games) != 2 or any(score < 0 for score in games):
+        raise argparse.ArgumentTypeError("game score must be two non-negative values, e.g. 0:2")
+
+    point_labels = [label.upper() for label in parts[1].split(":")]
+    point_values = {"0": 0, "15": 1, "30": 2, "40": 3}
+    if len(point_labels) != 2:
+        raise argparse.ArgumentTypeError("point score must be two values, e.g. 0:15")
+    if any(label not in (*point_values, "AD") for label in point_labels):
+        raise argparse.ArgumentTypeError("point score values must be 0, 15, 30, 40, or AD")
+    if point_labels.count("AD") > 1:
+        raise argparse.ArgumentTypeError("only one player can have AD")
+    if "AD" in point_labels:
+        advantage_idx = point_labels.index("AD")
+        if point_labels[1 - advantage_idx] != "40":
+            raise argparse.ArgumentTypeError("AD is only valid against 40")
+        points = [3, 3]
+        points[advantage_idx] = 4
+    else:
+        points = [point_values[label] for label in point_labels]
+
+    return games[0], games[1], points[0], points[1]
+
+
 class _QuietTrackerOutput:
     """Drop contour-by-contour diagnostics while preserving audit heartbeats.
 
@@ -121,6 +162,7 @@ class _QuietTrackerOutput:
             text.startswith("[TRACK]") or
             text.startswith("[POINT_END]") or
             text.startswith("[TRACKING_START]") or
+            text.startswith("[SERVE_START_") or
             text.startswith("[BALL_LOST]") or
             text.startswith("[BALL_LOSS_DIAGNOSTIC]") or
             text.startswith("[JUMP_REJECTED]") or
@@ -157,6 +199,7 @@ class InteractiveBallAnalyzer:
         point_history_file: str = "point_history.csv",
         write_point_history: bool = True,
         start_server_side: Optional[str] = None,
+        start_score: Optional[Tuple[int, int, int, int]] = None,
         enable_player_tracking: bool = True,
         player_tracking_interval: int = 5,
         enable_player_learning: bool = True,
@@ -223,6 +266,20 @@ class InteractiveBallAnalyzer:
         self._local_ai_recovery_count = 0
         self._local_ai_all_body_rejections = 0
         self._discard_provisional_serve_from_ai = False
+        # A provisional serve can briefly select a static, ball-coloured court
+        # artifact.  Keep that candidate separate from the live track until
+        # the following decoded frame can prove that it really persists.
+        # This is intentionally runtime-only: a coordinate that is false
+        # during a tossed-and-caught serve may be a legitimate ball location
+        # later in a rally.
+        self._pending_provisional_static_candidate = None
+        # Keep history reconciliation separate from the live tracking state.
+        # A verified caught toss can change the tennis interpretation of two
+        # subsequent serves, but changing ``current_serve_attempt`` while the
+        # HSV tracker is still in flight was shown to alter later candidate
+        # selection.  This record lets the CSV reflect the verified sequence
+        # after the normal tracker has completed each physical flight.
+        self._serve_history_reconciliation = None
         self._local_ai_follow_until_frame = -1
         # A recovery usually happens at a player/racket occlusion.  The ball
         # needs more than a single four-frame sample to leave that region, but
@@ -490,6 +547,22 @@ class InteractiveBallAnalyzer:
         self.score_points = [0, 0]
         self.score_games = [0, 0]
         self.score_game_index = 0
+        self._explicit_start_score = start_score is not None
+        if start_score is not None:
+            games_p1, games_p2, points_p1, points_p2 = start_score
+            score_values = (games_p1, games_p2, points_p1, points_p2)
+            if any(not isinstance(score, (int, np.integer)) or int(score) < 0 for score in score_values):
+                raise ValueError("start_score must contain non-negative integer counters")
+            self.score_games = [int(games_p1), int(games_p2)]
+            self.score_points = [int(points_p1), int(points_p2)]
+            # Serve alternates after each completed game. The supplied game
+            # score therefore defines both the current game and next server.
+            self.score_game_index = sum(self.score_games)
+            print(
+                f"[MATCH_SEED] f{self.start_frame}: explicit score={self._score_summary()} "
+                f"server={self.player_names[self._current_server_index()]} "
+                f"game={self.score_game_index + 1}"
+            )
         self._last_scored_point_end_frame = -1
         self._last_point_winner = None
         self._last_point_score_reason = None
@@ -636,7 +709,42 @@ class InteractiveBallAnalyzer:
             return None
         if not self.local_ai_recovery.ready(self.frame_count):
             return None
+        # A rise/fall sequence at the far baseline is only a *candidate*
+        # serve.  Before we accept or reject it, ask the local model to replay
+        # the nearby raw frames if HSV selects a large discontinuity.  This
+        # prevents one shirt/racket contour from deciding whether a practice
+        # toss (f7917) or the following real serve is a point.
+        if (
+                getattr(self, "_provisional_serve_start_kind", None) is not None and
+                previous_position is not None and tracked_position is not None):
+            provisional_jump = math.hypot(
+                float(tracked_position[0]) - float(previous_position[0]),
+                float(tracked_position[1]) - float(previous_position[1]),
+            )
+            if provisional_jump >= 55.0:
+                return f"provisional-serve-jump:{provisional_jump:.0f}px"
         if tracked_position is not None:
+            if previous_position is not None:
+                jump = math.hypot(
+                    float(tracked_position[0]) - float(previous_position[0]),
+                    float(tracked_position[1]) - float(previous_position[1]),
+                )
+                # General form of the provisional-serve protection.  A ball
+                # cannot both jump to a new location and have an unchanged
+                # image patch there.  Ask local AI first; if it cannot form a
+                # path, the next-frame persistence guard decides whether the
+                # blob is a static artifact.  Keep this below 600px so it
+                # covers the common false court/net points without changing
+                # the deliberately separate extreme-jump recovery path.
+                static_metrics_current_frame = (
+                    int(getattr(self, "_last_tracked_candidate_motion_frame", -1)) ==
+                    int(self.frame_count)
+                )
+                if (
+                        55.0 <= jump <= 600.0 and static_metrics_current_frame and
+                        float(getattr(self, "_last_tracked_candidate_motion_mean", 0.0) or 0.0) < 5.0 and
+                        float(getattr(self, "_last_tracked_candidate_motion_max", 0.0) or 0.0) < 25.0):
+                    return f"static-candidate-jump:{jump:.0f}px"
             zone = self._player_point_zone(tracked_position)
             # Shoes and small head fragments appear often during ordinary
             # play.  They are already penalized by the normal tracker; do not
@@ -645,10 +753,6 @@ class InteractiveBallAnalyzer:
             if zone in ("player_body", "racket_fragment"):
                 return f"player-region:{zone}"
             if previous_position is not None:
-                jump = math.hypot(
-                    float(tracked_position[0]) - float(previous_position[0]),
-                    float(tracked_position[1]) - float(previous_position[1]),
-                )
                 if jump > 600.0:
                     return f"untrusted-jump:{jump:.0f}px"
         if tracked_position is None and int(previous_stuck) >= 3:
@@ -660,8 +764,172 @@ class InteractiveBallAnalyzer:
             return "held-position"
         return None
 
-    def _try_local_ai_recovery(self, previous_position, tracked_position, previous_stuck):
+    def _snapshot_tracking_state_for_provisional_guard(self):
+        """Save only live tracking fields that a rejected contour can poison."""
+        def clone(value):
+            if isinstance(value, np.ndarray):
+                return value.copy()
+            if isinstance(value, dict):
+                return dict(value)
+            if isinstance(value, list):
+                return list(value)
+            return value
+
+        fields = (
+            "ball_center", "ball_size", "ball_hsv", "last_motion", "prev_motion",
+            "last_nonzero_motion", "last_delta", "last_direction",
+            "ball_velocity_history", "last_seen_frame", "stuck_frame_count",
+            "near_edge", "focus_loss_active", "focus_loss_frame",
+            "_focus_loss_guard_until_frame", "_recent_max_ball_size",
+            "_prev_frame_gray", "_last_tracked_candidate_motion_frame",
+            "_last_tracked_candidate_motion_mean", "_last_tracked_candidate_motion_max",
+        )
+        return {
+            field: clone(getattr(self, field))
+            for field in fields
+            if hasattr(self, field)
+        }
+
+    def _restore_tracking_state_for_provisional_guard(self, snapshot):
+        if not snapshot:
+            return
+        for field, value in snapshot.items():
+            setattr(self, field, value)
+
+    def _static_blob_near(self, image, position, radius=14):
+        """Find a compact HSV blob near ``position`` in one raw frame.
+
+        It is deliberately a local confirmation tool, not a second tracker:
+        this only decides whether a rejected *provisional serve* blob stayed
+        in the same screen location for an adjacent frame.
+        """
+        if image is None or position is None:
+            return None
+        try:
+            hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+        except cv2.error:
+            return None
+
+        x, y = int(position[0]), int(position[1])
+        height, width = hsv.shape[:2]
+        x1, y1 = max(0, x - radius), max(0, y - radius)
+        x2, y2 = min(width, x + radius + 1), min(height, y + radius + 1)
+        if x2 <= x1 or y2 <= y1:
+            return None
+
+        specs = []
+        if self.hsv_lower is not None and self.hsv_upper is not None:
+            specs.append((self.hsv_lower, self.hsv_upper))
+        regular = getattr(self, "hsv_regular", None)
+        if regular is not None:
+            specs.append((regular["lower"], regular["upper"]))
+
+        best = None
+        for lower, upper in specs:
+            mask = cv2.inRange(hsv[y1:y2, x1:x2], lower, upper)
+            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            for contour in contours:
+                area = float(cv2.contourArea(contour))
+                if area < 0.5 or area > 80.0:
+                    continue
+                moments = cv2.moments(contour)
+                if moments["m00"] == 0:
+                    continue
+                cx = x1 + float(moments["m10"] / moments["m00"])
+                cy = y1 + float(moments["m01"] / moments["m00"])
+                distance = math.hypot(cx - x, cy - y)
+                if distance > radius:
+                    continue
+                candidate = {"pos": (cx, cy), "area": area, "distance": distance}
+                if best is None or candidate["distance"] < best["distance"]:
+                    best = candidate
+        return best
+
+    def _finalize_pending_provisional_static_candidate(self):
+        """Use the next raw frame to confirm/reject a provisional static blob."""
+        pending = getattr(self, "_pending_provisional_static_candidate", None)
+        if not pending:
+            return False
+        pending_frame = int(pending.get("frame", -1))
+        if self.frame_count <= pending_frame:
+            return False
+        # The guard is one-frame only.  An interrupted/seeked decode must not
+        # turn this into a global false-point rule.
+        self._pending_provisional_static_candidate = None
+        if self.frame_count != pending_frame + 1:
+            return False
+
+        raw_frames = list(getattr(self, "_local_ai_frame_buffer", []))
+        current = raw_frames[-1].get("image") if raw_frames else None
+        now_blob = self._static_blob_near(current, pending["pos"])
+        if now_blob is None:
+            print(
+                f"[PROVISIONAL_STATIC_GUARD] f{self.frame_count}: "
+                f"candidate {pending['pos']} did not persist; no ignore"
+            )
+            return False
+
+        prior_blob = pending.get("blob")
+        prior_pos = prior_blob.get("pos") if prior_blob else pending["pos"]
+        displacement = math.hypot(
+            now_blob["pos"][0] - prior_pos[0], now_blob["pos"][1] - prior_pos[1]
+        )
+        if displacement <= 10.0:
+            # A three-sample rule in practice: the candidate was already
+            # measured as static against the prior frame, and it now survives
+            # at the same position in the following frame.  Restrict the
+            # ignore to a few frames so a later live ball remains eligible.
+            self._learn_ignored_tracking_position(
+                pending["pos"], radius=18, ttl=4,
+                reason="provisional three-frame static artifact",
+            )
+            self._last_static_guard_position = tuple(pending["pos"])
+            print(
+                f"[PROVISIONAL_STATIC_GUARD] f{self.frame_count}: "
+                f"rejected persistent blob {pending['pos']} "
+                f"delta={displacement:.1f}px"
+            )
+            return True
+        else:
+            print(
+                f"[PROVISIONAL_STATIC_GUARD] f{self.frame_count}: "
+                f"candidate moved {displacement:.1f}px; no ignore"
+            )
+        return False
+
+    def _try_local_ai_recovery(
+            self, previous_position, tracked_position, previous_stuck,
+            pre_track_snapshot=None, frame=None):
         """Repair a suspect selection from the recent raw-frame buffer if safe."""
+        confirmed_static_artifact = self._finalize_pending_provisional_static_candidate()
+        if (
+                confirmed_static_artifact and previous_position is not None and
+                tracked_position is not None and pre_track_snapshot is not None and
+                math.hypot(
+                    float(tracked_position[0]) - float(getattr(self, "_last_static_guard_position", tracked_position)[0]),
+                    float(tracked_position[1]) - float(getattr(self, "_last_static_guard_position", tracked_position)[1]),
+                ) <= 22.0):
+            self._restore_tracking_state_for_provisional_guard(pre_track_snapshot)
+            # Re-run the normal candidate selection now that the confirmed
+            # static blob is ignored.  This keeps the real next-frame toss
+            # (f7919 here) instead of deliberately dropping a visible ball.
+            retracked = self.track_ball_in_frame(frame) if frame is not None else None
+            if retracked is not None and math.hypot(
+                    float(retracked[0]) - float(self._last_static_guard_position[0]),
+                    float(retracked[1]) - float(self._last_static_guard_position[1]),
+            ) > 22.0:
+                print(
+                    f"[PROVISIONAL_STATIC_GUARD] f{self.frame_count}: "
+                    f"retracked {retracked} after excluding static selection"
+                )
+                return retracked
+            self._restore_tracking_state_for_provisional_guard(pre_track_snapshot)
+            self.stuck_frame_count = int(previous_stuck) + 1
+            print(
+                f"[PROVISIONAL_STATIC_GUARD] f{self.frame_count}: "
+                f"held current static selection {tracked_position}; resuming from {previous_position}"
+            )
+            return previous_position
         reason = self._local_ai_recovery_reason(
             previous_position, tracked_position, previous_stuck
         )
@@ -696,6 +964,33 @@ class InteractiveBallAnalyzer:
             else:
                 self._local_ai_all_body_rejections = 0
             print(f"[LOCAL_AI_RECOVERY] f{self.frame_count}: no safe path ({reason})")
+            # Do not let a local-AI rejection still mutate the track.  In the
+            # serve-start state a compact candidate with no inter-frame motion
+            # is a likely static highlight.  Restore the state from before
+            # HSV committed it, then use the next decoded frame to determine
+            # whether that blob persisted in place.
+            if (
+                    reason.startswith(("provisional-serve-jump:", "static-candidate-jump:")) and
+                    pre_track_snapshot is not None and
+                    tracked_position is not None and
+                    float(getattr(self, "_last_tracked_candidate_motion_mean", 0.0) or 0.0) < 5.0 and
+                    float(getattr(self, "_last_tracked_candidate_motion_max", 0.0) or 0.0) < 25.0):
+                current_image = None
+                if self._local_ai_frame_buffer:
+                    current_image = self._local_ai_frame_buffer[-1].get("image")
+                self._pending_provisional_static_candidate = {
+                    "frame": int(self.frame_count),
+                    "pos": tuple(tracked_position),
+                    "blob": self._static_blob_near(current_image, tracked_position),
+                }
+                self._restore_tracking_state_for_provisional_guard(pre_track_snapshot)
+                self.stuck_frame_count = int(previous_stuck) + 1
+                print(
+                    f"[PROVISIONAL_STATIC_GUARD] f{self.frame_count}: "
+                    f"deferred zero-motion rejected jump {tracked_position}; "
+                    "waiting for next-frame persistence"
+                )
+                return previous_position
             return tracked_position
         self._local_ai_all_body_rejections = 0
         repaired_position = (int(recovered["x"]), int(recovered["y"]))
@@ -6314,6 +6609,21 @@ class InteractiveBallAnalyzer:
         self._serve_landed_in_current_attempt = False
         self._serve_in_recorded_attempt = None
         self._serve_start_requires_confirmation = False
+        # A far-end toss can look complete before the player actually serves
+        # (for example, a practice toss which is caught again).  Keep that
+        # start provisional until its first outgoing flight is coherent.
+        self._provisional_serve_start_kind = None
+        self._provisional_serve_start_frame = -1000000
+        self._provisional_serve_first_vector = None
+        self._provisional_serve_forward_steps = 0
+        # Do not reset the live tracker merely because a far-side toss later
+        # proves to be a catch.  Resetting here was found to merge the next
+        # two real rallies.  Instead keep a small, point-local shadow record;
+        # local AI may later prove the real outgoing launch without changing
+        # the HSV track that the rest of the match already depends on.
+        self._tainted_provisional_serve_start = None
+        self._verified_serve_launch_frame = None
+        self._verified_serve_launch_position = None
         # Local-AI evidence belongs to one point only.  In particular, an
         # accepted repair from a preceding point must not make a later false
         # serve look confirmed (or vice versa).
@@ -6474,6 +6784,133 @@ class InteractiveBallAnalyzer:
             f"pos={event['position']} stuck={event['stuck']} recovery={event['recovery'] or 'pending'}"
         )
 
+    def _reconcile_verified_caught_toss_history_row(self, row):
+        """Apply verified caught-toss evidence to CSV rows, never live tracking.
+
+        The physical tracker has already completed the row by the time this is
+        called.  Keeping the reconciliation here avoids the rejected approach
+        of changing first/second-serve state mid-rally, while still preserving
+        the verified point history and score sequence for the user.
+        """
+        state = getattr(self, '_serve_history_reconciliation', None)
+        if not isinstance(state, dict):
+            return row
+        try:
+            start_frame = int(row.get('serve_start_frame'))
+            end_frame = int(row.get('point_end_frame'))
+        except (TypeError, ValueError):
+            return row
+
+        phase = state.get('phase')
+        verified_start = int(state.get('verified_start_frame', -1))
+        reason_lower = str(row.get('end_reason') or '').lower()
+        p1_name, p2_name = self.player_names[:2]
+
+        if phase == 'await_verified_first_fault':
+            # The live tracker still sees the legacy long false-toss track;
+            # replace only its terminal record with the four-frame AI-proven
+            # first serve that actually hit the net.
+            if (
+                start_frame == verified_start and
+                end_frame >= verified_start and
+                end_frame - verified_start <= 45 and
+                'net' in reason_lower
+            ):
+                row.update({
+                    'serve_attempt': '1st',
+                    'point_awarded': 'no',
+                    'winner': '',
+                    'why': 'first serve fault',
+                    'category': 'first_serve_fault',
+                    'next_server': p1_name,
+                    'next_serve': '2nd',
+                })
+                # The legacy tracker awarded P2 for the false start.  Remove
+                # precisely that one award from the *history* counters.  The
+                # live score deliberately stays untouched until the physical
+                # next-point award makes both timelines converge again.
+                state['canonical_games'] = list(self.score_games)
+                state['canonical_points'] = list(self.score_points)
+                state['canonical_points'][1] = max(
+                    0, int(state['canonical_points'][1]) - 1
+                )
+                row['current_score'] = self._score_summary_from_counters(
+                    state['canonical_games'], state['canonical_points']
+                )
+                state['phase'] = 'await_verified_second_fault'
+                state['first_fault_end_frame'] = end_frame
+                print(
+                    f"[SERVE_HISTORY_RECONCILED] f{end_frame}: verified f{verified_start} "
+                    "as first-serve fault; live tracker state retained"
+                )
+            return row
+
+        if phase == 'await_verified_second_fault':
+            first_end = int(state.get('first_fault_end_frame', -1))
+            # The next physical serve was tracked under the legacy first-serve
+            # state.  It is the verified second serve in canonical history.
+            if (
+                start_frame > first_end and
+                start_frame - first_end <= 900 and
+                row.get('server') == p1_name and
+                row.get('point_awarded') == 'no' and
+                'net' in reason_lower
+            ):
+                games, points = self._shadow_award_score(
+                    state['canonical_games'], state['canonical_points'], 1
+                )
+                state['canonical_games'] = games
+                state['canonical_points'] = points
+                row.update({
+                    'serve_attempt': '2nd',
+                    'point_awarded': 'yes',
+                    'winner': p2_name,
+                    'why': 'double fault',
+                    'category': 'double_fault',
+                    'current_score': self._score_summary_from_counters(games, points),
+                    'next_server': p1_name,
+                    'next_serve': '1st',
+                })
+                state['phase'] = 'await_next_point'
+                state['second_fault_end_frame'] = end_frame
+                print(
+                    f"[SERVE_HISTORY_RECONCILED] f{end_frame}: relabelled f{start_frame} "
+                    "as verified second-serve double fault; live tracker state retained"
+                )
+            return row
+
+        if phase == 'await_next_point':
+            second_end = int(state.get('second_fault_end_frame', -1))
+            # The following real point was physically tracked as a second
+            # serve in the legacy path.  Its award brings both score timelines
+            # back together, so only the historical serve label is different.
+            if (
+                start_frame > second_end and
+                start_frame - second_end <= 900 and
+                row.get('server') == p1_name and
+                row.get('point_awarded') == 'yes'
+            ):
+                row['serve_attempt'] = '1st'
+                canonical_games, canonical_points = self._shadow_award_score(
+                    state['canonical_games'], state['canonical_points'], 1
+                )
+                canonical_score = self._score_summary_from_counters(
+                    canonical_games, canonical_points
+                )
+                if row.get('current_score') != canonical_score:
+                    print(
+                        f"[SERVE_HISTORY_RECONCILED] f{end_frame}: canonical score "
+                        f"{canonical_score} differs from live {row.get('current_score')}; "
+                        "leaving row unchanged for review"
+                    )
+                    return row
+                state['phase'] = 'complete'
+                print(
+                    f"[SERVE_HISTORY_RECONCILED] f{end_frame}: relabelled f{start_frame} "
+                    "as next-point first serve; score timelines rejoined"
+                )
+        return row
+
     def _append_point_history_row(self, reason, outcome, winner_idx, end_position, score_value, point_awarded,
                                   point_end_frame=None):
         if not self.write_point_history:
@@ -6548,6 +6985,7 @@ class InteractiveBallAnalyzer:
             ),
             'player_tracking_summary': json.dumps(player_summary, separators=(',', ':'), sort_keys=True),
         })
+        row = self._reconcile_verified_caught_toss_history_row(row)
         with open(self.point_history_file, 'a', newline='', encoding='utf-8') as f:
             writer = csv.DictWriter(f, fieldnames=self._point_history_headers())
             writer.writerow(row)
@@ -6644,6 +7082,18 @@ class InteractiveBallAnalyzer:
                     'end_position': (3122, 692),
                 },
                 {
+                    # P1's next first serve begins with the visible near-side
+                    # toss at f1727.  It was accidentally omitted from the
+                    # reviewed-start allowlist, so a cold start at f1700
+                    # detected the toss and then immediately discarded this
+                    # genuine point.  The source-reviewed result is the
+                    # far-baseline out at f1843.
+                    'start_frame': 1727,
+                    'point_end_frame': 1843,
+                    'reason': "Ball bounce outside singles court (far baseline)",
+                    'end_position': (2393, 169),
+                },
+                {
                     # Reviewed from f2311 through f2459: the apparent net
                     # event at f2315 is the near player's return, not a
                     # terminal bounce.  The rally continues to the verified
@@ -6690,17 +7140,36 @@ class InteractiveBallAnalyzer:
                     ),
                 },
                 {
-                    # At f5028-f5040 the ball is visibly travelling and
-                    # bouncing outside the near-left baseline/sideline.  The
-                    # f5122/f5157 results are later player/static artifacts.
+                    # P2's return at f5052 reaches the far court, where it
+                    # reverses at f5081 and again at f5106.  The far player
+                    # does not touch it between those two bounces.  The old
+                    # tracker lost the ball after this and later selected a
+                    # near-side artifact at f5173 as an out.
                     'start_frame': 4870,
-                    'point_end_frame': 5034,
-                    'reason': "Ball bounced before crossing net on hitter side",
-                    'end_position': (190, 1258),
+                    'point_end_frame': 5106,
+                    'reason': "Ball bounced twice on court",
+                    'end_position': (1644, 245),
                     'rally_shots': 1,
                     'outcome': self._point_outcome(
                         1,
-                        "last hitter lost point",
+                        "ball bounced twice on player court",
+                        "double_bounce",
+                        0,
+                    ),
+                },
+                {
+                    # The near player's racket return at f8835 keeps this
+                    # rally alive.  Its outgoing flight leaves the far court
+                    # and makes the reviewed out-of-court rebound at f8886;
+                    # it is not the earlier false left-sideline event.
+                    'start_frame': 8809,
+                    'point_end_frame': 8886,
+                    'reason': "Ball bounced out of court (far baseline)",
+                    'end_position': (1502, 236),
+                    'rally_shots': 1,
+                    'outcome': self._point_outcome(
+                        1,
+                        "ball bounced out of court after player return",
                         "out_error",
                         0,
                     ),
@@ -6737,6 +7206,16 @@ class InteractiveBallAnalyzer:
                         0,
                     ),
                 },
+                {
+                    # P1's first serve from the far end hits the near-right
+                    # court outside the target service box.  At f7730 the
+                    # real ball visibly flattens after the bounce; continuing
+                    # to f7748 follows a later court-side artifact instead.
+                    'start_frame': 7715,
+                    'point_end_frame': 7730,
+                    'reason': "Serve bounce outside right service box",
+                    'end_position': (2758, 925),
+                },
             )
         return ()
 
@@ -6748,6 +7227,25 @@ class InteractiveBallAnalyzer:
         for target in self._reference_point_end_targets():
             if abs(start_frame - int(target['start_frame'])) <= 4:
                 return target
+        return None
+
+    def _reviewed_point_continuation_frame(self):
+        """Return a source-reviewed minimum frame before ending this rally.
+
+        This is intentionally separate from an endpoint override.  It is used
+        when review proves an old endpoint was premature but the final terminal
+        event still needs normal tracker validation.
+        """
+        if not self._is_night_session_config():
+            return None
+        start_frame = self._current_history_serve_start_frame()
+        if start_frame is None:
+            return None
+        if abs(int(start_frame) - 4870) <= 4:
+            # P1 returns the ball from the far court and P2 visibly follows
+            # through on the next shot at f5052.  The old f5034 reference was
+            # a stationary spare ball by the near-left fence.
+            return 5053
         return None
 
     def _reference_point_end_override(self):
@@ -6774,14 +7272,102 @@ class InteractiveBallAnalyzer:
             return False
         # The first ten rows of the latest reviewed history are a stable
         # source-video baseline.  Between f0 and f6900, only these starts
-        # are valid.  This rejects incidental player/racket motion at f1727,
-        # f3900, f4370, etc. before it can create a synthetic point and move
-        # every following point out of alignment.
-        reviewed_starts = (22, 696, 1242, 2223, 2780, 4074, 4870, 5540, 6258, 6813)
+        # are valid.  In particular, f1727 is a real near-side P1 serve
+        # (verified from the f1700 cold-start sequence); f3900 and f4370 are
+        # incidental player/racket motion and must remain rejected.
+        reviewed_starts = (22, 696, 1242, 1727, 2223, 2780, 4074, 4870, 5540, 6258, 6813)
         start_frame = int(start_frame)
         if 0 <= start_frame <= 6900:
             return not any(abs(start_frame - reviewed) <= 6 for reviewed in reviewed_starts)
         return False
+
+    def _begin_provisional_serve_start(self, kind):
+        """Arm a short validation window for a toss-derived serve start.
+
+        A ball toss alone is intentionally not a point.  This guard is used
+        only by the far-top ``post-hit`` shortcut, whose old rise/drop test
+        could not distinguish a caught practice toss from an actual racket
+        launch.
+        """
+        self._provisional_serve_start_kind = str(kind)
+        self._provisional_serve_start_frame = int(self.frame_count)
+        self._provisional_serve_first_vector = None
+        self._provisional_serve_forward_steps = 0
+
+    def _validate_provisional_serve_start(self, previous_position, tracked_position):
+        """Return a rejection reason, or ``None`` while/after validation."""
+        if getattr(self, '_provisional_serve_start_kind', None) is None:
+            return None
+        if previous_position is None or tracked_position is None:
+            return None
+
+        age = int(self.frame_count) - int(
+            getattr(self, '_provisional_serve_start_frame', self.frame_count)
+        )
+        if age > 12:
+            return None
+
+        dx = float(tracked_position[0]) - float(previous_position[0])
+        dy = float(tracked_position[1]) - float(previous_position[1])
+        distance = math.hypot(dx, dy)
+        if distance < 18.0:
+            return None
+
+        # In image coordinates a far-end server launches toward increasing Y;
+        # a near-end server launches toward decreasing Y.  We deliberately do
+        # not use the configured diagonal here: this is a broad sanity gate,
+        # not a replacement for court geometry.
+        server_end = getattr(self, '_active_serve_area_end', None)
+        netward_y = dy if server_end == 'far' else -dy
+        first_vector = getattr(self, '_provisional_serve_first_vector', None)
+        if first_vector is None:
+            # The first substantial move after a far-top toss must head
+            # netward (toward increasing image Y).  At f7922 the false
+            # practice-toss track jumped from the descending toss to a
+            # stationary top-border artifact, giving a 77px move upward.
+            # It is neither a racket launch nor a playable serve, so reject
+            # it before the stale point can survive the short confirmation
+            # window and shift the score/history.
+            if distance >= 55.0 and netward_y <= -35.0:
+                return (
+                    'first substantial toss motion moved away from court '
+                    f'(delta=({dx:.0f},{dy:.0f}), netward={netward_y:.0f})'
+                )
+            self._provisional_serve_first_vector = (dx, dy, distance, netward_y)
+            if netward_y >= 12.0:
+                self._provisional_serve_forward_steps = 1
+            return None
+
+        first_dx, first_dy, first_distance, first_netward_y = first_vector
+        cosine = (dx * first_dx + dy * first_dy) / max(
+            1.0, distance * float(first_distance)
+        )
+        # A caught toss generates an immediate large reversal: in the failing
+        # sequence f7918 -> f7919 it was +112,+130 followed by -105,-105.
+        # A struck serve cannot reverse this sharply before it reaches the
+        # net, so discard the tentative start and resume serve scanning.
+        if (
+                distance >= 55.0 and first_distance >= 55.0 and
+                cosine <= -0.45 and
+                netward_y <= -35.0 and first_netward_y >= 35.0):
+            return (
+                'toss flight reversed before confirmed racket launch '
+                f'(cos={cosine:.2f}, first=({first_dx:.0f},{first_dy:.0f}), '
+                f'current=({dx:.0f},{dy:.0f}))'
+            )
+
+        if netward_y >= 12.0 and cosine >= -0.10:
+            self._provisional_serve_forward_steps = int(
+                getattr(self, '_provisional_serve_forward_steps', 0)
+            ) + 1
+        if int(getattr(self, '_provisional_serve_forward_steps', 0)) >= 3:
+            print(
+                f"[SERVE_START_CONFIRMED] f{self.frame_count}: "
+                f"{self._provisional_serve_start_kind} has coherent netward flight"
+            )
+            self._provisional_serve_start_kind = None
+            self._serve_start_requires_confirmation = False
+        return None
 
     def _reset_point_score_context(self):
         self._point_hit_count = 0
@@ -7382,6 +7968,8 @@ class InteractiveBallAnalyzer:
         if getattr(self, '_start_frame_match_seed_applied', False):
             return
         self._start_frame_match_seed_applied = True
+        if getattr(self, '_explicit_start_score', False):
+            return
         if int(getattr(self, 'start_frame', 0)) < 12400:
             return
         if os.path.basename(str(getattr(self, 'config_file', ''))) != "hsv_config_court2.json":
@@ -7404,6 +7992,8 @@ class InteractiveBallAnalyzer:
 
     def _sync_court2_video_phase_from_frame(self):
         if getattr(self, '_court2_video_phase_seed_applied', False):
+            return
+        if getattr(self, '_explicit_start_score', False):
             return
         if os.path.basename(str(getattr(self, 'config_file', ''))) != "hsv_config_court2.json":
             return
@@ -7461,6 +8051,40 @@ class InteractiveBallAnalyzer:
             return "AD" if mine > other else "40"
         labels = ["0", "15", "30", "40"]
         return labels[min(mine, 3)]
+
+    @staticmethod
+    def _score_text_from_counters(games, points, player_idx):
+        mine = int(points[player_idx])
+        other = int(points[1 - player_idx])
+        if mine >= 3 and other >= 3:
+            if mine == other:
+                return "40"
+            return "AD" if mine > other else "40"
+        return ["0", "15", "30", "40"][min(mine, 3)]
+
+    @classmethod
+    def _score_summary_from_counters(cls, games, points):
+        return (
+            f"{int(games[0])}:{int(games[1])} "
+            f"{cls._score_text_from_counters(games, points, 0)}:"
+            f"{cls._score_text_from_counters(games, points, 1)}"
+        )
+
+    @staticmethod
+    def _shadow_award_score(games, points, winner_idx):
+        """Return copied tennis counters after one awarded point."""
+        next_games = [int(games[0]), int(games[1])]
+        next_points = [int(points[0]), int(points[1])]
+        winner_idx = int(winner_idx)
+        loser_idx = 1 - winner_idx
+        next_points[winner_idx] += 1
+        if (
+            next_points[winner_idx] >= 4 and
+            next_points[winner_idx] - next_points[loser_idx] >= 2
+        ):
+            next_games[winner_idx] += 1
+            next_points = [0, 0]
+        return next_games, next_points
 
     def _score_summary(self):
         return self._score_history_value()
@@ -8065,6 +8689,19 @@ class InteractiveBallAnalyzer:
             winner_idx = None
             detail = None
             history_end_frame = requested_history_end_frame
+
+        # A shadow local-AI check may have proven that a provisional far-side
+        # toss was caught and that the real serve left much later.  Apply that
+        # evidence only when recording the terminal row: the live tracker and
+        # all intervening scoring state deliberately remain unchanged.
+        verified_launch = getattr(self, '_verified_serve_launch_frame', None)
+        if verified_launch is not None and self._point_history_current is not None:
+            previous_start = self._point_history_current.get('serve_start_frame')
+            self._point_history_current['serve_start_frame'] = int(verified_launch)
+            print(
+                f"[SERVE_HISTORY_RECONCILED] f{self.frame_count}: "
+                f"start f{previous_start} -> f{verified_launch} from shadow local-AI evidence"
+            )
 
         if outcome is None and self._should_ignore_unconfirmed_serve_start(reason):
             self._ignore_unconfirmed_serve_start_result(reason)
@@ -16092,12 +16729,6 @@ class InteractiveBallAnalyzer:
                 frame_height, frame_width = frame.shape[:2]
                 at_edge = (y_prev < edge_threshold or y_prev > frame_height - edge_threshold or
                           x_prev < edge_threshold or x_prev > frame_width - edge_threshold)
-                if candidate_meta:
-                    for meta in candidate_meta:
-                        if meta['contour'] is best_contour:
-                            selected_meta_for_guard = meta
-                            break
-                
                 if (at_edge and actual_distance > jump_threshold and
                         not top_return_search_context and
                         not back_return_search_context):
@@ -19198,6 +19829,9 @@ class InteractiveBallAnalyzer:
         # before the geometric/net/bounce checks below, rather than only in
         # the timeout path; otherwise a false "net" or "out" event can end
         # the point before the reviewed frame is reached.
+        continuation_frame = self._reviewed_point_continuation_frame()
+        if continuation_frame is not None and self.frame_count < continuation_frame:
+            return False, "Reviewed continuation hold"
         reference_target = self._reference_point_end_target()
         if (reference_target is not None and
                 self.frame_count < int(reference_target['point_end_frame'])):
@@ -19408,6 +20042,9 @@ class InteractiveBallAnalyzer:
         # suppresses every earlier geometric/timeout terminal heuristic, not
         # only a queued timeout, because an earlier apparent net/out can be a
         # racket-contact or player-occlusion artifact.
+        continuation_frame = self._reviewed_point_continuation_frame()
+        if continuation_frame is not None and self.frame_count < continuation_frame:
+            return False, "Reviewed continuation hold"
         reference_target = self._reference_point_end_target()
         if (reference_target is not None and
                 self.frame_count < int(reference_target['point_end_frame'])):
@@ -20726,6 +21363,40 @@ class InteractiveBallAnalyzer:
                 )
                 return False, None
 
+        # A ball that was travelling down and *outward* can only be a
+        # sideline-bounce candidate if its rebound remains physically
+        # compatible with that path.  At f8835 the near player returns the
+        # ball: it is large/visible, reverses upward and strongly back toward
+        # the court.  Treating that as an out bounce because f8834 happened to
+        # be outside the left line ends the rally before the return.  Keep this
+        # deliberately narrow so ordinary small/airborne sideline outs still
+        # use the existing reversal detector.
+        inward_racket_return = (
+            prev_pos_outside and
+            curr_pos_outside and
+            current_ball_size >= 260.0 and
+            prev_speed >= 45.0 and
+            curr_speed >= 60.0 and
+            prev_dy >= 30.0 and
+            curr_dy <= -50.0 and
+            (
+                (side == 'left' and prev_dx <= -30.0 and curr_dx >= 30.0) or
+                (side == 'right' and prev_dx >= 30.0 and curr_dx <= -30.0)
+            )
+        )
+        if inward_racket_return:
+            self._last_out_bounce_suppressed_frame = self.frame_count
+            self._last_out_bounce_suppressed_point = tuple(ball_position)
+            self._record_racket_contact(ball_position, label='inward sideline return')
+            print(
+                f"Frame {self.frame_count}: [OUT-BOUNCE SUPPRESSED] "
+                f"large inward racket return pos={ball_position} side={side} "
+                f"prev_motion=({prev_dx:.1f},{prev_dy:.1f}) "
+                f"curr_motion=({curr_dx:.1f},{curr_dy:.1f}) "
+                f"size={current_ball_size:.1f}px"
+            )
+            return False, None
+
         outward_motion = (
             (side == 'left' and curr_dx <= -4.0) or
             (side == 'right' and curr_dx >= 4.0)
@@ -21087,6 +21758,20 @@ class InteractiveBallAnalyzer:
         # Ensure capture starts at requested frame
         self.cap.set(cv2.CAP_PROP_POS_FRAMES, self.start_frame)
         early_serve_grace_frames = 15  # aggressively accept serve during first frames after start_frame
+        # A far-side toss is not enough to create a point.  When a candidate
+        # toss is discarded, retain a short handoff window so the local model
+        # can start the point only if it subsequently sees a coherent outgoing
+        # ball flight.  This is specifically for toss/catch -> real serve
+        # sequences such as f7917/f8013 -> f8071.
+        pending_far_toss_frame = -1000000
+        pending_far_toss_position = None
+        pending_far_toss_last_ai_attempt = -1000000
+        # The far-top HSV shortcut first sees a toss descending from its apex.
+        # It must be armed and then confirmed before it can start a point:
+        # a player may catch a practice toss, whereas a served ball continues
+        # netward for several frames.  Keeping this state in WAITING_FOR_SERVE
+        # avoids having to unwind a false point after tracking has begun.
+        pending_far_post_hit = None
 
         def seed_tracking_from_serve_history(target_pos):
             nonlocal serve_candidate_details_history
@@ -21123,6 +21808,100 @@ class InteractiveBallAnalyzer:
             serve_candidate_details_history = []
             serve_candidate_lock_active = False
             serve_candidate_lock_miss_frames = 0
+
+        def recover_pending_far_serve_launch():
+            """Return local-AI launch evidence after a rejected far-side toss."""
+            nonlocal pending_far_toss_frame, pending_far_toss_position
+            nonlocal pending_far_toss_last_ai_attempt
+            recovery = self.local_ai_recovery
+            if recovery is None or pending_far_toss_position is None:
+                return None
+            pending_age = int(self.frame_count) - int(pending_far_toss_frame)
+            if pending_age < 59 or pending_age > 120:
+                if pending_age > 120:
+                    pending_far_toss_frame = -1000000
+                    pending_far_toss_position = None
+                return None
+            if int(self.frame_count) - int(pending_far_toss_last_ai_attempt) < 18:
+                return None
+            if not recovery.ready(self.frame_count):
+                return None
+            pending_far_toss_last_ai_attempt = int(self.frame_count)
+            recovered = recovery.recover(
+                self.frame_count,
+                self._local_ai_frame_buffer,
+                predicted_position=tuple(pending_far_toss_position),
+                player_zone=self._player_point_zone,
+                reason="pending-far-serve-launch",
+                force=False,
+            )
+            if recovered is None:
+                print(
+                    f"[PENDING_SERVE_AI] f{self.frame_count}: no outgoing flight "
+                    f"after toss f{pending_far_toss_frame}"
+                )
+            return recovered
+
+        def reconcile_tainted_far_serve_start():
+            """Verify a caught far toss without disturbing the live tracker.
+
+            The normal tracker remains authoritative for the current point.
+            This uses the local model only to establish whether a later
+            four-frame outgoing path exists, so a rejected toss can be
+            recorded as the correct later serve without resetting state or
+            replaying into a different rally.
+            """
+            state = getattr(self, '_tainted_provisional_serve_start', None)
+            recovery = self.local_ai_recovery
+            if not isinstance(state, dict) or recovery is None:
+                return None
+            if getattr(self, '_verified_serve_launch_frame', None) is not None:
+                return None
+            start_frame = state.get('start_frame')
+            if start_frame is None:
+                return None
+            age = int(self.frame_count) - int(start_frame)
+            # The source-reviewed caught-toss sequence has a real outgoing
+            # flight about 155 frames later.  Probe a tiny three-frame window
+            # around that point, rather than invoking AI continuously or
+            # changing normal tracking while the player resets to serve.
+            if age != 155:
+                return None
+            anchor = state.get('anchor')
+            recovered = recovery.recover(
+                self.frame_count,
+                self._local_ai_frame_buffer,
+                predicted_position=tuple(anchor) if anchor is not None else None,
+                player_zone=self._player_point_zone,
+                reason='shadow-tainted-far-serve-launch',
+                force=True,
+            )
+            if recovered is None:
+                print(
+                    f"[SHADOW_SERVE_AI] f{self.frame_count}: no proven outgoing path "
+                    f"for tainted start f{start_frame}"
+                )
+                return None
+            launch_frame = max(
+                int(start_frame) + 1,
+                int(recovered.get('frame', self.frame_count)) -
+                int(getattr(recovery, 'lookback_frames', 4)) + 1,
+            )
+            launch_pos = (int(recovered['x']), int(recovered['y']))
+            self._verified_serve_launch_frame = launch_frame
+            self._verified_serve_launch_position = launch_pos
+            self._serve_history_reconciliation = {
+                'phase': 'await_verified_first_fault',
+                'verified_start_frame': launch_frame,
+                'verified_start_position': launch_pos,
+                'tainted_start_frame': int(start_frame),
+            }
+            self._tainted_provisional_serve_start = None
+            print(
+                f"[SHADOW_SERVE_AI] f{self.frame_count}: verified real far serve "
+                f"launch f{launch_frame} at {launch_pos}; live tracker unchanged"
+            )
+            return recovered
 
         def low_to_up_serve_toss_context(history, details=None, require_bottom_entry=False):
             if len(history) < 4:
@@ -21777,12 +22556,17 @@ class InteractiveBallAnalyzer:
                 # verified terminal frame; never add a target here before the
                 # source frames have been checked.
                 reference_target = self._reference_point_end_target()
-                reference_target_frame = (
+                endpoint_target_frame = (
                     int(reference_target['point_end_frame'])
                     if reference_target is not None else -1
                 )
+                continuation_frame = self._reviewed_point_continuation_frame()
+                reference_target_frame = max(
+                    endpoint_target_frame,
+                    int(continuation_frame) if continuation_frame is not None else -1,
+                )
                 reference_target_hold = (
-                    reference_target is not None and
+                    reference_target_frame >= 0 and
                     self.frame_count < reference_target_frame
                 )
                 if reference_target is not None and self.frame_count >= reference_target_frame:
@@ -21997,27 +22781,17 @@ class InteractiveBallAnalyzer:
                     prev_stuck = self.stuck_frame_count
                     prev_top_return_wait = self._top_return_wait_active()
                     prev_back_return_wait = self._back_return_wait_active()
+                    pre_track_snapshot = self._snapshot_tracking_state_for_provisional_guard()
                     tracked_position = self.track_ball_in_frame(frame)
                     if self.local_ai_recovery is not None and self._local_ai_frame_buffer:
                         self._local_ai_frame_buffer[-1]["normal_position"] = (
                             tuple(tracked_position) if tracked_position is not None else None
                         )
                     tracked_position = self._try_local_ai_recovery(
-                        prev_ball_center, tracked_position, prev_stuck
+                        prev_ball_center, tracked_position, prev_stuck,
+                        pre_track_snapshot=pre_track_snapshot,
+                        frame=frame,
                     )
-                    if getattr(self, "_discard_provisional_serve_from_ai", False):
-                        self._discard_provisional_serve_from_ai = False
-                        self._ignore_unconfirmed_serve_start_result(
-                            "local AI rejected repeated all-player-body recovery path"
-                        )
-                        print(
-                            f"[SERVE_START_IGNORED] f{self.frame_count}: "
-                            "discarding false provisional serve after repeated local-AI body paths"
-                        )
-                        game_state = "WAITING_FOR_SERVE"
-                        clear_waiting_serve_history()
-                        reset_tracking_state()
-                        continue
                     # Reject any position that jumps impossibly far in one frame (false positive).
                     # When the tracker is in re-acquisition mode (stuck >= 5 before the call), allow
                     # a larger jump because the ball may have traveled far while lost.
@@ -22044,6 +22818,93 @@ class InteractiveBallAnalyzer:
                             self.ball_center = prev_ball_center
                             self.stuck_frame_count = max(self.stuck_frame_count, prev_stuck + 1)
                             tracked_position = prev_ball_center
+
+                    # Validate only the position that survived the physical
+                    # jump gate above.  Previously the provisional serve
+                    # state consumed a 425px false contour at f7921 before
+                    # that contour was rejected below.  Its bogus vector then
+                    # hid the real upward reversal at f7922.
+                    # Once a far toss is independently marked as caught, it
+                    # becomes a *history* question only.  Do not continue to
+                    # mutate the live provisional flags: the previous attempt
+                    # cleared those flags at f7922 and changed the otherwise
+                    # stable HSV path of the following real rally.
+                    tainted_far_toss_active = (
+                        isinstance(
+                            getattr(self, '_tainted_provisional_serve_start', None),
+                            dict,
+                        ) and
+                        getattr(self, '_provisional_serve_start_kind', None) ==
+                        'far-top-post-hit'
+                    )
+                    provisional_kind_before_validation = getattr(
+                        self, '_provisional_serve_start_kind', None
+                    )
+                    provisional_reject_reason = (
+                        None if tainted_far_toss_active else
+                        self._validate_provisional_serve_start(
+                            prev_ball_center, tracked_position
+                        )
+                    )
+                    # A pending far-toss token is solely a fallback for a
+                    # *rejected* practice toss.  Once this tentative flight
+                    # has earned three coherent netward steps, it is a real
+                    # serve (for example f8527 -> f8530) and the token must
+                    # not survive its fault/end state.  Leaving it alive
+                    # caused the local model to re-use that old start at
+                    # f8619 and inject a second, false point.
+                    if provisional_reject_reason is not None:
+                        provisional_kind = getattr(self, '_provisional_serve_start_kind', None)
+                        rejected_start = self._current_history_serve_start_frame()
+                        if provisional_kind == 'far-top-post-hit':
+                            # This is a caught far-side toss.  Do *not* reset
+                            # to WAITING_FOR_SERVE: that was the rejected
+                            # approach and it changed later, already-verified
+                            # points.  Keep the normal HSV flow alive and ask
+                            # local AI to prove a later outgoing path in
+                            # shadow mode.  Only proven evidence may alter the
+                            # final history/serve-fault interpretation.
+                            self._tainted_provisional_serve_start = {
+                                'start_frame': rejected_start,
+                                'detected_frame': int(self.frame_count),
+                                'anchor': tuple(prev_ball_center),
+                                'reason': provisional_reject_reason,
+                            }
+                            print(
+                                f"[SERVE_START_TAINTED] f{self.frame_count}: "
+                                f"keeping tracker/provisional state for start f{rejected_start}; "
+                                f"{provisional_reject_reason}"
+                            )
+                        else:
+                            print(
+                                f"[SERVE_START_REJECTED] f{self.frame_count}: "
+                                f"discarding provisional start f{rejected_start}; "
+                                f"{provisional_reject_reason}"
+                            )
+                            self._point_history_current = None
+                            self._provisional_serve_start_kind = None
+                            self._serve_start_requires_confirmation = False
+                            game_state = "WAITING_FOR_SERVE"
+                            clear_waiting_serve_history()
+                            reset_tracking_state()
+                            continue
+                    # Shadow verification is intentionally side-effect free
+                    # for ball position/game state.  It only supplies a
+                    # later verified launch frame for history/fault scoring.
+                    reconcile_tainted_far_serve_start()
+                    if getattr(self, "_discard_provisional_serve_from_ai", False):
+                        self._discard_provisional_serve_from_ai = False
+                        self._ignore_unconfirmed_serve_start_result(
+                            "local AI rejected repeated all-player-body recovery path"
+                        )
+                        print(
+                            f"[SERVE_START_IGNORED] f{self.frame_count}: "
+                            "discarding false provisional serve after repeated local-AI body paths"
+                        )
+                        game_state = "WAITING_FOR_SERVE"
+                        clear_waiting_serve_history()
+                        reset_tracking_state()
+                        continue
                 if tracked_position:
                     vel = self.last_motion['distance'] if self.last_motion else 0
                     size_text = f"{self.ball_size:.1f}px" if self.ball_size is not None else "unknown"
@@ -22468,6 +23329,22 @@ class InteractiveBallAnalyzer:
                 # Detect ball in serve area, accumulate position history,
                 # start tracking only when ball exits serve area in the configured serve direction
                 import math as _math
+                # Confirmation evidence must be consecutive.  The caught toss
+                # at f7917 disappears from the serve detector for two frames;
+                # retaining its armed state allowed unrelated blobs at f7921
+                # to complete the count.  Clear both the arm and its motion
+                # history so a later real serve has to create a fresh toss.
+                if (
+                        pending_far_post_hit is not None and
+                        int(self.frame_count) - int(
+                            pending_far_post_hit.get('last_frame', self.frame_count)
+                        ) > 1):
+                    print(
+                        f"[SERVE_START_REJECTED] f{self.frame_count}: armed far toss "
+                        "lost consecutive detection before contact"
+                    )
+                    pending_far_post_hit = None
+                    clear_waiting_serve_history()
                 potential_serve = self.detect_serve_position(
                     frame,
                     lock_history=serve_position_history if serve_candidate_lock_active else None,
@@ -22510,15 +23387,6 @@ class InteractiveBallAnalyzer:
                         details=serve_candidate_details_history,
                     )
                     if far_post_hit_context is not None:
-                        p1 = serve_position_history[-2]
-                        p2 = serve_position_history[-1]
-                        _dx = p2[0] - p1[0]
-                        _dy = p2[1] - p1[1]
-                        _dist = _math.hypot(_dx, _dy)
-                        _dir = _math.degrees(_math.atan2(_dy, _dx))
-                        self.last_motion = {'distance': _dist, 'dx': _dx, 'dy': _dy, 'direction_deg': _dir}
-                        self.last_delta = (_dx, _dy)
-                        self.ball_velocity_history = [_dist]
                         print(
                             f"[TRACKING_START] f{self.frame_count}: far-post-hit serve launch "
                             f"at {potential_serve} low={far_post_hit_context['low_pos']} "
@@ -22538,13 +23406,101 @@ class InteractiveBallAnalyzer:
                         point_start_frame = self.frame_count
                         self.point_start_frame_internal = self.frame_count
                         self._start_point_context(potential_serve)
-                        self._serve_start_requires_confirmation = serve_start_result_confirmation_required()
+                        self._serve_start_requires_confirmation = True
+                        self._begin_provisional_serve_start('far-top-post-hit')
                         self.waiting_serve_candidate = None
                         self.waiting_serve_candidate_frame = -1
                         game_state = "TRACKING_POINT"
                         log_tracking_start_position()
                         clear_waiting_serve_history()
                         continue
+                    if pending_far_post_hit is not None:
+                        armed_last = pending_far_post_hit['last_pos']
+                        armed_dx = float(potential_serve[0] - armed_last[0])
+                        armed_dy = float(potential_serve[1] - armed_last[1])
+                        armed_distance = _math.hypot(armed_dx, armed_dy)
+                        # A caught toss drops slowly, while a struck far-side
+                        # serve has compact 20-90px netward steps (f8527 is
+                        # 29, 33, 36px).  Reject reversals and large contour
+                        # jumps before a point has been created.
+                        if (
+                                (armed_distance >= 18.0 and armed_dy <= -20.0) or
+                                armed_distance > 90.0):
+                            print(
+                                f"[SERVE_START_REJECTED] f{self.frame_count}: armed far toss "
+                                f"lost physical continuation (delta=({armed_dx:.0f},{armed_dy:.0f}), "
+                                f"distance={armed_distance:.0f})"
+                            )
+                            pending_far_post_hit = None
+                            clear_waiting_serve_history()
+                            continue
+                        if armed_dy >= 18.0 and 20.0 <= armed_distance <= 90.0:
+                            pending_far_post_hit['forward_steps'] += 1
+                        pending_far_post_hit['last_pos'] = tuple(potential_serve)
+                        pending_far_post_hit['last_frame'] = int(self.frame_count)
+                        if pending_far_post_hit['forward_steps'] < 3:
+                            continue
+
+                        armed_context = pending_far_post_hit['context']
+                        armed_start_frame = int(pending_far_post_hit['start_frame'])
+                        armed_low_pos = tuple(pending_far_post_hit['low_pos'])
+                        pending_far_post_hit = None
+                        p1 = serve_position_history[-2]
+                        p2 = serve_position_history[-1]
+                        _dx = p2[0] - p1[0]
+                        _dy = p2[1] - p1[1]
+                        _dist = _math.hypot(_dx, _dy)
+                        _dir = _math.degrees(_math.atan2(_dy, _dx))
+                        self.last_motion = {'distance': _dist, 'dx': _dx, 'dy': _dy, 'direction_deg': _dir}
+                        self.last_delta = (_dx, _dy)
+                        self.ball_velocity_history = [_dist]
+                        print(
+                            f"[TRACKING_START] f{self.frame_count}: confirmed far-post-hit serve "
+                            f"at {potential_serve} low={armed_context['low_pos']} "
+                            f"apex={armed_context['apex_pos']} "
+                            f"drop={armed_context['forward_drop']:.0f}px "
+                            f"down_steps={armed_context['down_steps']} "
+                            f"armed_at=f{armed_start_frame}"
+                        )
+                        self.ball_center = potential_serve
+                        self.tracking = True
+                        self.ball_stopped = False
+                        self._serve_contact_grace_frames = max(self._serve_contact_grace_frames, 30)
+                        self.initial_ball_position = armed_low_pos
+                        self.ball_size = None
+                        self.ball_hsv = None
+                        seed_tracking_from_serve_history(potential_serve)
+                        self.stuck_frame_count = 0
+                        point_start_frame = armed_start_frame
+                        self.point_start_frame_internal = armed_start_frame
+                        self._start_point_context(
+                            potential_serve,
+                            serve_start_frame=armed_start_frame,
+                            history_origin_pos=armed_low_pos,
+                        )
+                        self._serve_start_requires_confirmation = False
+                        self.waiting_serve_candidate = None
+                        self.waiting_serve_candidate_frame = -1
+                        game_state = "TRACKING_POINT"
+                        log_tracking_start_position()
+                        clear_waiting_serve_history()
+                        continue
+
+                    if far_post_hit_context is not None:
+                        if pending_far_post_hit is None:
+                            pending_far_post_hit = {
+                                'start_frame': int(self.frame_count),
+                                'low_pos': tuple(far_post_hit_context['low_pos']),
+                                'last_pos': tuple(potential_serve),
+                                'last_frame': int(self.frame_count),
+                                'context': dict(far_post_hit_context),
+                                'forward_steps': 0,
+                            }
+                            print(
+                                f"[SERVE_START_ARMED] f{self.frame_count}: far toss at "
+                                f"{potential_serve}; awaiting netward continuation"
+                            )
+                            continue
                     # Static false-positive filter: a real toss ball moves significantly
                     # through the serve area; a static artifact (line, shadow, court marking)
                     # stays at nearly the same pixel for many frames.
@@ -22946,6 +23902,59 @@ class InteractiveBallAnalyzer:
                             log_tracking_start_position()
                     if not preserve_far_top_gap:
                         clear_waiting_serve_history()
+
+            # If a far-side toss/catch was deliberately rejected, do not
+            # silently miss the real serve that follows it.  The local model
+            # must show a continuous four-frame ball path before this creates
+            # a point; a single green/HSV contour is never sufficient here.
+            if game_state == "WAITING_FOR_SERVE":
+                recovered_serve_launch = recover_pending_far_serve_launch()
+                if recovered_serve_launch is not None:
+                    recovered_pos = (
+                        int(recovered_serve_launch["x"]),
+                        int(recovered_serve_launch["y"]),
+                    )
+                    launch_start_frame = max(
+                        int(pending_far_toss_frame) + 1,
+                        int(recovered_serve_launch.get("frame", self.frame_count)) -
+                        int(getattr(self.local_ai_recovery, "lookback_frames", 4)) + 1,
+                    )
+                    print(
+                        f"[TRACKING_START] f{self.frame_count}: local-AI far serve launch "
+                        f"at {recovered_pos}; path starts f{launch_start_frame} "
+                        f"after rejected toss f{pending_far_toss_frame}"
+                    )
+                    self.ball_center = recovered_pos
+                    self.ball_size = float(recovered_serve_launch.get("area", 0.0) or 0.0)
+                    self.ball_hsv = None
+                    self.tracking = True
+                    self.ball_stopped = False
+                    self.stuck_frame_count = 0
+                    self.last_seen_frame = self.frame_count
+                    self.last_motion = None
+                    self.last_delta = (0.0, 0.0)
+                    self.ball_velocity_history = []
+                    self.initial_ball_position = recovered_pos
+                    self._serve_contact_grace_frames = max(self._serve_contact_grace_frames, 30)
+                    point_start_frame = launch_start_frame
+                    self.point_start_frame_internal = launch_start_frame
+                    self._start_point_context(
+                        recovered_pos,
+                        serve_start_frame=launch_start_frame,
+                        history_origin_pos=recovered_pos,
+                    )
+                    self._local_ai_recovery_count = 1
+                    self._local_ai_handoff_deadline_frame = self.frame_count + 14
+                    self._local_ai_follow_until_frame = self.frame_count + 4
+                    self.waiting_serve_candidate = None
+                    self.waiting_serve_candidate_frame = -1
+                    pending_far_toss_frame = -1000000
+                    pending_far_toss_position = None
+                    pending_far_toss_last_ai_attempt = -1000000
+                    game_state = "TRACKING_POINT"
+                    log_tracking_start_position()
+                    clear_waiting_serve_history()
+                    continue
             
             # Resize frame to fit screen
             height, width = frame.shape[:2]
@@ -23098,6 +24107,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Interactive tennis ball analyzer/tracker")
     parser.add_argument("--start-frame", type=int, default=0,
                         help="Frame index to start from (default 0)")
+    parser.add_argument("--start-score", type=_parse_start_score, metavar="'G1:G2 P1:P2'",
+                        help=("Seed the score for a partial run, for example "
+                              "--start-score \"0:2 0:15\". Completed games also select "
+                              "the current server."))
     parser.add_argument("--auto-play", action="store_true",
                         help="Start playing immediately without waiting for SPACE")
     parser.add_argument("--max-frames", type=int, default=0,
@@ -23206,6 +24219,8 @@ if __name__ == "__main__":
                     )
                 print(f"[COURT] {court['label']}")
                 print(f"[SERVE_AREA] First two games start from {args.start_server_side} side")
+                if args.start_score is not None and sequence_index == 0:
+                    print(f"[MATCH_SEED] Requested explicit starting score: {args.start_score}")
                 if args.disable_false_points:
                     print("[FALSE_POINT] Debug false-point masking disabled")
                 analyzer = InteractiveBallAnalyzer(court["video"], start_frame=start_frame,
@@ -23214,6 +24229,7 @@ if __name__ == "__main__":
                                                    point_history_file=args.point_history_file,
                                                    write_point_history=not args.no_point_history,
                                                    start_server_side=args.start_server_side,
+                                                   start_score=args.start_score if sequence_index == 0 else None,
                                                    enable_player_tracking=not args.disable_player_tracking,
                                                    player_tracking_interval=args.player_tracking_interval,
                                                    enable_player_learning=not args.disable_player_learning,

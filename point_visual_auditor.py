@@ -365,7 +365,11 @@ class PointVisualAuditAgent:
         }
         if center is None or point is None:
             return metrics
-        x, y = point
+        # Decoded audit frames may be downscaled to control memory use, while
+        # point-history coordinates are always in the original video space.
+        # Render/crop helpers already convert through _frame_point(); metrics
+        # must do the same before checking bounds or sampling HSV.
+        x, y = self._frame_point(point)
         metrics["position_in_frame"] = bool(0 <= x < center.shape[1] and 0 <= y < center.shape[0])
         if not metrics["position_in_frame"]:
             return metrics

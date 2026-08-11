@@ -107,7 +107,26 @@ def _training_rows(database: Path, limit: int, seed: int) -> list[TrainingRow]:
     return rows[: max(1, limit)]
 
 
-def _make_dataset(rows: list[TrainingRow], seed: int):
+def _reviewed_patch_rows(database: Path, table: str) -> list[TrainingRow]:
+    if table not in {"hard_negative_patches", "hard_positive_patches"}:
+        raise ValueError(f"Unsupported reviewed-patch table: {table}")
+    connection = sqlite3.connect(database)
+    try:
+        exists = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+        ).fetchone()
+        if not exists:
+            return []
+        return [TrainingRow(*row) for row in connection.execute(
+            f"SELECT image_path, candidate_x, candidate_y FROM {table} "
+            "ORDER BY added_at, source_frame"
+        )]
+    finally:
+        connection.close()
+
+
+def _make_dataset(rows: list[TrainingRow], hard_negatives: list[TrainingRow],
+                  hard_positives: list[TrainingRow], seed: int):
     torch, _, _, _, Dataset = _torch()
     rng = random.Random(seed)
     examples: list[tuple[TrainingRow, tuple[float, float], float]] = []
@@ -120,6 +139,24 @@ def _make_dataset(rows: list[TrainingRow], seed: int):
         distance = rng.uniform(62, 180)
         examples.append((row, (row.x + np.cos(angle) * distance,
                                row.y + np.sin(angle) * distance), 0.0))
+
+    # A manually/visually reviewed false candidate is much more valuable than
+    # an arbitrary background crop.  Repeat it with a tiny jitter so a few
+    # corrections have enough influence to counter thousands of pseudo labels.
+    for row in hard_negatives:
+        for _ in range(24):
+            examples.append((
+                row,
+                (row.x + rng.uniform(-6, 6), row.y + rng.uniform(-6, 6)),
+                0.0,
+            ))
+    for row in hard_positives:
+        for _ in range(24):
+            examples.append((
+                row,
+                (row.x + rng.uniform(-6, 6), row.y + rng.uniform(-6, 6)),
+                1.0,
+            ))
         angle = rng.random() * 6.2831853
         distance = rng.uniform(200, 440)
         examples.append((row, (row.x + np.cos(angle) * distance,
@@ -147,12 +184,26 @@ def train(database: Path, model_path: Path, *, epochs: int, samples: int,
     random.Random(seed).shuffle(rows)
     split = max(1, int(len(rows) * 0.85))
     train_rows, validation_rows = rows[:split], rows[split:]
+    hard_negatives = _reviewed_patch_rows(database, "hard_negative_patches")
+    hard_positives = _reviewed_patch_rows(database, "hard_positive_patches")
+    random.Random(seed + 17).shuffle(hard_negatives)
+    random.Random(seed + 23).shuffle(hard_positives)
+    hard_split = int(len(hard_negatives) * 0.85)
+    positive_split = int(len(hard_positives) * 0.85)
+    train_hard_negatives = hard_negatives[:hard_split]
+    validation_hard_negatives = hard_negatives[hard_split:]
+    train_hard_positives = hard_positives[:positive_split]
+    validation_hard_positives = hard_positives[positive_split:]
     device, device_name = _device(torch)
     model = _model_class()().to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-    train_loader = DataLoader(_make_dataset(train_rows, seed), batch_size=batch_size,
+    train_loader = DataLoader(_make_dataset(
+        train_rows, train_hard_negatives, train_hard_positives, seed
+    ), batch_size=batch_size,
                               shuffle=True, num_workers=0)
-    validation_loader = DataLoader(_make_dataset(validation_rows, seed + 1), batch_size=batch_size,
+    validation_loader = DataLoader(_make_dataset(
+        validation_rows, validation_hard_negatives, validation_hard_positives, seed + 1
+    ), batch_size=batch_size,
                                    shuffle=False, num_workers=0)
     history = []
     for epoch in range(1, epochs + 1):
@@ -179,8 +230,12 @@ def train(database: Path, model_path: Path, *, epochs: int, samples: int,
         print(json.dumps(history[-1], sort_keys=True))
     model_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save({"state_dict": model.cpu().state_dict(), "patch_size": PATCH_SIZE,
-                "device_trained": device_name, "rows": len(rows), "history": history}, model_path)
-    return {"model": str(model_path), "device": device_name, "rows": len(rows), "history": history}
+                "device_trained": device_name, "rows": len(rows),
+                "hard_negatives": len(hard_negatives), "hard_positives": len(hard_positives),
+                "history": history}, model_path)
+    return {"model": str(model_path), "device": device_name, "rows": len(rows),
+            "hard_negatives": len(hard_negatives), "hard_positives": len(hard_positives),
+            "history": history}
 
 
 def score(model_path: Path, image_path: Path, candidates: Iterable[dict], batch_size: int) -> list[dict]:
@@ -197,6 +252,44 @@ def score(model_path: Path, image_path: Path, candidates: Iterable[dict], batch_
             scores.extend(torch.sigmoid(model(batch)).cpu().tolist())
     return [{**candidate, "ai_score": round(float(value), 6)}
             for candidate, value in zip(candidates, scores)]
+
+
+def score_batch(model_path: Path, requests: Iterable[dict], batch_size: int) -> list[list[dict]]:
+    """Score several frame candidate lists while loading the model once.
+
+    Local recovery normally needs a short temporal path.  Starting Python and
+    DirectML separately for each frame made a four-frame check far slower than
+    the HSV tracker itself.  Requests stay separate in the result so callers
+    retain their existing per-frame continuity logic.
+    """
+    torch, _, _, _, _ = _torch()
+    device, model = _load_model(model_path, torch)
+    prepared: list[tuple[list[dict], list[np.ndarray]]] = []
+    for request in requests:
+        candidates = list(request.get("candidates") or [])
+        image_path = Path(request["image"])
+        with Image.open(image_path) as image:
+            rgb = image.convert("RGB")
+            patches = [_crop_rgb(rgb, (candidate["x"], candidate["y"])) for candidate in candidates]
+        prepared.append((candidates, patches))
+
+    flat_patches = [patch for _, patches in prepared for patch in patches]
+    flat_scores: list[float] = []
+    with torch.no_grad():
+        for start in range(0, len(flat_patches), max(1, batch_size)):
+            batch = torch.from_numpy(np.stack(flat_patches[start:start + batch_size])).to(device)
+            flat_scores.extend(torch.sigmoid(model(batch)).cpu().tolist())
+
+    results: list[list[dict]] = []
+    offset = 0
+    for candidates, patches in prepared:
+        scores = flat_scores[offset:offset + len(patches)]
+        offset += len(patches)
+        results.append([
+            {**candidate, "ai_score": round(float(value), 6)}
+            for candidate, value in zip(candidates, scores)
+        ])
+    return results
 
 
 def _load_model(model_path: Path, torch):
@@ -264,6 +357,11 @@ def main() -> None:
     score_parser.add_argument("--candidates", required=True,
                               help="JSON file containing [{x, y, ...}, ...]")
     score_parser.add_argument("--batch-size", type=int, default=64)
+    score_batch_parser = commands.add_parser("score-batch")
+    score_batch_parser.add_argument("--model", required=True)
+    score_batch_parser.add_argument("--requests", required=True,
+                                    help="JSON file containing [{image, candidates}, ...]")
+    score_batch_parser.add_argument("--batch-size", type=int, default=64)
     evaluate_parser = commands.add_parser("evaluate")
     evaluate_parser.add_argument("--database", required=True)
     evaluate_parser.add_argument("--model", required=True)
@@ -279,6 +377,10 @@ def main() -> None:
         candidates = json.loads(Path(args.candidates).read_text(encoding="utf-8"))
         print(json.dumps(score(Path(args.model).resolve(), Path(args.image).resolve(),
                                candidates, max(1, args.batch_size))))
+    elif args.command == "score-batch":
+        requests = json.loads(Path(args.requests).read_text(encoding="utf-8"))
+        print(json.dumps(score_batch(Path(args.model).resolve(), requests,
+                                     max(1, args.batch_size))))
     else:
         print(json.dumps(evaluate(Path(args.database).resolve(), Path(args.model).resolve(),
                                   samples=max(100, args.samples), seed=args.seed,

@@ -103,6 +103,42 @@ class LocalBallAIRecovery:
             image_path.unlink(missing_ok=True)
             candidate_path.unlink(missing_ok=True)
 
+    def _score_batch(self, samples: list[tuple[np.ndarray, int, list[dict]]]) -> list[list[dict]]:
+        """Score a short temporal window with one model/runtime startup."""
+        if not samples:
+            return []
+        self._sequence += 1
+        stem = f"batch_{self._sequence:04d}"
+        request_path = self.work_dir / f"{stem}.json"
+        image_paths: list[Path] = []
+        try:
+            requests: list[dict] = []
+            for index, (image, source_frame, candidates) in enumerate(samples):
+                image_path = self.work_dir / f"{stem}_f{int(source_frame):08d}_{index}.jpg"
+                if not cv2.imwrite(str(image_path), image):
+                    raise RuntimeError("Could not write local-AI recovery frame")
+                image_paths.append(image_path)
+                requests.append({"image": str(image_path), "candidates": candidates})
+            request_path.write_text(json.dumps(requests), encoding="utf-8")
+            command = [
+                self.python_executable,
+                str(Path(__file__).with_name("ball_local_ai.py")),
+                "score-batch",
+                "--model", str(self.model_path),
+                "--requests", str(request_path),
+            ]
+            completed = subprocess.run(command, capture_output=True, text=True, timeout=75, check=False)
+            if completed.returncode != 0:
+                raise RuntimeError(completed.stderr.strip() or completed.stdout.strip() or "local AI batch scorer failed")
+            scored = json.loads(completed.stdout.strip())
+            if not isinstance(scored, list) or len(scored) != len(samples):
+                raise RuntimeError("local AI batch scorer returned malformed output")
+            return [list(group) for group in scored]
+        finally:
+            request_path.unlink(missing_ok=True)
+            for image_path in image_paths:
+                image_path.unlink(missing_ok=True)
+
     def _best_candidate(
         self,
         scored: list[dict],
@@ -154,9 +190,8 @@ class LocalBallAIRecovery:
         if len(samples) < 2:
             return None
 
-        accepted: list[dict] = []
+        candidate_samples: list[tuple[dict, list[dict]]] = []
         anchor = predicted_position
-        diagnostics: list[dict] = []
         for sample in samples:
             image = sample.get("image")
             if image is None:
@@ -172,15 +207,34 @@ class LocalBallAIRecovery:
                 radius=950.0 if search_anchor is not None else None,
             )
             candidates = self._candidate_subset(candidates, search_anchor)
-            try:
-                scored = self._score(image, int(sample["frame"]), candidates)
-            except Exception as error:
-                self.last_rejection = "score-error"
-                self._write_event({
-                    "frame": int(frame_index), "reason": reason, "accepted": False,
-                    "error": str(error), "stage": "score",
-                })
-                return None
+            candidate_samples.append((sample, candidates))
+
+        try:
+            # Keep test/research subclasses that override ``_score`` fully
+            # deterministic.  The production scorer batches the window so
+            # one recovery does not cold-start the GPU four times.
+            if self.__class__ is LocalBallAIRecovery:
+                scored_groups = self._score_batch([
+                    (sample["image"], int(sample["frame"]), candidates)
+                    for sample, candidates in candidate_samples
+                ])
+            else:
+                scored_groups = [
+                    self._score(sample["image"], int(sample["frame"]), candidates)
+                    for sample, candidates in candidate_samples
+                ]
+        except Exception as error:
+            self.last_rejection = "score-error"
+            self._write_event({
+                "frame": int(frame_index), "reason": reason, "accepted": False,
+                "error": str(error), "stage": "score",
+            })
+            return None
+
+        accepted: list[dict] = []
+        anchor = predicted_position
+        diagnostics: list[dict] = []
+        for (sample, candidates), scored in zip(candidate_samples, scored_groups):
             selected = self._best_candidate(scored, anchor, player_zone)
             diagnostics.append({
                 "frame": int(sample["frame"]), "candidates": len(candidates),

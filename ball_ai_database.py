@@ -91,6 +91,31 @@ class BallAIDatabase:
                     REFERENCES ball_frames(run_id, source_frame) ON DELETE CASCADE
             );
 
+            -- Hard negatives preserve reviewed *false detections* rather
+            -- than merely dropping them from the positive tracker labels.
+            -- The patch model reads these rows explicitly during training.
+            CREATE TABLE IF NOT EXISTS hard_negative_patches (
+                image_path TEXT NOT NULL,
+                source_frame INTEGER NOT NULL,
+                candidate_x REAL NOT NULL,
+                candidate_y REAL NOT NULL,
+                note TEXT,
+                source TEXT NOT NULL DEFAULT 'review',
+                added_at TEXT NOT NULL,
+                PRIMARY KEY (image_path, source_frame, candidate_x, candidate_y)
+            );
+
+            CREATE TABLE IF NOT EXISTS hard_positive_patches (
+                image_path TEXT NOT NULL,
+                source_frame INTEGER NOT NULL,
+                candidate_x REAL NOT NULL,
+                candidate_y REAL NOT NULL,
+                note TEXT,
+                source TEXT NOT NULL DEFAULT 'review',
+                added_at TEXT NOT NULL,
+                PRIMARY KEY (image_path, source_frame, candidate_x, candidate_y)
+            );
+
             CREATE INDEX IF NOT EXISTS idx_ball_frames_status
                 ON ball_frames(label_status, tracking_active, source_frame);
             CREATE INDEX IF NOT EXISTS idx_ball_frames_point
@@ -301,6 +326,64 @@ class BallAIDatabase:
             (
                 run_id, int(source_frame), review_status, corrected_x, corrected_y,
                 note, reviewer, datetime.now().isoformat(timespec="seconds"),
+            ),
+        )
+        self.connection.commit()
+
+    def add_hard_negative(
+        self,
+        image_path: str | Path,
+        source_frame: int,
+        candidate_x: float,
+        candidate_y: float,
+        *,
+        note: Optional[str] = None,
+        source: str = "review",
+    ) -> None:
+        """Persist a reviewed false candidate for future local-AI training."""
+        image = Path(image_path).expanduser().resolve()
+        if not image.is_file():
+            raise FileNotFoundError(f"Hard-negative image does not exist: {image}")
+        self.connection.execute(
+            """
+            INSERT INTO hard_negative_patches(
+                image_path, source_frame, candidate_x, candidate_y, note, source, added_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(image_path, source_frame, candidate_x, candidate_y) DO UPDATE SET
+                note=excluded.note, source=excluded.source, added_at=excluded.added_at
+            """,
+            (
+                str(image), int(source_frame), float(candidate_x), float(candidate_y),
+                note, str(source), datetime.now().isoformat(timespec="seconds"),
+            ),
+        )
+        self.connection.commit()
+
+    def add_hard_positive(
+        self,
+        image_path: str | Path,
+        source_frame: int,
+        candidate_x: float,
+        candidate_y: float,
+        *,
+        note: Optional[str] = None,
+        source: str = "review",
+    ) -> None:
+        """Persist a reviewed true ball candidate for future local-AI training."""
+        image = Path(image_path).expanduser().resolve()
+        if not image.is_file():
+            raise FileNotFoundError(f"Hard-positive image does not exist: {image}")
+        self.connection.execute(
+            """
+            INSERT INTO hard_positive_patches(
+                image_path, source_frame, candidate_x, candidate_y, note, source, added_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(image_path, source_frame, candidate_x, candidate_y) DO UPDATE SET
+                note=excluded.note, source=excluded.source, added_at=excluded.added_at
+            """,
+            (
+                str(image), int(source_frame), float(candidate_x), float(candidate_y),
+                note, str(source), datetime.now().isoformat(timespec="seconds"),
             ),
         )
         self.connection.commit()
