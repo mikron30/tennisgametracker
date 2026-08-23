@@ -196,6 +196,7 @@ class InteractiveBallAnalyzer:
         config_file: str = "hsv_config.json",
         headless: bool = False,
         disable_false_points: bool = False,
+        disable_specific_frame_logic: bool = False,
         point_history_file: str = "point_history.csv",
         write_point_history: bool = True,
         start_server_side: Optional[str] = None,
@@ -213,6 +214,7 @@ class InteractiveBallAnalyzer:
         self.config_file = config_file
         self.headless = headless
         self.disable_false_points = disable_false_points
+        self.disable_specific_frame_logic = bool(disable_specific_frame_logic)
         self.point_history_file = point_history_file
         self.write_point_history = write_point_history
         self.ball_dataset_dir = ball_dataset_dir
@@ -6792,6 +6794,8 @@ class InteractiveBallAnalyzer:
         of changing first/second-serve state mid-rally, while still preserving
         the verified point history and score sequence for the user.
         """
+        if self.disable_specific_frame_logic:
+            return row
         state = getattr(self, '_serve_history_reconciliation', None)
         if not isinstance(state, dict):
             return row
@@ -6995,6 +6999,8 @@ class InteractiveBallAnalyzer:
         return self.score_game_index % 2
 
     def _point_timeout_result_override(self, reason, end_position=None):
+        if self.disable_specific_frame_logic:
+            return None
         reason_lower = (reason or "").lower()
         if "timeout" not in reason_lower:
             return None
@@ -7044,6 +7050,8 @@ class InteractiveBallAnalyzer:
         table was only consulted at the exact frame, so a generic stuck-ball
         timeout could end the point early and bypass the reviewed endpoint.
         """
+        if self.disable_specific_frame_logic:
+            return ()
         config_name = os.path.basename(self.config_file or "").lower()
         if config_name == "hsv_config_court2.json":
             return (
@@ -7236,6 +7244,8 @@ class InteractiveBallAnalyzer:
         when review proves an old endpoint was premature but the final terminal
         event still needs normal tracker validation.
         """
+        if self.disable_specific_frame_logic:
+            return None
         if not self._is_night_session_config():
             return None
         start_frame = self._current_history_serve_start_frame()
@@ -7264,6 +7274,8 @@ class InteractiveBallAnalyzer:
         the source video.  It prevents an incidental moving contour from
         creating a synthetic point and shifting all later point indices.
         """
+        if self.disable_specific_frame_logic:
+            return False
         config_name = os.path.basename(self.config_file or "").lower()
         if config_name != "hsv_config_04_left_night.json":
             return False
@@ -7965,6 +7977,8 @@ class InteractiveBallAnalyzer:
             )
 
     def _seed_match_state_from_start_frame(self):
+        if self.disable_specific_frame_logic:
+            return
         if getattr(self, '_start_frame_match_seed_applied', False):
             return
         self._start_frame_match_seed_applied = True
@@ -7991,6 +8005,8 @@ class InteractiveBallAnalyzer:
         )
 
     def _sync_court2_video_phase_from_frame(self):
+        if self.disable_specific_frame_logic:
+            return
         if getattr(self, '_court2_video_phase_seed_applied', False):
             return
         if getattr(self, '_explicit_start_score', False):
@@ -8285,6 +8301,8 @@ class InteractiveBallAnalyzer:
         return True
 
     def _court2_false_serve_start_override(self, reason):
+        if self.disable_specific_frame_logic:
+            return False
         if os.path.basename(self.config_file or "").lower() != "hsv_config_court2.json":
             return False
         start_frame = self._current_history_serve_start_frame()
@@ -14610,7 +14628,9 @@ class InteractiveBallAnalyzer:
                 hsv_lower_use = self.hsv_lower
                 hsv_upper_use = self.hsv_upper
                 hsv_mode = "serve_area"
-            use_alt_first = (self.frame_count == 127)
+            use_alt_first = (
+                not self.disable_specific_frame_logic and self.frame_count == 127
+            )
             primary_lower = self.alt_hsv_lower if use_alt_first and self.alt_hsv_lower is not None else hsv_lower_use
             primary_upper = self.alt_hsv_upper if use_alt_first and self.alt_hsv_upper is not None else hsv_upper_use
             # Use the narrower alt filter (capped H max) alongside primary to preserve pre-focus behavior
@@ -24125,6 +24145,8 @@ if __name__ == "__main__":
                         help="Disable learned false-point hiding in debug/tuner views (default)")
     parser.add_argument("--enable-false-points", dest="disable_false_points", action="store_false",
                         help="Enable learned false-point hiding in debug/tuner views")
+    parser.add_argument("--disable-specific-frame-logic", action="store_true",
+                        help="Disable reviewed and exact-frame tracking exceptions")
     parser.add_argument("--point-history-file", default="point_history.csv",
                         help="Base CSV path for timestamped point history output (default: point_history.csv)")
     parser.add_argument("--no-point-history", action="store_true",
@@ -24226,6 +24248,7 @@ if __name__ == "__main__":
                 analyzer = InteractiveBallAnalyzer(court["video"], start_frame=start_frame,
                                                    config_file=court["config"], headless=args.headless,
                                                    disable_false_points=args.disable_false_points,
+                                                   disable_specific_frame_logic=args.disable_specific_frame_logic,
                                                    point_history_file=args.point_history_file,
                                                    write_point_history=not args.no_point_history,
                                                    start_server_side=args.start_server_side,

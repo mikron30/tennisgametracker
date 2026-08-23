@@ -5,34 +5,34 @@
   },
   "racket_sides": {
     "P1": {
-      "left": 55,
-      "right": 37
+      "left": 59,
+      "right": 38
     },
     "P2": {
       "left": 21,
-      "right": 10
+      "right": 11
     }
   },
   "serve_sides": {
     "P1": {
-      "left": 12317,
-      "right": 15799
+      "left": 13124,
+      "right": 16544
     },
     "P2": {
-      "left": 7139,
-      "right": 8707
+      "left": 7536,
+      "right": 9366
     }
   },
   "shots": {
     "P1": {
-      "backhand": 52,
-      "forehand": 40,
+      "backhand": 55,
+      "forehand": 42,
       "unknown": 57
     },
     "P2": {
       "backhand": 9,
-      "forehand": 22,
-      "unknown": 8
+      "forehand": 23,
+      "unknown": 9
     }
   },
   "version": 1
