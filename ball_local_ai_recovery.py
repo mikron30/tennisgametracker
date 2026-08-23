@@ -48,6 +48,13 @@ class LocalBallAIRecovery:
         self.minimum_score = float(minimum_score)
         self.maximum_candidates = max(8, int(maximum_candidates))
         self.last_attempt_frame = -1_000_000
+        # A player/racket occlusion is the one case where waiting for the normal
+        # cooldown is dangerous: the HSV tracker can lock onto the player and
+        # then use that false position as the next search anchor.  After a
+        # player-region recovery attempt fails, allow a short bounded sequence
+        # of immediate retries.  The window is deliberately not extended by
+        # every retry, so this cannot turn local AI into the normal tracker.
+        self._urgent_retry_until_frame = -1_000_000
         self.last_rejection: Optional[str] = None
         self._sequence = 0
         self._config = json.loads(self.config_path.read_text(encoding="utf-8"))
@@ -59,7 +66,10 @@ class LocalBallAIRecovery:
             raise FileNotFoundError(f"Local AI Python runtime not found: {self.python_executable}")
 
     def ready(self, frame_index: int) -> bool:
-        return int(frame_index) - self.last_attempt_frame >= self.cooldown_frames
+        frame_index = int(frame_index)
+        if frame_index <= int(getattr(self, "_urgent_retry_until_frame", -1_000_000)):
+            return True
+        return frame_index - self.last_attempt_frame >= self.cooldown_frames
 
     @staticmethod
     def _distance(point_a, point_b) -> float:
@@ -277,6 +287,25 @@ class LocalBallAIRecovery:
             if path_spread < 4.0:
                 final = None
                 rejection = "static-recovery-path"
+
+        # If the normal tracker has entered a player/racket region and AI could
+        # not yet form a safe temporal path, the next few frames are exactly
+        # where the real ball is most likely to emerge from the occlusion.
+        # Do not let the ordinary 18-frame cooldown blind us during that short
+        # handoff.  Arm this only once; subsequent failures inside the window
+        # do not extend it indefinitely.
+        if final is not None:
+            self._urgent_retry_until_frame = -1_000_000
+        elif str(reason).startswith("player-region:"):
+            current_deadline = int(getattr(self, "_urgent_retry_until_frame", -1_000_000))
+            if current_deadline < int(frame_index):
+                self._urgent_retry_until_frame = int(frame_index) + 8
+                print(
+                    f"[LOCAL_AI_RAPID_RETRY] f{int(frame_index)}: "
+                    f"{reason} recovery not safe yet; retry window through "
+                    f"f{self._urgent_retry_until_frame}"
+                )
+
         payload = {
             "frame": int(frame_index), "reason": reason, "accepted": final is not None,
             "predicted_position": predicted_position, "path": accepted, "diagnostics": diagnostics,
