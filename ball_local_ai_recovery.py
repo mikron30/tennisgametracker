@@ -75,6 +75,106 @@ class LocalBallAIRecovery:
     def _distance(point_a, point_b) -> float:
         return math.hypot(float(point_a[0]) - float(point_b[0]), float(point_a[1]) - float(point_b[1]))
 
+    @staticmethod
+    def _sample_normal_position(sample: dict) -> Optional[tuple[int, int]]:
+        point = sample.get("normal_position")
+        if not isinstance(point, (tuple, list)) or len(point) < 2:
+            return None
+        try:
+            return int(point[0]), int(point[1])
+        except (TypeError, ValueError):
+            return None
+
+    def _build_recovery_corridor(self, samples: list[dict]) -> tuple[dict[int, tuple[int, int]], Optional[float], Optional[dict]]:
+        """Detect a catastrophic normal-tracker jump and extrapolate the last sane lane.
+
+        The normal tracker is still useful before an occlusion.  When its recent
+        positions show a modest physical chain followed by a several-hundred-pixel
+        jump, do not let that bad point become the anchor used to collect/rank AI
+        candidates.  Instead extrapolate the last stable velocity for only the
+        remainder of this short recovery window.
+
+        This is intentionally conservative: ordinary direction changes, racket
+        contacts, and perspective acceleration stay untouched unless the new step
+        is both absolutely large and far beyond the immediately preceding speed.
+        """
+        positioned = []
+        for sample in samples:
+            pos = self._sample_normal_position(sample)
+            if pos is None:
+                continue
+            try:
+                frame = int(sample.get("frame"))
+            except (TypeError, ValueError):
+                continue
+            positioned.append({"frame": frame, "pos": pos})
+
+        if len(positioned) < 3:
+            return {}, None, None
+
+        stable = positioned[:2]
+        outlier = None
+        threshold = None
+        for entry in positioned[2:]:
+            previous = stable[-1]
+            previous_previous = stable[-2]
+            previous_speed = self._distance(previous["pos"], previous_previous["pos"])
+            step = self._distance(entry["pos"], previous["pos"])
+            # Never call a small/medium contact turn an outlier.  The bad case
+            # seen in court footage is a 600+ px teleport after a 10-60 px chain.
+            threshold = max(150.0, min(520.0, previous_speed * 3.2 + 60.0))
+            if step > threshold:
+                outlier = {
+                    "frame": int(entry["frame"]),
+                    "pos": tuple(entry["pos"]),
+                    "step": float(step),
+                    "threshold": float(threshold),
+                }
+                break
+            stable.append(entry)
+
+        if outlier is None or len(stable) < 2:
+            return {}, None, None
+
+        last_good = stable[-1]
+        previous_good = stable[-2]
+        frame_gap = max(1, int(last_good["frame"]) - int(previous_good["frame"]))
+        vx = (float(last_good["pos"][0]) - float(previous_good["pos"][0])) / frame_gap
+        vy = (float(last_good["pos"][1]) - float(previous_good["pos"][1])) / frame_gap
+        stable_speed = math.hypot(vx, vy)
+
+        # A true post-contact ball can accelerate, so the lane is deliberately
+        # wider than one predicted step.  It is still far tighter than the old
+        # 900 px acceptance radius that allowed a far-player ball to teleport
+        # onto the near player's shoulder.
+        corridor_cap = max(180.0, min(420.0, stable_speed * 3.5 + 60.0))
+        anchors: dict[int, tuple[int, int]] = {}
+        for sample in samples:
+            try:
+                frame = int(sample.get("frame"))
+            except (TypeError, ValueError):
+                continue
+            if frame < int(outlier["frame"]):
+                continue
+            dt = frame - int(last_good["frame"])
+            anchors[frame] = (
+                int(round(float(last_good["pos"][0]) + vx * dt)),
+                int(round(float(last_good["pos"][1]) + vy * dt)),
+            )
+
+        info = {
+            "outlier_frame": int(outlier["frame"]),
+            "outlier_position": tuple(outlier["pos"]),
+            "outlier_step": float(outlier["step"]),
+            "outlier_threshold": float(outlier["threshold"]),
+            "last_good_frame": int(last_good["frame"]),
+            "last_good_position": tuple(last_good["pos"]),
+            "velocity": (float(vx), float(vy)),
+            "stable_speed": float(stable_speed),
+            "corridor_cap": float(corridor_cap),
+        }
+        return anchors, corridor_cap, info
+
     def _candidate_subset(self, candidates: list[dict], anchor: Optional[tuple[int, int]]) -> list[dict]:
         if anchor is None:
             # Avoid passing thousands of line/background components through the
@@ -154,6 +254,8 @@ class LocalBallAIRecovery:
         scored: list[dict],
         anchor: Optional[tuple[int, int]],
         player_zone: Callable[[tuple[int, int]], Optional[str]],
+        *,
+        max_anchor_distance: float = 900.0,
     ) -> Optional[dict]:
         ranked = sorted(scored, key=lambda item: float(item.get("ai_score", 0.0)), reverse=True)
         for candidate in ranked:
@@ -166,7 +268,7 @@ class LocalBallAIRecovery:
             threshold = 0.9995 if zone is not None else self.minimum_score
             if score < threshold:
                 continue
-            if anchor is not None and self._distance(point, anchor) > 900.0:
+            if anchor is not None and self._distance(point, anchor) > float(max_anchor_distance):
                 continue
             candidate = dict(candidate)
             candidate["player_zone"] = zone
@@ -200,21 +302,52 @@ class LocalBallAIRecovery:
         if len(samples) < 2:
             return None
 
+        corridor_anchors, corridor_cap, corridor_info = self._build_recovery_corridor(samples)
+        if corridor_info is not None:
+            print(
+                f"[LOCAL_AI_CORRIDOR] f{int(frame_index)}: ignoring normal jump "
+                f"f{corridor_info['outlier_frame']} {corridor_info['outlier_position']} "
+                f"step={corridor_info['outlier_step']:.1f}px > "
+                f"{corridor_info['outlier_threshold']:.1f}px; "
+                f"last_good={corridor_info['last_good_position']} "
+                f"speed={corridor_info['stable_speed']:.1f}px "
+                f"corridor={corridor_info['corridor_cap']:.1f}px"
+            )
+
         candidate_samples: list[tuple[dict, list[dict]]] = []
-        anchor = predicted_position
         for sample in samples:
             image = sample.get("image")
             if image is None:
                 continue
-            normal_position = sample.get("normal_position")
-            search_anchor = anchor or normal_position
+            normal_position = self._sample_normal_position(sample)
+            try:
+                sample_frame = int(sample.get("frame"))
+            except (TypeError, ValueError):
+                continue
+
+            if corridor_info is not None:
+                search_anchor = corridor_anchors.get(
+                    sample_frame,
+                    normal_position or predicted_position,
+                )
+                if sample_frame >= int(corridor_info["outlier_frame"]):
+                    search_radius = max(
+                        260.0,
+                        min(950.0, float(corridor_cap or 420.0) * 1.8),
+                    )
+                else:
+                    search_radius = 950.0
+            else:
+                search_anchor = predicted_position or normal_position
+                search_radius = 950.0 if search_anchor is not None else None
+
             candidates = collect_candidates(
                 image,
                 self._config,
                 min_area=3.0,
                 max_area=2000.0,
                 around=search_anchor,
-                radius=950.0 if search_anchor is not None else None,
+                radius=search_radius if search_anchor is not None else None,
             )
             candidates = self._candidate_subset(candidates, search_anchor)
             candidate_samples.append((sample, candidates))
@@ -238,6 +371,7 @@ class LocalBallAIRecovery:
             self._write_event({
                 "frame": int(frame_index), "reason": reason, "accepted": False,
                 "error": str(error), "stage": "score",
+                "corridor": corridor_info,
             })
             return None
 
@@ -245,17 +379,57 @@ class LocalBallAIRecovery:
         anchor = predicted_position
         diagnostics: list[dict] = []
         for (sample, candidates), scored in zip(candidate_samples, scored_groups):
-            selected = self._best_candidate(scored, anchor, player_zone)
+            sample_frame = int(sample["frame"])
+            normal_position = self._sample_normal_position(sample)
+            restricted = (
+                corridor_info is not None and
+                sample_frame >= int(corridor_info["outlier_frame"])
+            )
+            if corridor_info is not None:
+                sample_anchor = corridor_anchors.get(
+                    sample_frame,
+                    normal_position or anchor,
+                )
+            else:
+                sample_anchor = anchor
+
+            max_anchor_distance = float(corridor_cap or 900.0) if restricted else 900.0
+            selected = self._best_candidate(
+                scored,
+                sample_anchor,
+                player_zone,
+                max_anchor_distance=max_anchor_distance,
+            )
             diagnostics.append({
-                "frame": int(sample["frame"]), "candidates": len(candidates),
+                "frame": sample_frame,
+                "candidates": len(candidates),
+                "anchor": sample_anchor,
+                "anchor_cap": max_anchor_distance,
                 "selected": selected,
             })
             if selected is None:
                 continue
+
             point = (int(selected["x"]), int(selected["y"]))
-            if accepted and self._distance(point, (accepted[-1]["x"], accepted[-1]["y"])) > 900.0:
-                continue
-            accepted.append({**selected, "frame": int(sample["frame"])})
+            if accepted:
+                step = self._distance(
+                    point,
+                    (accepted[-1]["x"], accepted[-1]["y"]),
+                )
+                if restricted:
+                    max_step = max(
+                        220.0,
+                        min(520.0, float(corridor_cap or 420.0) * 1.35),
+                    )
+                else:
+                    max_step = 900.0
+                if step > max_step:
+                    diagnostics[-1]["selected_rejected"] = (
+                        f"path-step {step:.1f}px > {max_step:.1f}px"
+                    )
+                    continue
+
+            accepted.append({**selected, "frame": sample_frame})
             anchor = point
 
         final = accepted[-1] if len(accepted) >= 2 and accepted[-1]["frame"] == int(frame_index) else None
@@ -288,6 +462,26 @@ class LocalBallAIRecovery:
                 final = None
                 rejection = "static-recovery-path"
 
+        if final is not None and corridor_info is not None:
+            # During a detected teleport, a huge contour-size explosion is
+            # another strong sign that the model has latched onto a shirt,
+            # shoulder, or racket fragment just outside the player bbox.
+            previous_areas = [
+                float(sample.get("area", 0.0) or 0.0)
+                for sample in accepted[:-1]
+                if float(sample.get("area", 0.0) or 0.0) > 0.0
+            ]
+            final_area = float(final.get("area", 0.0) or 0.0)
+            if previous_areas:
+                baseline_area = float(np.median(previous_areas))
+                area_cap = max(260.0, baseline_area * 10.0)
+                if final_area > area_cap:
+                    rejection = (
+                        f"recovery-area-explosion:{final_area:.1f}>"
+                        f"{area_cap:.1f}"
+                    )
+                    final = None
+
         # If the normal tracker has entered a player/racket region and AI could
         # not yet form a safe temporal path, the next few frames are exactly
         # where the real ball is most likely to emerge from the occlusion.
@@ -309,7 +503,7 @@ class LocalBallAIRecovery:
         payload = {
             "frame": int(frame_index), "reason": reason, "accepted": final is not None,
             "predicted_position": predicted_position, "path": accepted, "diagnostics": diagnostics,
-            "rejection": rejection,
+            "rejection": rejection, "corridor": corridor_info,
         }
         self.last_rejection = rejection
         self._write_event(payload)
