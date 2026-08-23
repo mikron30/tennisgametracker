@@ -966,6 +966,43 @@ class InteractiveBallAnalyzer:
             else:
                 self._local_ai_all_body_rejections = 0
             print(f"[LOCAL_AI_RECOVERY] f{self.frame_count}: no safe path ({reason})")
+            # If HSV just teleported from a physically coherent ball path into a
+            # player region and local AI could not verify a replacement, never let
+            # that player pixel become the next-frame anchor. Restore the complete
+            # pre-track state (position, size, motion and velocity history) and let
+            # the rapid AI retry continue from the last sane trajectory.
+            if (
+                    reason.startswith("player-region:") and
+                    pre_track_snapshot is not None and
+                    previous_position is not None and
+                    tracked_position is not None):
+                player_jump = math.hypot(
+                    float(tracked_position[0]) - float(previous_position[0]),
+                    float(tracked_position[1]) - float(previous_position[1]),
+                )
+                prior_motion = pre_track_snapshot.get("last_motion") or {}
+                prior_speed = float(prior_motion.get("distance", 0.0) or 0.0)
+                prior_velocities = pre_track_snapshot.get("ball_velocity_history") or []
+                if prior_velocities:
+                    prior_speed = max(
+                        prior_speed,
+                        max(float(value or 0.0) for value in prior_velocities[-3:]),
+                    )
+                jump_limit = max(150.0, min(520.0, prior_speed * 3.2 + 60.0))
+                if player_jump > jump_limit:
+                    rejected_position = tuple(tracked_position)
+                    self._restore_tracking_state_for_provisional_guard(pre_track_snapshot)
+                    self.stuck_frame_count = int(previous_stuck) + 1
+                    if getattr(self, "_last_motion_reacq_frame", -1000000) == self.frame_count:
+                        self._last_motion_reacq_frame = -1000000
+                        self._last_motion_reacq_pos = None
+                    print(
+                        f"[LOCAL_AI_PLAYER_JUMP_ROLLBACK] f{self.frame_count}: "
+                        f"rejected {rejected_position} jump={player_jump:.1f}px > "
+                        f"{jump_limit:.1f}px; restored {previous_position} "
+                        f"stuck={self.stuck_frame_count}"
+                    )
+                    return previous_position
             # Do not let a local-AI rejection still mutate the track.  In the
             # serve-start state a compact candidate with no inter-frame motion
             # is a likely static highlight.  Restore the state from before
