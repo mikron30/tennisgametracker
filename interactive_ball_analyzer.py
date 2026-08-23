@@ -21772,6 +21772,7 @@ class InteractiveBallAnalyzer:
         serve_candidate_lock_miss_frames = 0
         scan_position_history = []  # motion history for SCANNING_FOR_SERVE rightward check
         play_mode = auto_play  # start playing immediately if --auto-play flag is set
+        pause_at_frame_triggered = False
         last_frame_for_debug = None
         last_ball_center_for_debug = None
         last_frame_index_for_debug = None
@@ -24020,6 +24021,12 @@ class InteractiveBallAnalyzer:
             last_frame_index_for_debug = self.frame_count
 
             if not getattr(self, 'auto_play', False) and not self.headless:
+                pause_at_frame = getattr(self, 'pause_at_frame', None)
+                if (pause_at_frame is not None and not pause_at_frame_triggered
+                        and self.frame_count >= pause_at_frame):
+                    play_mode = False
+                    pause_at_frame_triggered = True
+                    print(f"[PAUSE_AT_FRAME] Paused at frame {self.frame_count}")
                 if self.pause_requested:
                     play_mode = False
                 if jump_frames_remaining > 0:
@@ -24127,6 +24134,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Interactive tennis ball analyzer/tracker")
     parser.add_argument("--start-frame", type=int, default=0,
                         help="Frame index to start from (default 0)")
+    parser.add_argument("--pause-at-frame", type=int, default=None,
+                        help="Automatically pause once when this frame is reached")
     parser.add_argument("--start-score", type=_parse_start_score, metavar="'G1:G2 P1:P2'",
                         help=("Seed the score for a partial run, for example "
                               "--start-score \"0:2 0:15\". Completed games also select "
@@ -24261,6 +24270,7 @@ if __name__ == "__main__":
                                                    local_ai_model=args.local_ai_model,
                                                    local_ai_python=args.local_ai_python,
                                                    local_ai_recovery_dir=args.local_ai_recovery_dir)
+                analyzer.pause_at_frame = args.pause_at_frame if sequence_index == 0 else None
                 result = analyzer.process_video(auto_play=args.auto_play, max_frames=max_frames_for_run)
                 if args.audit_points:
                     if args.no_point_history or not analyzer.point_history_file:
