@@ -249,6 +249,60 @@ class LocalBallAIRecovery:
             for image_path in image_paths:
                 image_path.unlink(missing_ok=True)
 
+    def rank_local_roi_candidate(
+        self,
+        frame_index: int,
+        image: np.ndarray,
+        *,
+        anchor: tuple[int, int],
+        radius: float = 25.0,
+        maximum_candidates: int = 12,
+    ) -> Optional[dict]:
+        """Return the model's top contour inside one tightly bounded ROI.
+
+        This is intentionally a *ranker*, not an acceptance decision.  The
+        caller must still prove that the candidate follows the trusted
+        trajectory and has real inter-frame motion.  Keeping those guards in
+        the tracker lets this narrow near-player check use relative model rank
+        without weakening the normal 0.985/0.9995 recovery thresholds.
+        """
+        if image is None or anchor is None:
+            return None
+        roi_radius = max(8.0, float(radius))
+        roi_anchor = (int(anchor[0]), int(anchor[1]))
+        candidates = collect_candidates(
+            image,
+            self._config,
+            min_area=3.0,
+            max_area=2000.0,
+            around=roi_anchor,
+            radius=roi_radius,
+        )
+        candidates = self._candidate_subset(candidates, roi_anchor)[
+            : max(1, int(maximum_candidates))
+        ]
+        if not candidates:
+            return None
+
+        scored = self._score(image, int(frame_index), candidates)
+        ranked = sorted(
+            scored,
+            key=lambda item: float(item.get("ai_score", 0.0)),
+            reverse=True,
+        )
+        if not ranked:
+            return None
+        selected = dict(ranked[0])
+        selected["roi_anchor"] = roi_anchor
+        selected["roi_radius"] = roi_radius
+        selected["roi_candidates"] = len(ranked)
+        selected["roi_score_margin"] = (
+            float(selected.get("ai_score", 0.0)) -
+            float(ranked[1].get("ai_score", 0.0))
+            if len(ranked) >= 2 else None
+        )
+        return selected
+
     def _best_candidate(
         self,
         scored: list[dict],

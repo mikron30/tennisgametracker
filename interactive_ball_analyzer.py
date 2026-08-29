@@ -267,6 +267,14 @@ class InteractiveBallAnalyzer:
         self._local_ai_frame_buffer = frame_buffer(12)
         self._local_ai_recovery_count = 0
         self._local_ai_all_body_rejections = 0
+        # A sharp near-player turn may need a few tightly cropped AI rankings
+        # before ordinary HSV tracking has a trustworthy outgoing vector
+        # again.  This state is bounded to the contact corridor and hands off
+        # as soon as normal tracking clears the player.
+        self._local_ai_tight_roi_follow = None
+        self._local_ai_tight_roi_accept_frame = -1000000
+        self._local_ai_tight_roi_attempt_frame = -1000000
+        self._local_ai_tight_roi_previous_gray = None
         self._discard_provisional_serve_from_ai = False
         # A provisional serve can briefly select a static, ball-coloured court
         # artifact.  Keep that candidate separate from the live track until
@@ -668,6 +676,28 @@ class InteractiveBallAnalyzer:
         except Exception:
             return None
 
+    def _point_in_player_contact_corridor(self, point):
+        """Return whether ``point`` lies in a player's padded contact area.
+
+        Strict body/racket zones are intentionally narrow and can miss a ball
+        just outside the racket.  The player tracker already exposes a padded
+        association corridor for stroke classification; reuse it only as a
+        trigger hint.  Local AI still has to verify a strongly moving contour
+        in a small causal ROI before any position is accepted.
+        """
+        if point is None:
+            return False
+        if self._player_point_zone(point) is not None:
+            return True
+        tracker = getattr(self, 'player_tracker', None)
+        track_for_point = getattr(tracker, '_track_for_point', None)
+        if not callable(track_for_point):
+            return False
+        try:
+            return track_for_point(point) is not None
+        except Exception:
+            return False
+
     def _reject_unlocked_night_serve_body_candidate(self, point, lock_active=False):
         """Reject a torso blob from becoming the *first* serve-ball sample.
 
@@ -699,6 +729,13 @@ class InteractiveBallAnalyzer:
     def _local_ai_recovery_reason(self, previous_position, tracked_position, previous_stuck):
         """Return a narrow recovery trigger; normal tracking remains primary."""
         if self.local_ai_recovery is None:
+            return None
+        # The tight near-player ROI ranker runs before the candidate is
+        # committed.  Do not immediately run the broad buffered recovery on
+        # the same accepted frame merely because the real ball still lies
+        # inside the player's bounding region.
+        if self.frame_count == int(
+                getattr(self, "_local_ai_tight_roi_accept_frame", -1000000)):
             return None
         # A successful recovery establishes a short *endpoint* handoff window,
         # but it must not turn into another model inference for every frame in
@@ -899,6 +936,59 @@ class InteractiveBallAnalyzer:
             )
         return False
 
+    def _try_active_tight_local_ai_hold(
+            self, frame, tracked_position, previous_gray=None):
+        """Advance an active contact ROI when normal tracking only holds.
+
+        Player-occlusion branches can return the previous marker without
+        reaching any candidate-commit hook.  During the bounded tight-ROI
+        contact lock, rank that small area directly instead of waiting five
+        frames for a broad full-frame reacquisition.
+        """
+        follow = getattr(self, '_local_ai_tight_roi_follow', None)
+        if (
+                not isinstance(follow, dict) or frame is None or
+                int(self.frame_count) > int(follow.get('deadline', -1)) or
+                int(self.frame_count) <= int(follow.get('last_frame', -1)) or
+                int(getattr(self, 'stuck_frame_count', 0)) < 3):
+            return None
+
+        held_pos = tracked_position or self.ball_center or follow.get('last_pos')
+        if held_pos is None:
+            return None
+        held_pos = (int(held_pos[0]), int(held_pos[1]))
+        frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        held_motion = self._candidate_motion_metrics(
+            frame_gray, held_pos[0], held_pos[1], previous_gray=previous_gray
+        )
+        held_mean = (
+            float(held_motion.get('mean', 0.0) or 0.0)
+            if held_motion else 0.0
+        )
+        held_max = (
+            float(held_motion.get('max', 0.0) or 0.0)
+            if held_motion else 0.0
+        )
+        height, width = frame.shape[:2]
+        px = max(0, min(width - 1, held_pos[0]))
+        py = max(0, min(height - 1, held_pos[1]))
+        proposal = {
+            'pos': held_pos,
+            'area': float(getattr(self, 'ball_size', 0.0) or 0.0),
+            'hsv': cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)[py, px],
+            'motion_mean': held_mean,
+            'motion_max': held_max,
+            'source': 'tight_roi_held_marker',
+            'recovery_label': 'LOCAL AI TIGHT ROI HOLD',
+            'tight_roi_force_rank': True,
+        }
+        preferred = self._prefer_night_tight_local_ai_candidate(
+            frame, frame_gray, proposal, previous_gray=previous_gray
+        )
+        if preferred.get('source') != 'local_ai_tight_roi':
+            return None
+        return self._commit_night_visible_ball_recovery(preferred, frame)
+
     def _try_local_ai_recovery(
             self, previous_position, tracked_position, previous_stuck,
             pre_track_snapshot=None, frame=None):
@@ -932,6 +1022,13 @@ class InteractiveBallAnalyzer:
                 f"held current static selection {tracked_position}; resuming from {previous_position}"
             )
             return previous_position
+        tight_hold_recovery = self._try_active_tight_local_ai_hold(
+            frame,
+            tracked_position,
+            previous_gray=(pre_track_snapshot or {}).get('_prev_frame_gray'),
+        )
+        if tight_hold_recovery is not None:
+            return tight_hold_recovery
         reason = self._local_ai_recovery_reason(
             previous_position, tracked_position, previous_stuck
         )
@@ -4213,12 +4310,37 @@ class InteractiveBallAnalyzer:
             'mask_area': 0.0,
         }
 
-    def _candidate_motion_metrics(self, gray_frame, cx, cy, radius=8):
-        prev_gray = getattr(self, '_prev_frame_gray', None)
+    def _candidate_motion_metrics(
+            self, gray_frame, cx, cy, radius=8, previous_gray=None):
+        prev_gray = (
+            previous_gray if previous_gray is not None else
+            getattr(self, '_prev_frame_gray', None)
+        )
         if gray_frame is None or prev_gray is None:
             return None
         if gray_frame.shape[:2] != prev_gray.shape[:2]:
             return None
+
+        # A player-reacquisition pass can update ``_prev_frame_gray`` before
+        # the caller learns that normal tracking merely held the old marker.
+        # Tight contact recovery receives the causal pre-track image directly;
+        # compute that one patch without contaminating the per-frame cache.
+        if previous_gray is not None:
+            x1 = max(0, cx - radius)
+            y1 = max(0, cy - radius)
+            x2 = min(gray_frame.shape[1], cx + radius + 1)
+            y2 = min(gray_frame.shape[0], cy + radius + 1)
+            if x2 <= x1 or y2 <= y1:
+                return None
+            current_patch = gray_frame[y1:y2, x1:x2]
+            previous_patch = prev_gray[y1:y2, x1:x2]
+            if current_patch.size == 0 or previous_patch.size == 0:
+                return None
+            diff_patch = cv2.absdiff(previous_patch, current_patch)
+            return {
+                'mean': float(np.mean(diff_patch)),
+                'max': float(np.max(diff_patch)),
+            }
 
         # This helper is called for every HSV contour.  A bright/noisy night
         # frame can produce hundreds of contours, so repeatedly calculating
@@ -4429,6 +4551,390 @@ class InteractiveBallAnalyzer:
 
         _, _, chosen = min(candidates, key=lambda item: (item[0], item[1]))
         return chosen
+
+    def _prefer_night_tight_local_ai_candidate(
+            self, frame, frame_gray, proposed_candidate, previous_gray=None):
+        """Prefer a model-ranked ball in a bounded causal ROI near contact.
+
+        This is deliberately candidate arbitration, not broad recovery.  It
+        handles both a sharp weak-motion player-region turn and a fast ball
+        that stalls at a racket before launching.  Coherent normal candidates
+        pass through cheaply; suspicious proposals are ranked only inside the
+        small causal/predicted corridor.
+        """
+        recovery = getattr(self, 'local_ai_recovery', None)
+        ranker = getattr(recovery, 'rank_local_roi_candidate', None)
+        previous = getattr(self, 'ball_center', None)
+        if (
+                recovery is None or not callable(ranker) or frame is None or
+                frame_gray is None or proposed_candidate is None or
+                previous is None):
+            return proposed_candidate
+
+        frame_index = int(self.frame_count)
+        follow = getattr(self, '_local_ai_tight_roi_follow', None)
+        if isinstance(follow, dict) and frame_index > int(follow.get('deadline', -1)):
+            self._local_ai_tight_roi_follow = None
+            follow = None
+        follow_active = (
+            isinstance(follow, dict) and
+            int(follow.get('last_frame', -1)) < frame_index <=
+            int(follow.get('deadline', -1))
+        )
+
+        prior_motion = dict(getattr(self, 'last_motion', None) or {})
+        prior_dx = float(prior_motion.get('dx', 0.0) or 0.0)
+        prior_dy = float(prior_motion.get('dy', 0.0) or 0.0)
+        prior_speed = float(
+            prior_motion.get('distance', math.hypot(prior_dx, prior_dy)) or 0.0
+        )
+        proposed_pos = tuple(proposed_candidate.get('pos') or previous)
+        proposed_dx = float(proposed_pos[0]) - float(previous[0])
+        proposed_dy = float(proposed_pos[1]) - float(previous[1])
+        proposed_speed = math.hypot(proposed_dx, proposed_dy)
+        proposed_mean = float(proposed_candidate.get('motion_mean', 0.0) or 0.0)
+        proposed_max = float(proposed_candidate.get('motion_max', 0.0) or 0.0)
+        initial_mode = 'tight_turn'
+        roi_radius = 25.0
+        prediction_limit = 25.0
+        fast_follow = False
+
+        if follow_active:
+            origin = tuple(follow['last_pos'])
+            follow_mode = str(follow.get('mode', 'tight_turn'))
+            fast_follow = follow_mode == 'fast_contact'
+            elapsed = max(1, frame_index - int(follow['last_frame']))
+            if fast_follow:
+                ai_accept_count = int(follow.get('ai_accept_count', 1))
+                velocity = tuple(follow.get('velocity', (0.0, 0.0)))
+                if ai_accept_count <= 1:
+                    # The first post-stall direction is unknown.  Stay tightly
+                    # around contact for one frame before extrapolating.
+                    anchor = origin
+                    roi_radius = 32.0
+                else:
+                    anchor = (
+                        int(round(float(origin[0]) + float(velocity[0]) * elapsed)),
+                        int(round(float(origin[1]) + float(velocity[1]) * elapsed)),
+                    )
+                    # The first measured launch step is shorter than the next
+                    # acceleration frame; bridge that one step, then tighten.
+                    roi_radius = 75.0 if ai_accept_count == 2 else 35.0
+                prediction_limit = roi_radius
+            else:
+                anchor = origin
+            proposal_from_anchor = math.hypot(
+                float(proposed_pos[0]) - float(origin[0]),
+                float(proposed_pos[1]) - float(origin[1]),
+            )
+            proposal_from_prediction = math.hypot(
+                float(proposed_pos[0]) - float(anchor[0]),
+                float(proposed_pos[1]) - float(anchor[1]),
+            )
+            # Once the normal tracker again supplies a strongly moving point
+            # within the 25 px contact corridor, it is already the safe local
+            # answer.  Keep advancing the lock without paying for another
+            # model process.  A large jump (the original f4127/f4131 failure)
+            # still invokes the tight ranker below.
+            coherent_normal = (
+                not proposed_candidate.get('tight_roi_force_rank', False) and
+                proposal_from_prediction <= (25.0 if fast_follow else 35.0) and
+                proposed_mean >= 10.0 and proposed_max >= 50.0
+            )
+            if coherent_normal:
+                step_dx = (
+                    float(proposed_pos[0]) - float(origin[0])
+                ) / elapsed
+                step_dy = (
+                    float(proposed_pos[1]) - float(origin[1])
+                ) / elapsed
+                step_speed = math.hypot(step_dx, step_dy)
+                coherent_history = list(
+                    follow.get(
+                        'velocity_history',
+                        getattr(self, 'ball_velocity_history', []),
+                    )
+                )[-4:] + [step_speed]
+                follow['last_pos'] = tuple(proposed_pos)
+                follow['last_frame'] = frame_index
+                follow['velocity'] = (step_dx, step_dy)
+                follow['velocity_history'] = coherent_history
+                if fast_follow:
+                    # Preserve the launch lock through the short high-speed
+                    # flight.  It is cheap while normal tracking is coherent,
+                    # and protects the later far-player/top-edge crossing.
+                    follow['outside_count'] = 0
+                    self._local_ai_tight_roi_follow = follow
+                else:
+                    active_zones = ('player_body', 'racket_fragment')
+                    outside_player = (
+                        self._player_point_zone(origin) not in active_zones and
+                        self._player_point_zone(proposed_pos) not in active_zones
+                    )
+                    follow['outside_count'] = (
+                        int(follow.get('outside_count', 0)) + 1
+                        if outside_player else 0
+                    )
+                    if int(follow['outside_count']) >= 2:
+                        self._local_ai_tight_roi_follow = None
+                        print(
+                            f"[LOCAL_AI_TIGHT_ROI_HANDOFF] f{frame_index}: "
+                            f"normal tracker exited player ROI at {proposed_pos}"
+                        )
+                    else:
+                        self._local_ai_tight_roi_follow = follow
+                self._local_ai_tight_roi_accept_frame = frame_index
+                return proposed_candidate
+            trigger = (
+                f"{follow_mode}-lock:"
+                f"{frame_index - int(follow.get('start_frame', frame_index))}f/"
+                f"normal={proposal_from_prediction:.0f}px"
+            )
+        else:
+            height, _ = frame.shape[:2]
+            prior_size = float(getattr(self, 'ball_size', 0.0) or 0.0)
+            proposed_area = float(proposed_candidate.get('area', 0.0) or 0.0)
+            contact_band = (
+                int(height * 0.28) <= int(previous[1]) <= int(height * 0.52)
+            )
+            contact_proximity = any(
+                self._point_in_player_contact_corridor(point)
+                for point in (previous, proposed_pos)
+            )
+            contact_stall = (
+                prior_speed >= 20.0 and prior_dy >= 10.0 and
+                proposed_speed <= 8.0 and
+                proposed_speed <= prior_speed * 0.35 and
+                proposed_mean >= 10.0 and proposed_max >= 50.0 and
+                max(prior_size, proposed_area) >= 40.0 and
+                (contact_proximity or contact_band)
+            )
+            if contact_stall:
+                initial_mode = 'fast_contact'
+                anchor = (int(proposed_pos[0]), int(proposed_pos[1]))
+                trigger = (
+                    f'contact-stall:{prior_speed:.0f}->{proposed_speed:.0f}px/'
+                    f'motion={proposed_mean:.0f}/{proposed_max:.0f}'
+                )
+            else:
+                # The original probe is reserved for the weak-motion player
+                # fragment seen at f4126.  Strong normal motion alone is not
+                # evidence of a takeover.
+                if (
+                        prior_speed < 5.0 or proposed_speed < 1.0 or
+                        proposed_mean >= 10.0 or proposed_max >= 50.0):
+                    return proposed_candidate
+                prior_direction = math.degrees(math.atan2(prior_dy, prior_dx))
+                proposed_direction = math.degrees(math.atan2(proposed_dy, proposed_dx))
+                raw_delta = abs(proposed_direction - prior_direction) % 360.0
+                angle_delta = min(raw_delta, 360.0 - raw_delta)
+                anchor = (
+                    int(round(float(previous[0]) + prior_dx)),
+                    int(round(float(previous[1]) + prior_dy)),
+                )
+                prediction_error = math.hypot(
+                    float(proposed_pos[0]) - float(anchor[0]),
+                    float(proposed_pos[1]) - float(anchor[1]),
+                )
+                near_player = any(
+                    self._player_point_zone(point) in ('player_body', 'racket_fragment')
+                    for point in (proposed_pos, previous, anchor)
+                )
+                if (
+                        not near_player or angle_delta < 70.0 or
+                        prediction_error < 12.0 or prediction_error > 45.0):
+                    return proposed_candidate
+                trigger = f'player-turn:{angle_delta:.0f}deg/{prediction_error:.0f}px'
+
+        self._local_ai_tight_roi_attempt_frame = frame_index
+        try:
+            selected = ranker(
+                frame_index,
+                frame,
+                anchor=anchor,
+                radius=roi_radius,
+                maximum_candidates=8,
+            )
+        except Exception as exc:
+            print(
+                f"[LOCAL_AI_TIGHT_ROI] f{frame_index}: scorer failed "
+                f"({type(exc).__name__}: {exc})"
+            )
+            return proposed_candidate
+        if selected is None:
+            print(
+                f"[LOCAL_AI_TIGHT_ROI] f{frame_index}: no candidate "
+                f"anchor={anchor} trigger={trigger}"
+            )
+            return proposed_candidate
+
+        model_pos = (int(selected['x']), int(selected['y']))
+        model_score = float(selected.get('ai_score', 0.0) or 0.0)
+        prediction_distance = math.hypot(
+            float(model_pos[0]) - float(anchor[0]),
+            float(model_pos[1]) - float(anchor[1]),
+        )
+        previous_size = float(getattr(self, 'ball_size', 0.0) or 0.0)
+        model_area = float(selected.get('area', previous_size) or previous_size)
+        merged_player_contour = model_area > max(120.0, previous_size * 3.0)
+
+        # When the ball and player are merged into one contour, the contour's
+        # centroid is biased toward the player.  The model has verified that
+        # this tight patch contains the ball; if the causal anchor lies inside
+        # its bounding box, retain that physical anchor as the ball center.
+        accepted_pos = model_pos
+        bbox = selected.get('bbox')
+        if merged_player_contour and isinstance(bbox, (list, tuple)) and len(bbox) >= 4:
+            bx, by, bw, bh = [int(value) for value in bbox[:4]]
+            if bx <= anchor[0] < bx + bw and by <= anchor[1] < by + bh:
+                accepted_pos = anchor
+
+        motion_previous_gray = (
+            previous_gray if previous_gray is not None else
+            getattr(self, '_local_ai_tight_roi_previous_gray', None)
+        )
+        motion = self._candidate_motion_metrics(
+            frame_gray,
+            accepted_pos[0],
+            accepted_pos[1],
+            previous_gray=motion_previous_gray,
+        )
+        motion_mean = float(motion.get('mean', 0.0) or 0.0) if motion else 0.0
+        motion_max = float(motion.get('max', 0.0) or 0.0) if motion else 0.0
+        strong_motion = motion_mean >= 10.0 and motion_max >= 50.0
+        stronger_than_proposal = (
+            motion_mean >= proposed_mean + 4.0 or
+            motion_max >= proposed_max + 35.0
+        )
+        catastrophic_lock_jump = (
+            follow_active and not fast_follow and
+            proposal_from_anchor >= 150.0 and
+            prediction_distance <= 12.0
+        )
+        fast_top_edge_candidate = (
+            fast_follow and int(anchor[1]) <= 40 and
+            int(model_pos[1]) <= 45 and prediction_distance <= 10.0 and
+            int(selected.get('roi_candidates', 0) or 0) == 1
+        )
+        score_floor = (
+            0.45 if fast_top_edge_candidate else
+            0.50 if catastrophic_lock_jump else
+            0.75 if follow_active else
+            0.985 if initial_mode == 'fast_contact' else
+            0.85
+        )
+        accepted = (
+            model_score >= score_floor and
+            prediction_distance <= prediction_limit and
+            strong_motion and
+            (follow_active or stronger_than_proposal)
+        )
+        if not accepted:
+            print(
+                f"[LOCAL_AI_TIGHT_ROI] f{frame_index}: rejected model={model_pos} "
+                f"score={model_score:.6f} pred={prediction_distance:.1f}px "
+                f"floor={score_floor:.2f} "
+                f"motion={motion_mean:.1f}/{motion_max:.1f} "
+                f"normal={proposed_mean:.1f}/{proposed_max:.1f} "
+                f"trigger={trigger}"
+            )
+            return proposed_candidate
+
+        safe_area = previous_size if merged_player_contour else model_area
+        if safe_area <= 0.0:
+            safe_area = model_area
+        height, width = frame.shape[:2]
+        px = max(0, min(width - 1, int(accepted_pos[0])))
+        py = max(0, min(height - 1, int(accepted_pos[1])))
+        accepted_pos = (px, py)
+
+        prior_history = list(getattr(self, 'ball_velocity_history', []))
+        if follow_active:
+            origin = tuple(follow['last_pos'])
+            origin_frame = int(follow['last_frame'])
+            elapsed = max(1, frame_index - origin_frame)
+            motion_dx = (float(accepted_pos[0]) - float(origin[0])) / elapsed
+            motion_dy = (float(accepted_pos[1]) - float(origin[1])) / elapsed
+            prior_history = list(follow.get('velocity_history', prior_history))
+            new_velocity_history = prior_history[-4:] + [
+                math.hypot(motion_dx, motion_dy)
+            ]
+            follow['last_pos'] = tuple(accepted_pos)
+            follow['last_frame'] = frame_index
+            follow['velocity'] = (motion_dx, motion_dy)
+            follow['velocity_history'] = new_velocity_history
+            follow['ai_accept_count'] = int(follow.get('ai_accept_count', 0)) + 1
+            # AI-only positions do not prove that normal tracking recovered.
+            # Only coherent normal candidates may advance handoff state.
+            follow['outside_count'] = 0
+            self._local_ai_tight_roi_follow = follow
+        else:
+            if initial_mode == 'fast_contact':
+                motion_dx = float(accepted_pos[0]) - float(previous[0])
+                motion_dy = float(accepted_pos[1]) - float(previous[1])
+            else:
+                motion_dx = prior_dx
+                motion_dy = prior_dy
+            new_velocity_history = prior_history[-4:] + [
+                math.hypot(motion_dx, motion_dy)
+            ]
+            self._local_ai_tight_roi_follow = {
+                'start_frame': frame_index,
+                'deadline': frame_index + (20 if initial_mode == 'fast_contact' else 24),
+                'last_frame': frame_index,
+                'last_pos': tuple(accepted_pos),
+                'velocity': (prior_dx, prior_dy),
+                'velocity_history': new_velocity_history,
+                'outside_count': 0,
+                'mode': initial_mode,
+                'ai_accept_count': 1,
+            }
+            if initial_mode == 'fast_contact':
+                self._local_ai_tight_roi_follow['velocity'] = (
+                    motion_dx, motion_dy
+                )
+        motion_distance = math.hypot(motion_dx, motion_dy)
+        motion_direction = (
+            math.degrees(math.atan2(motion_dy, motion_dx))
+            if motion_distance > 0.0 else 0.0
+        )
+        if (
+                fast_follow and accepted_pos[1] <= 40 and
+                motion_dy < 0.0 and
+                isinstance(self._local_ai_tight_roi_follow, dict)):
+            # The next frame's existing top-return wait is safer than further
+            # ROI ranking once the predicted flight leaves the image.
+            self._local_ai_tight_roi_follow['deadline'] = frame_index
+
+        preferred = dict(proposed_candidate)
+        preferred.update({
+            'pos': accepted_pos,
+            'area': safe_area,
+            'hsv': cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)[py, px],
+            'motion_mean': motion_mean,
+            'motion_max': motion_max,
+            'source': 'local_ai_tight_roi',
+            'recovery_label': 'LOCAL AI TIGHT ROI',
+            'local_ai_score': model_score,
+            'local_ai_model_pos': model_pos,
+            'local_ai_anchor': anchor,
+            'local_ai_trigger': trigger,
+            'local_ai_motion_override': {
+                'distance': motion_distance,
+                'dx': motion_dx,
+                'dy': motion_dy,
+                'direction_deg': motion_direction,
+            },
+            'local_ai_velocity_history': new_velocity_history,
+        })
+        self._local_ai_tight_roi_accept_frame = frame_index
+        print(
+            f"[LOCAL_AI_TIGHT_ROI] f{frame_index}: preferred {accepted_pos} "
+            f"model={model_pos} score={model_score:.6f} anchor={anchor} "
+            f"radius={roi_radius:.0f}px motion={motion_mean:.1f}/{motion_max:.1f} "
+            f"trigger={trigger}"
+        )
+        return preferred
 
     def _find_night_startup_regular_candidate(self, frame, frame_gray=None):
         """Recover a visible ball during a bounded night-camera flight.
@@ -4726,7 +5232,9 @@ class InteractiveBallAnalyzer:
             )
         else:
             _, _, chosen = min(candidates, key=lambda item: (item[0], item[1]))
-        return chosen
+        return self._prefer_night_tight_local_ai_candidate(
+            frame, frame_gray, chosen
+        )
 
     def _find_night_lower_contact_launch_candidate(
             self, frame, frame_gray, lower_contact_launch_context
@@ -4951,12 +5459,40 @@ class InteractiveBallAnalyzer:
         return min(candidates, key=lambda item: item[:3])[3]
 
     def _commit_night_visible_ball_recovery(self, candidate, frame):
+        # Some visible-ball recovery paths (notably player-reacquisition) jump
+        # directly here and bypass the startup candidate arbiter.  Reuse the
+        # same pre-commit tight-ROI guard so an active near-player lock can
+        # reject that jump before it mutates motion/contact state.
+        if (
+                frame is not None and
+                candidate.get('source') != 'local_ai_tight_roi' and
+                int(getattr(self, '_local_ai_tight_roi_attempt_frame', -1000000)) !=
+                int(self.frame_count)):
+            commit_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            candidate = self._prefer_night_tight_local_ai_candidate(
+                frame, commit_gray, candidate
+            )
         prev_pos = self.ball_center
         new_pos = candidate['pos']
         self.ball_center = new_pos
         self.ball_hsv = candidate['hsv']
         self.ball_size = candidate['area']
         self._update_recovered_motion(prev_pos, new_pos)
+        motion_override = candidate.get('local_ai_motion_override')
+        if isinstance(motion_override, dict):
+            self.last_motion = dict(motion_override)
+            self.last_delta = (
+                float(motion_override.get('dx', 0.0) or 0.0),
+                float(motion_override.get('dy', 0.0) or 0.0),
+            )
+            self.last_direction = float(
+                motion_override.get('direction_deg', 0.0) or 0.0
+            )
+            velocity_history = candidate.get('local_ai_velocity_history')
+            if isinstance(velocity_history, list):
+                self.ball_velocity_history = list(velocity_history)[-5:]
+            if float(motion_override.get('distance', 0.0) or 0.0) > 0.0:
+                self.last_nonzero_motion = dict(motion_override)
         self.stuck_frame_count = 0
         # Short grace period for a player/racket pixel held during occlusion.
         self._player_occlusion_hold_frames = 0
@@ -4968,6 +5504,19 @@ class InteractiveBallAnalyzer:
         self._last_tracked_candidate_motion_frame = self.frame_count
         self._last_tracked_candidate_motion_mean = float(candidate.get('motion_mean', 0.0) or 0.0)
         self._last_tracked_candidate_motion_max = float(candidate.get('motion_max', 0.0) or 0.0)
+        if candidate.get('source') == 'local_ai_tight_roi':
+            self._local_ai_recovery_count = int(
+                getattr(self, '_local_ai_recovery_count', 0)
+            ) + 1
+            # Suppress broad local-AI replay and endpoint inference only for
+            # this already-verified frame.  The dedicated one-frame ROI state
+            # independently handles the adjacent confirmation frame.
+            self._local_ai_follow_until_frame = max(
+                int(getattr(self, '_local_ai_follow_until_frame', -1)),
+                int(self.frame_count),
+            )
+            self._pending_rally_end_reason = None
+            self._pending_rally_end_frame = -1
         self._activate_regular_hsv()
         if candidate.get('lower_contact_approach', False):
             # Keep a tightly bounded launch prediction for the frame after
@@ -6082,6 +6631,23 @@ class InteractiveBallAnalyzer:
                 motion_mean >= 14.0 and
                 motion_max >= 120.0
             )
+            # A fast return can already expose a large ball-shaped contour
+            # before its centre clears the ordinary 50 px top-noise band.
+            # Require all three independent signals (large area, strong mean
+            # motion, and a high peak) so persistent top-line specks cannot
+            # end the off-screen wait.  This is the f4203 re-entry after the
+            # ball genuinely disappeared above the frame at f4168.
+            strong_large_top_reentry = (
+                mode == "upper_side" and
+                elapsed >= 30 and
+                0 <= cy <= max_reentry_y and
+                area >= 70.0 and
+                motion_mean >= 25.0 and
+                motion_max >= 120.0
+            )
+            strong_partial_top_reentry = (
+                strong_large_top_reentry and cy < min_reentry_y
+            )
             lane_min_x = int(frame_width * 0.18)
             lane_max_x = int(frame_width * 0.72)
             if abs(exit_dx) < 12.0:
@@ -6091,8 +6657,17 @@ class InteractiveBallAnalyzer:
             else:
                 x_drift_cap = max(700.0, min(1100.0, max(abs(exit_dx) * 9.0, 900.0)))
             min_directional_progress = max(260.0, min(520.0, abs(exit_dx) * 8.0))
-            blind_wait_frames = 20 if strong_visible_reentry else 30
-            if strong_visible_reentry:
+            strong_confirmed_reentry = (
+                strong_visible_reentry or strong_partial_top_reentry
+            )
+            if strong_large_top_reentry:
+                # The held marker is the exit point, not a one-frame motion
+                # prediction.  After a long off-screen flight, a strongly
+                # confirmed return can legitimately be roughly 500-650 px
+                # away even when the last visible horizontal step was small.
+                x_drift_cap = max(x_drift_cap, 650.0)
+            blind_wait_frames = 20 if strong_confirmed_reentry else 30
+            if strong_confirmed_reentry:
                 min_directional_progress = min(min_directional_progress, 235.0)
             if elapsed < blind_wait_frames:
                 return False, f"top-return blind wait elapsed={elapsed}f"
@@ -6108,7 +6683,8 @@ class InteractiveBallAnalyzer:
                 return False, f"top-return x {cx} opposes leftward exit from {anchor[0]}"
             if exit_dx >= 40.0 and cx < anchor[0] - 120:
                 return False, f"top-return x {cx} opposes rightward exit from {anchor[0]}"
-            if cy < min_reentry_y and not partial_top_reentry:
+            if cy < min_reentry_y and not (
+                    partial_top_reentry or strong_partial_top_reentry):
                 return False, f"top-return y {cy} < min_reentry_y {min_reentry_y}"
             if cy > max_reentry_y:
                 return False, f"top-return y {cy} > max_reentry_y {max_reentry_y}"
@@ -6221,6 +6797,21 @@ class InteractiveBallAnalyzer:
         if not strong_motion:
             return False, f"top-return weak motion mean={motion_mean:.1f} max={motion_max:.1f} area={area:.1f}"
         return True, None
+
+    def _top_return_player_reacq_jump_override_ok(
+            self, pos, area, motion_mean, motion_max, source, frame_shape):
+        """Allow a large player-reacq jump only for a proven top return."""
+        if not self._top_return_wait_active():
+            return False, "top-return wait inactive"
+        if getattr(self, '_top_return_mode', None) not in ('upper_side', 'upper_racket'):
+            return False, "top-return mode does not allow player-reacq jump override"
+        if source not in ('primary', 'regular', 'alt'):
+            return False, f"top-return source {source} not allowed for upper-side reentry"
+        if area < 70.0 or motion_mean < 25.0 or motion_max < 120.0:
+            return False, "top-return player-reacq jump lacks strong ball evidence"
+        return self._top_return_reentry_ok(
+            pos, area, motion_mean, motion_max, frame_shape
+        )
 
     def _build_top_return_search_region(self, frame_shape):
         """Build a thin top-band/lane search region for delayed upper re-entry."""
@@ -6668,6 +7259,10 @@ class InteractiveBallAnalyzer:
         # serve look confirmed (or vice versa).
         self._local_ai_recovery_count = 0
         self._local_ai_all_body_rejections = 0
+        self._local_ai_tight_roi_follow = None
+        self._local_ai_tight_roi_accept_frame = -1000000
+        self._local_ai_tight_roi_attempt_frame = -1000000
+        self._local_ai_tight_roi_previous_gray = None
         self._discard_provisional_serve_from_ai = False
         self._local_ai_follow_until_frame = -1
         self._local_ai_handoff_deadline_frame = -1
@@ -15604,7 +16199,8 @@ class InteractiveBallAnalyzer:
             # Distance is primary, but size consistency matters for fast-moving balls
             full_frame_scan = (
                 self.stuck_frame_count >= 5 and
-                not _player_reacq_hsv_fallback
+                not _player_reacq_hsv_fallback and
+                not top_return_reentry_grace
             )
             if full_frame_scan:
                 # In full-frame scan mode: prioritize size match over distance.
@@ -15835,7 +16431,7 @@ class InteractiveBallAnalyzer:
             # is correct even on the last frame of the window (counter was 1, now 0).
             if (not full_frame_scan and not serve_contact_grace and not rally_contact_grace and not ground_bounce_grace
                     and lower_contact_launch_context is None and ground_bounce_context is None and not _in_post_reacq
-                    and self.last_motion and distance > 0):
+                    and not top_return_reentry_grace and self.last_motion and distance > 0):
                 lm_dx = self.last_motion['dx']
                 lm_dy = self.last_motion['dy']
                 lm_dist = self.last_motion['distance']
@@ -15850,7 +16446,8 @@ class InteractiveBallAnalyzer:
                     align_bonus = dot / (lm_dist * distance)
                     score -= max(0.0, align_bonus) * 40
             if (not full_frame_scan and not serve_contact_grace and not rally_contact_grace and not ground_bounce_grace
-                    and lower_contact_launch_context is None and ground_bounce_context is None and not _in_post_reacq and predicted_point):
+                    and lower_contact_launch_context is None and ground_bounce_context is None and not _in_post_reacq
+                    and not top_return_reentry_grace and predicted_point):
                 pdx = cx - predicted_point[0]
                 pdy = cy - predicted_point[1]
                 predicted_distance = np.sqrt(pdx * pdx + pdy * pdy)
@@ -16746,6 +17343,8 @@ class InteractiveBallAnalyzer:
                 player_reacq_guard_active = (
                     int(getattr(self, '_player_reacq_protect_until_frame', -1)) >= self.frame_count
                 )
+                selected_area_for_guard = cv2.contourArea(best_contour)
+                selected_motion_for_guard = None
 
                 # The first contour after a player/racket occlusion is still
                 # provisional.  Even a large HSV blob cannot teleport from a
@@ -16762,26 +17361,55 @@ class InteractiveBallAnalyzer:
                         min(520.0, float(getattr(self, 'max_ball_speed', 400) or 400) * 1.25),
                     )
                     if actual_distance > max_player_reacq_jump:
-                        self._record_rejected_contour_debug(
-                            best_contour,
-                            x1,
-                            y1,
-                            cx,
-                            cy,
-                            cv2.contourArea(best_contour),
-                            f"player-reacq jump {actual_distance:.1f}px > {max_player_reacq_jump:.1f}px",
-                            source=best_source,
+                        selected_motion_for_guard = self._candidate_motion_metrics(
+                            frame_gray, cx, cy
                         )
-                        self.stuck_frame_count = max(
-                            int(getattr(self, 'stuck_frame_count', 0)) + 1,
-                            5,
+                        guard_motion_mean = (
+                            selected_motion_for_guard['mean']
+                            if selected_motion_for_guard is not None else 0.0
                         )
+                        guard_motion_max = (
+                            selected_motion_for_guard['max']
+                            if selected_motion_for_guard is not None else 0.0
+                        )
+                        (
+                            allow_confirmed_top_return,
+                            top_return_jump_reason,
+                        ) = self._top_return_player_reacq_jump_override_ok(
+                            (cx, cy),
+                            selected_area_for_guard,
+                            guard_motion_mean,
+                            guard_motion_max,
+                            best_source,
+                            frame.shape,
+                        )
+                        if not allow_confirmed_top_return:
+                            self._record_rejected_contour_debug(
+                                best_contour,
+                                x1,
+                                y1,
+                                cx,
+                                cy,
+                                selected_area_for_guard,
+                                f"player-reacq jump {actual_distance:.1f}px > {max_player_reacq_jump:.1f}px",
+                                source=best_source,
+                            )
+                            self.stuck_frame_count = max(
+                                int(getattr(self, 'stuck_frame_count', 0)) + 1,
+                                5,
+                            )
+                            print(
+                                f"Frame {self.frame_count}: [PLAYER-REACQ JUMP REJECT] "
+                                f"holding {self.ball_center} instead of ({cx},{cy}) "
+                                f"jump={actual_distance:.1f}px limit={max_player_reacq_jump:.1f}px"
+                            )
+                            return self.ball_center
                         print(
-                            f"Frame {self.frame_count}: [PLAYER-REACQ JUMP REJECT] "
-                            f"holding {self.ball_center} instead of ({cx},{cy}) "
-                            f"jump={actual_distance:.1f}px limit={max_player_reacq_jump:.1f}px"
+                            f"Frame {self.frame_count}: [TOP-RETURN JUMP ALLOW] "
+                            f"accepting strongly confirmed re-entry at ({cx},{cy}) "
+                            f"jump={actual_distance:.1f}px motion="
+                            f"{guard_motion_mean:.1f}/{guard_motion_max:.1f}"
                         )
-                        return self.ball_center
                 
                 frame_height, frame_width = frame.shape[:2]
                 at_edge = (y_prev < edge_threshold or y_prev > frame_height - edge_threshold or
@@ -16806,7 +17434,11 @@ class InteractiveBallAnalyzer:
                     print(f"  DEBUG: Will wait for ball to return...")
                     return self.ball_center
 
-                selected_motion = self._candidate_motion_metrics(frame_gray, cx, cy)
+                selected_motion = (
+                    selected_motion_for_guard
+                    if selected_motion_for_guard is not None else
+                    self._candidate_motion_metrics(frame_gray, cx, cy)
+                )
                 motion_mean = selected_motion['mean'] if selected_motion is not None else 0.0
                 motion_max = selected_motion['max'] if selected_motion is not None else 0.0
                 if (
@@ -16829,7 +17461,7 @@ class InteractiveBallAnalyzer:
                     motion_mean,
                     motion_max,
                 ) if contact_reacquire_bounds is not None else None
-                selected_area = cv2.contourArea(best_contour)
+                selected_area = selected_area_for_guard
                 player_reacq_static = self._player_reacq_static_candidate(
                     {
                         'pos': (cx, cy),
@@ -18766,6 +19398,22 @@ class InteractiveBallAnalyzer:
                     self._last_tracked_candidate_motion_max = (
                         final_motion_metrics['max'] if final_motion_metrics is not None else 0.0
                     )
+                if accepted_top_return_reentry:
+                    # Re-acquisition returns early below, before the ordinary
+                    # accepted-return cleanup.  End the stale off-screen wait
+                    # here so the very next frame follows the returning ball
+                    # from its new position instead of searching the old exit
+                    # band for one extra frame.
+                    # ``last_delta`` was computed against that same old exit
+                    # marker (522 px at f4203), so it is not a one-frame
+                    # velocity.  Hold the new position for prediction once;
+                    # f4204 then establishes the real downward return vector.
+                    self.last_delta = (0, 0)
+                    self._top_return_wait_frames = 0
+                    self._top_return_anchor = None
+                    self._top_return_origin_frame = -1
+                    self._top_return_mode = None
+                    self._top_return_exit_dx = 0.0
                 self._prev_frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                 # Skip all correction mechanisms (focus loss, alt HSV) on re-acquisition
                 return self.ball_center
@@ -21786,6 +22434,10 @@ class InteractiveBallAnalyzer:
             self._last_detected_serve_candidate = None
             self._pending_rally_end_reason = None
             self._pending_rally_end_frame = -1
+            self._local_ai_tight_roi_follow = None
+            self._local_ai_tight_roi_accept_frame = -1000000
+            self._local_ai_tight_roi_attempt_frame = -1000000
+            self._local_ai_tight_roi_previous_gray = None
             self._awaiting_serve_bounce = False
             self._point_serve_start_side = None
             self._point_target_service_side = None
@@ -22840,6 +23492,9 @@ class InteractiveBallAnalyzer:
                     prev_top_return_wait = self._top_return_wait_active()
                     prev_back_return_wait = self._back_return_wait_active()
                     pre_track_snapshot = self._snapshot_tracking_state_for_provisional_guard()
+                    self._local_ai_tight_roi_previous_gray = (
+                        pre_track_snapshot.get('_prev_frame_gray')
+                    )
                     tracked_position = self.track_ball_in_frame(frame)
                     if self.local_ai_recovery is not None and self._local_ai_frame_buffer:
                         self._local_ai_frame_buffer[-1]["normal_position"] = (
@@ -22850,6 +23505,7 @@ class InteractiveBallAnalyzer:
                         pre_track_snapshot=pre_track_snapshot,
                         frame=frame,
                     )
+                    self._local_ai_tight_roi_previous_gray = None
                     # Reject any position that jumps impossibly far in one frame (false positive).
                     # When the tracker is in re-acquisition mode (stuck >= 5 before the call), allow
                     # a larger jump because the ball may have traveled far while lost.

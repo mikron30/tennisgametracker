@@ -5,8 +5,8 @@
   },
   "racket_sides": {
     "P1": {
-      "left": 59,
-      "right": 38
+      "left": 63,
+      "right": 42
     },
     "P2": {
       "left": 21,
@@ -15,18 +15,18 @@
   },
   "serve_sides": {
     "P1": {
-      "left": 13124,
-      "right": 16544
+      "left": 17101,
+      "right": 19644
     },
     "P2": {
-      "left": 7536,
-      "right": 9366
+      "left": 8971,
+      "right": 11164
     }
   },
   "shots": {
     "P1": {
-      "backhand": 55,
-      "forehand": 42,
+      "backhand": 59,
+      "forehand": 46,
       "unknown": 57
     },
     "P2": {
