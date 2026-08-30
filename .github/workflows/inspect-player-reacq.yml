@@ -52,7 +52,7 @@ jobs:
                 )
 
                 # Do not let a distant, weakly moving background blob end the
-                # protected player-contact reacquisition window.  A real fast
+                # protected player-contact reacquisition window. A real fast
                 # ball may travel far, so large jumps are still allowed when
                 # inter-frame motion is strong or the candidate agrees with
                 # the predicted trajectory.
@@ -132,7 +132,7 @@ jobs:
                     return self.ball_center
 
                 # Clearing the protection now needs either strong image motion
-                # or geometric continuity.  This preserves slow nearby tracks
+                # or geometric continuity. This preserves slow nearby tracks
                 # while preventing a 300+ px weak-motion blob from becoming a
                 # new anchor simply because it is outside the player box.
                 if (
@@ -151,7 +151,7 @@ jobs:
                     )
                     self._player_reacq_protect_until_frame = -1
 
-'''
+          '''
           text = text[:start] + replacement + text[end:]
           path.write_text(text, encoding='utf-8')
           print('patched player-reacq weak-jump guard')
