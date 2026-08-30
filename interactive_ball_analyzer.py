@@ -1022,6 +1022,57 @@ class InteractiveBallAnalyzer:
                 f"held current static selection {tracked_position}; resuming from {previous_position}"
             )
             return previous_position
+        # Keep a weak player/background reacquisition from becoming the
+        # next tracking anchor before tight local AI can arbitrate it.
+        if (
+                pre_track_snapshot is not None and
+                previous_position is not None and
+                tracked_position is not None and
+                int(previous_stuck or 0) >= 3):
+            reacq_jump = math.hypot(
+                float(tracked_position[0]) - float(previous_position[0]),
+                float(tracked_position[1]) - float(previous_position[1]),
+            )
+            reacq_motion_mean = float(
+                getattr(self, '_last_tracked_candidate_motion_mean', 0.0) or 0.0
+            )
+            reacq_motion_max = float(
+                getattr(self, '_last_tracked_candidate_motion_max', 0.0) or 0.0
+            )
+            reacq_zone = self._player_point_zone(tracked_position)
+            weak_player_candidate = (
+                reacq_zone is not None and
+                reacq_motion_mean < 8.0 and
+                reacq_motion_max < 50.0
+            )
+            weak_long_jump = (
+                reacq_jump >= 150.0 and
+                reacq_motion_mean < 12.0 and
+                reacq_motion_max < 80.0
+            )
+            if weak_player_candidate or weak_long_jump:
+                rejected_position = tuple(tracked_position)
+                self._restore_tracking_state_for_provisional_guard(pre_track_snapshot)
+                self.stuck_frame_count = int(previous_stuck or 0) + 1
+                tracked_position = tuple(previous_position)
+                if getattr(self, '_last_motion_reacq_frame', -1000000) == self.frame_count:
+                    self._last_motion_reacq_frame = -1000000
+                    self._last_motion_reacq_pos = None
+                if weak_player_candidate:
+                    print(
+                        f'[PLAYER_REACQ_WEAK_PLAYER_REJECTED] f{self.frame_count}: '
+                        f'rejected {rejected_position} zone={reacq_zone} '
+                        f'motion={reacq_motion_mean:.1f}/{reacq_motion_max:.1f}; '
+                        f'restored {previous_position} stuck={self.stuck_frame_count}'
+                    )
+                else:
+                    print(
+                        f'[PLAYER_REACQ_WEAK_JUMP_REJECTED] f{self.frame_count}: '
+                        f'rejected {rejected_position} jump={reacq_jump:.1f}px '
+                        f'motion={reacq_motion_mean:.1f}/{reacq_motion_max:.1f}; '
+                        f'restored {previous_position} stuck={self.stuck_frame_count}'
+                    )
+
         tight_hold_recovery = self._try_active_tight_local_ai_hold(
             frame,
             tracked_position,
