@@ -22,7 +22,8 @@ DEFAULT_MODES = ("regular_court", "alt1", "alt2", "alt3", "s_30", "h_10")
 def collect_candidates(image: np.ndarray, config: dict, *, modes=DEFAULT_MODES,
                        min_area: float = 3.0, max_area: float = 8000.0,
                        around: tuple[int, int] | None = None,
-                       radius: float | None = None) -> list[dict]:
+                       radius: float | None = None,
+                       dedup_distance: float = 12.0) -> list[dict]:
     """Return de-duplicated actual HSV contours, preserving their source mode."""
     hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
     candidates: list[dict] = []
@@ -53,8 +54,10 @@ def collect_candidates(image: np.ndarray, config: dict, *, modes=DEFAULT_MODES,
         if around is not None and radius is not None and math.hypot(
                 candidate["x"] - around[0], candidate["y"] - around[1]) > radius:
             continue
-        if any(math.hypot(candidate["x"] - kept["x"], candidate["y"] - kept["y"]) < 12
-               for kept in deduplicated):
+        dedup_radius = max(0.0, float(dedup_distance))
+        if dedup_radius > 0.0 and any(
+                math.hypot(candidate["x"] - kept["x"], candidate["y"] - kept["y"]) < dedup_radius
+                for kept in deduplicated):
             continue
         deduplicated.append(candidate)
     return deduplicated

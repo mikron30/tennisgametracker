@@ -1272,6 +1272,7 @@ class InteractiveBallAnalyzer:
             print(
                 f"[LOCAL_AI_TRAJECTORY_CAND] f{self.frame_count} "
                 f"#{row['rank']} pos={row['position']} ai={row['ai_score']:.6f} "
+                f"mode={row['mode'] or 'unknown'} "
                 f"err={row['prediction_error']:.1f}/{prediction_cap:.1f}px "
                 f"cos={row['direction_cos']:.2f} step={row['step']:.1f}px "
                 f"motion={row['motion_mean']:.1f}/{row['motion_max']:.1f} "

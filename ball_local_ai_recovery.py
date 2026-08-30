@@ -275,6 +275,11 @@ class LocalBallAIRecovery:
             max_area=2000.0,
             around=roi_anchor,
             radius=roi_radius,
+            # The default 12 px cross-HSV de-dup is useful for broad recovery,
+            # but it can hide a small regular-HSV ball behind a larger alt-HSV
+            # blob at nearly the same location.  Trajectory arbitration needs
+            # to see both geometries so physics and AI can compare them.
+            dedup_distance=4.0,
         )
         candidates = self._candidate_subset(candidates, roi_anchor)[
             : max(1, int(maximum_candidates))
