@@ -1,0 +1,37 @@
+name: Patch serve acquisition v1
+
+on:
+  push:
+    branches:
+      - revert_1
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout revert_1
+        uses: actions/checkout@v4
+        with:
+          ref: revert_1
+          fetch-depth: 0
+
+      - name: Apply patch
+        run: python .github/scripts/patch_serve_acquisition_v1.py
+
+      - name: Validate Python and diff
+        run: |
+          python -m py_compile interactive_ball_analyzer.py ball_local_ai_recovery.py ball_ai_recovery_probe.py
+          git diff --check
+
+      - name: Commit source and remove temporary patch files
+        run: |
+          rm -f .github/scripts/patch_serve_acquisition_v1.py
+          rm -f .github/workflows/patch-serve-acquisition-v1.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add interactive_ball_analyzer.py .github/scripts/patch_serve_acquisition_v1.py .github/workflows/patch-serve-acquisition-v1.yml
+          git commit -m "Improve serve acquisition and early tracking seed"
+          git push origin HEAD:revert_1
