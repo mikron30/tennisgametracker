@@ -2,7 +2,8 @@ name: Apply player reacq guard
 
 on:
   push:
-    branches: [revert_1]
+    branches:
+      - revert_1
 
 permissions:
   contents: write
@@ -30,7 +31,6 @@ jobs:
           if marker not in text:
               if text.count(anchor) != 1:
                   raise RuntimeError('tight-hold call anchor not unique: %d' % text.count(anchor))
-
               guard = '''        # Keep a weak player/background reacquisition from becoming the
           # next tracking anchor before tight local AI can arbitrate it.
           if (
@@ -82,14 +82,13 @@ jobs:
                           f'restored {previous_position} stuck={self.stuck_frame_count}'
                       )
 
-'''
+          '''
               text = text.replace(anchor, guard + anchor, 1)
               path.write_text(text, encoding='utf-8')
               print('patched')
           else:
               print('already patched')
           PY
-
           python -m py_compile interactive_ball_analyzer.py ball_local_ai_recovery.py
 
       - name: Commit source
