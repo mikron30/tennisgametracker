@@ -1,0 +1,337 @@
+name: Add temporary local AI shadow debug
+
+on:
+  push:
+    branches:
+      - revert_1
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: revert_1
+          fetch-depth: 0
+
+      - name: Patch analyzer with shadow debug
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import textwrap
+
+          path = Path('interactive_ball_analyzer.py')
+          text = path.read_text(encoding='utf-8')
+          marker = '[LOCAL_AI_SHADOW_RANK]'
+          if marker in text:
+              print('shadow debug already present')
+              raise SystemExit(0)
+
+          # 1) Generic START:END parser, no frame values hard-coded in source.
+          insert_before = 'class _QuietTrackerOutput:'
+          if insert_before not in text:
+              raise RuntimeError('quiet-output insertion marker not found')
+          helper = '''
+          def _parse_frame_range(value: str) -> Tuple[int, int]:
+              """Parse an inclusive debug frame range such as ``12887:12888``."""
+              raw = str(value or '').strip()
+              if ':' not in raw:
+                  raise argparse.ArgumentTypeError('frame range must be START:END')
+              left, right = raw.split(':', 1)
+              try:
+                  start = int(left)
+                  end = int(right)
+              except ValueError as error:
+                  raise argparse.ArgumentTypeError('frame range must contain integers') from error
+              if start < 0 or end < start:
+                  raise argparse.ArgumentTypeError('frame range must satisfy 0 <= START <= END')
+              return start, end
+
+
+          '''
+          text = text.replace(insert_before, textwrap.dedent(helper) + insert_before, 1)
+
+          # 2) Add constructor args.
+          old_sig = '''        local_ai_model: Optional[str] = None,
+                  local_ai_python: Optional[str] = None,
+                  local_ai_recovery_dir: Optional[str] = None,
+              ):'''
+          new_sig = '''        local_ai_model: Optional[str] = None,
+                  local_ai_python: Optional[str] = None,
+                  local_ai_recovery_dir: Optional[str] = None,
+                  debug_local_ai_range: Optional[Tuple[int, int]] = None,
+                  debug_local_ai_radius: float = 140.0,
+              ):'''
+          if old_sig not in text:
+              raise RuntimeError('constructor signature marker not found')
+          text = text.replace(old_sig, new_sig, 1)
+
+          # 3) Store debug config near normal local-AI setup.
+          old_state = '''        self.local_ai_recovery = None
+                  self._local_ai_frame_buffer = frame_buffer(12)'''
+          new_state = '''        self.local_ai_recovery = None
+                  self._local_ai_debug_shadow = None
+                  self._debug_local_ai_range = debug_local_ai_range
+                  self._debug_local_ai_radius = max(20.0, float(debug_local_ai_radius))
+                  self._local_ai_frame_buffer = frame_buffer(12)'''
+          if old_state not in text:
+              raise RuntimeError('local AI state marker not found')
+          text = text.replace(old_state, new_state, 1)
+
+          # 4) Create a separate LocalBallAIRecovery instance whose state can never
+          #    affect the production recovery instance.
+          init_marker = '''            print(
+                      f"[LOCAL_AI] Buffered recovery enabled: model={self.local_ai_recovery.model_path} "
+                      f"lookback={self.local_ai_recovery.lookback_frames}f"
+                  )'''
+          if init_marker not in text:
+              raise RuntimeError('local AI init print marker not found')
+          init_extra = init_marker + '''
+                  if self._debug_local_ai_range is not None:
+                      shadow_root = os.path.join(
+                          local_ai_recovery_dir or "tmp/local_ai_recovery",
+                          "shadow_debug",
+                      )
+                      self._local_ai_debug_shadow = LocalBallAIRecovery(
+                          local_ai_model,
+                          config_file,
+                          python_executable=local_ai_python,
+                          work_dir=shadow_root,
+                      )
+                      print(
+                          f"[LOCAL_AI_SHADOW] enabled range={self._debug_local_ai_range[0]}:"
+                          f"{self._debug_local_ai_range[1]} radius={self._debug_local_ai_radius:.0f}px "
+                          f"output={shadow_root}"
+                      )'''
+          text = text.replace(init_marker, init_extra, 1)
+
+          # 5) Add non-invasive shadow method immediately before the normal recovery
+          #    method. It runs both a single-frame rank and a full multi-frame recover.
+          method_marker = '    def _try_local_ai_recovery('
+          if method_marker not in text:
+              raise RuntimeError('_try_local_ai_recovery marker not found')
+          method = '''
+          def _debug_local_ai_shadow_frame(self, frame, previous_position, normal_position):
+              """Print/save what Local AI would choose without changing tracker state."""
+              shadow = getattr(self, '_local_ai_debug_shadow', None)
+              frame_range = getattr(self, '_debug_local_ai_range', None)
+              if shadow is None or frame_range is None or frame is None:
+                  return
+              start_frame, end_frame = frame_range
+              if not (int(start_frame) <= int(self.frame_count) <= int(end_frame)):
+                  return
+
+              anchors = []
+              for label, point in (
+                  ('previous', previous_position),
+                  ('normal', normal_position),
+              ):
+                  if point is None:
+                      continue
+                  point = (int(point[0]), int(point[1]))
+                  if any(existing[1] == point for existing in anchors):
+                      continue
+                  anchors.append((label, point))
+
+              ranked_results = []
+              for label, anchor in anchors:
+                  try:
+                      ranked = shadow.rank_local_roi_candidate(
+                          int(self.frame_count),
+                          frame,
+                          anchor=anchor,
+                          radius=float(self._debug_local_ai_radius),
+                          maximum_candidates=32,
+                      )
+                  except Exception as error:
+                      print(
+                          f"[LOCAL_AI_SHADOW_RANK] f{self.frame_count} anchor={label}:{anchor} "
+                          f"ERROR={error}"
+                      )
+                      continue
+                  if ranked is None:
+                      print(
+                          f"[LOCAL_AI_SHADOW_RANK] f{self.frame_count} anchor={label}:{anchor} "
+                          f"no-candidate radius={self._debug_local_ai_radius:.0f}px"
+                      )
+                      continue
+                  point = (int(ranked['x']), int(ranked['y']))
+                  zone = self._player_point_zone(point)
+                  distance = math.hypot(point[0] - anchor[0], point[1] - anchor[1])
+                  score = float(ranked.get('ai_score', 0.0) or 0.0)
+                  margin = ranked.get('roi_score_margin')
+                  margin_text = 'n/a' if margin is None else f"{float(margin):.6f}"
+                  print(
+                      f"[LOCAL_AI_SHADOW_RANK] f{self.frame_count} anchor={label}:{anchor} "
+                      f"top={point} score={score:.6f} margin={margin_text} "
+                      f"distance={distance:.1f}px zone={zone or 'clear'} "
+                      f"candidates={int(ranked.get('roi_candidates', 0) or 0)}"
+                  )
+                  ranked_results.append((label, anchor, ranked, zone))
+
+              # Full recovery is run on the separate shadow object. force=True only
+              # bypasses the SHADOW object's cooldown; production state is untouched.
+              event_offset = 0
+              try:
+                  if shadow.events_path.exists():
+                      event_offset = shadow.events_path.stat().st_size
+              except OSError:
+                  event_offset = 0
+              try:
+                  recovered = shadow.recover(
+                      int(self.frame_count),
+                      self._local_ai_frame_buffer,
+                      predicted_position=(
+                          tuple(previous_position) if previous_position is not None else None
+                      ),
+                      player_zone=self._player_point_zone,
+                      reason='shadow-debug',
+                      force=True,
+                  )
+              except Exception as error:
+                  print(f"[LOCAL_AI_SHADOW_RECOVER] f{self.frame_count} ERROR={error}")
+                  recovered = None
+
+              event = None
+              try:
+                  if shadow.events_path.exists():
+                      with shadow.events_path.open('r', encoding='utf-8') as handle:
+                          handle.seek(event_offset)
+                          appended = [line.strip() for line in handle if line.strip()]
+                      if appended:
+                          event = json.loads(appended[-1])
+              except Exception:
+                  event = None
+
+              if recovered is not None:
+                  recovered_point = (int(recovered['x']), int(recovered['y']))
+                  print(
+                      f"[LOCAL_AI_SHADOW_RECOVER] f{self.frame_count} ACCEPT "
+                      f"point={recovered_point} score={float(recovered.get('ai_score', 0.0) or 0.0):.6f} "
+                      f"zone={recovered.get('player_zone') or 'clear'}"
+                  )
+              else:
+                  rejection = (
+                      event.get('rejection') if isinstance(event, dict) else shadow.last_rejection
+                  )
+                  print(
+                      f"[LOCAL_AI_SHADOW_RECOVER] f{self.frame_count} NO_SAFE_PATH "
+                      f"rejection={rejection or 'threshold/path guards'}"
+                  )
+
+              if isinstance(event, dict):
+                  for diag in event.get('diagnostics', []):
+                      if int(diag.get('frame', -1)) != int(self.frame_count):
+                          continue
+                      selected = diag.get('selected')
+                      if selected is None:
+                          print(
+                              f"[LOCAL_AI_SHADOW_PATH] f{self.frame_count} candidates={diag.get('candidates', 0)} "
+                              f"anchor={diag.get('anchor')} selected=None cap={diag.get('anchor_cap')}"
+                          )
+                      else:
+                          print(
+                              f"[LOCAL_AI_SHADOW_PATH] f{self.frame_count} candidates={diag.get('candidates', 0)} "
+                              f"anchor={diag.get('anchor')} selected=({selected.get('x')},{selected.get('y')}) "
+                              f"score={float(selected.get('ai_score', 0.0) or 0.0):.6f} "
+                              f"zone={selected.get('player_zone') or 'clear'} cap={diag.get('anchor_cap')}"
+                          )
+
+              # Save one annotated source frame so the candidate can be checked by eye.
+              debug_image = frame.copy()
+              for label, anchor in anchors:
+                  cv2.circle(debug_image, anchor, 14, (0, 255, 255), 2)
+                  cv2.putText(debug_image, f"anchor:{label}", (anchor[0] + 10, anchor[1] - 10),
+                              cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+              for label, anchor, ranked, zone in ranked_results:
+                  point = (int(ranked['x']), int(ranked['y']))
+                  cv2.circle(debug_image, point, 18, (255, 0, 255), 3)
+                  cv2.putText(
+                      debug_image,
+                      f"AI {float(ranked.get('ai_score', 0.0) or 0.0):.4f} {zone or 'clear'}",
+                      (point[0] + 10, point[1] + 25),
+                      cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 0, 255), 2,
+                  )
+              if recovered is not None:
+                  rp = (int(recovered['x']), int(recovered['y']))
+                  cv2.circle(debug_image, rp, 24, (0, 0, 255), 3)
+                  cv2.putText(debug_image, 'FULL RECOVER', (rp[0] + 10, rp[1] - 20),
+                              cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+              shadow_frames = shadow.work_dir / 'frames'
+              shadow_frames.mkdir(parents=True, exist_ok=True)
+              output_path = shadow_frames / f"shadow_f{int(self.frame_count):08d}.jpg"
+              cv2.imwrite(str(output_path), debug_image)
+              print(f"[LOCAL_AI_SHADOW_IMAGE] f{self.frame_count} saved={output_path}")
+
+
+          '''
+          text = text.replace(method_marker, textwrap.indent(textwrap.dedent(method), '    ') + method_marker, 1)
+
+          # 6) Invoke shadow debug after the normal-position buffer is updated but
+          #    before production Local-AI recovery changes anything.
+          call_old = '''                    if self.local_ai_recovery is not None and self._local_ai_frame_buffer:
+                              self._local_ai_frame_buffer[-1]["normal_position"] = (
+                                  tuple(tracked_position) if tracked_position is not None else None
+                              )
+                          tracked_position = self._try_local_ai_recovery('''
+          call_new = '''                    if self.local_ai_recovery is not None and self._local_ai_frame_buffer:
+                              self._local_ai_frame_buffer[-1]["normal_position"] = (
+                                  tuple(tracked_position) if tracked_position is not None else None
+                              )
+                          self._debug_local_ai_shadow_frame(frame, prev_ball_center, tracked_position)
+                          tracked_position = self._try_local_ai_recovery('''
+          if call_old not in text:
+              raise RuntimeError('tracking call-site marker not found')
+          text = text.replace(call_old, call_new, 1)
+
+          # 7) CLI flags.
+          cli_marker = '''    parser.add_argument("--local-ai-recovery-dir", default="tmp/local_ai_recovery",
+                              help="Directory for local-AI recovery decision logs (default: tmp/local_ai_recovery)")'''
+          if cli_marker not in text:
+              raise RuntimeError('local AI CLI marker not found')
+          cli_extra = cli_marker + '''
+              parser.add_argument(
+                  "--debug-local-ai-range", type=_parse_frame_range, metavar="START:END", default=None,
+                  help=("Shadow-run Local AI on an inclusive frame range without changing tracking; "
+                        "prints candidates and saves annotated debug frames."),
+              )
+              parser.add_argument(
+                  "--debug-local-ai-radius", type=float, default=140.0,
+                  help="ROI radius in pixels for --debug-local-ai-range (default 140)",
+              )'''
+          text = text.replace(cli_marker, cli_extra, 1)
+
+          # 8) Pass CLI values to constructor.
+          ctor_old = '''                                                   local_ai_model=args.local_ai_model,
+                                                             local_ai_python=args.local_ai_python,
+                                                             local_ai_recovery_dir=args.local_ai_recovery_dir)'''
+          ctor_new = '''                                                   local_ai_model=args.local_ai_model,
+                                                             local_ai_python=args.local_ai_python,
+                                                             local_ai_recovery_dir=args.local_ai_recovery_dir,
+                                                             debug_local_ai_range=args.debug_local_ai_range,
+                                                             debug_local_ai_radius=args.debug_local_ai_radius)'''
+          if ctor_old not in text:
+              raise RuntimeError('constructor call marker not found')
+          text = text.replace(ctor_old, ctor_new, 1)
+
+          path.write_text(text, encoding='utf-8')
+          print('patched local AI shadow debug')
+          PY
+
+          python -m py_compile interactive_ball_analyzer.py ball_local_ai_recovery.py
+          git diff --check
+
+      - name: Commit source and remove workflow
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm --ignore-unmatch .github/workflows/add-local-ai-shadow-debug.yml
+          git add interactive_ball_analyzer.py
+          git diff --cached --check
+          git commit -m "Add opt-in local AI shadow frame debug"
+          git push origin HEAD:revert_1
