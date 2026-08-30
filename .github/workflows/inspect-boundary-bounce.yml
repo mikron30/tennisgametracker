@@ -1,4 +1,4 @@
-name: Inspect boundary bounce logic
+name: Apply generic boundary bounce priority
 
 on:
   push:
@@ -6,35 +6,160 @@ on:
       - revert_1
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  inspect:
+  patch:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           ref: revert_1
-      - name: Show exact point-end and far-boundary functions
+          fetch-depth: 0
+
+      - name: Patch analyzer and syntax check
         shell: bash
         run: |
           python - <<'PY'
           from pathlib import Path
-          lines = Path('interactive_ball_analyzer.py').read_text(encoding='utf-8').splitlines()
-          needles = [
-              'PLAYER-REACQ END SUPPRESSED',
-              'TOP-FAR-OUT TURN',
-          ]
-          for needle in needles:
-              print('\n===== NEEDLE:', needle, '=====')
-              hits = [i for i, line in enumerate(lines) if needle in line]
-              for idx in hits:
-                  fn = idx
-                  while fn >= 0 and not lines[fn].lstrip().startswith('def '):
-                      fn -= 1
-                  print('HIT', idx + 1, 'FUNCTION', lines[fn].strip() if fn >= 0 else 'UNKNOWN')
-                  start = max(fn, idx - 90) if fn >= 0 else max(0, idx - 90)
-                  end = min(len(lines), idx + 130)
-                  for n in range(start, end):
-                      print(f'{n+1:05d}: {lines[n]}')
+          import textwrap
+
+          path = Path('interactive_ball_analyzer.py')
+          text = path.read_text(encoding='utf-8')
+          marker = '[BOUNDARY-REVERSAL OUT]'
+          if marker in text:
+              print('boundary reversal override already present')
+              raise SystemExit(0)
+
+          detect_marker = '    def detect_point_end(self, ball_position, frame):\n'
+          if detect_marker not in text:
+              raise RuntimeError('detect_point_end insertion point not found')
+
+          helper = '''
+          def _confirmed_boundary_reversal_out_candidate(self, ball_position, frame):
+              """Return a geometry-confirmed OUT bounce during a direction reversal.
+
+              Player-occlusion/reacquisition guards protect against body and racket
+              fragments becoming point-ending positions.  They must not, however,
+              hide a real bounce whose tracked trajectory reaches a singles-court
+              boundary and reverses vertically.  This helper uses only general
+              evidence: current motion, the recorded direction-change event, court
+              geometry, ball-size plausibility, and verified racket-contact state.
+              """
+              if ball_position is None or frame is None:
+                  return False, None
+              if int(getattr(self, '_last_direction_change_frame', -1000000)) != int(self.frame_count):
+                  return False, None
+              if not bool(getattr(self, '_last_direction_change_vertical_reversal', False)):
+                  return False, None
+              if self.prev_motion is None or self.last_motion is None:
+                  return False, None
+              if getattr(self, '_awaiting_serve_bounce', False):
+                  return False, None
+
+              prev_dy = float(self.prev_motion.get('dy', 0.0) or 0.0)
+              curr_dy = float(self.last_motion.get('dy', 0.0) or 0.0)
+              prev_speed = float(self.prev_motion.get('distance', 0.0) or 0.0)
+              curr_speed = float(self.last_motion.get('distance', 0.0) or 0.0)
+              if prev_dy < 4.0 or curr_dy > -4.0:
+                  return False, None
+              if prev_speed < 5.0 or curr_speed < 6.0:
+                  return False, None
+
+              # Do not reinterpret a verified recent racket strike as a bounce.
+              last_racket = int(getattr(self, '_last_racket_contact_frame', -1000000))
+              if 0 <= int(self.frame_count) - last_racket <= 1:
+                  return False, None
+
+              height, width = frame.shape[:2]
+              ball_size = float(getattr(self, 'ball_size', 0.0) or 0.0)
+              plausible_ball_cap = max(90.0, min(180.0, float(width) * 0.025))
+              if ball_size <= 0.0 or ball_size > plausible_ball_cap:
+                  return False, None
+
+              candidates = []
+              change_point = getattr(self, '_last_direction_change_point', None)
+              if change_point is not None:
+                  candidates.append(tuple(change_point))
+              candidates.append(tuple(ball_position))
+
+              seen = set()
+              for point in candidates:
+                  point = (int(point[0]), int(point[1]))
+                  if point in seen:
+                      continue
+                  seen.add(point)
+                  try:
+                      outside, boundary, _, _, _, _ = self._point_outside_singles_court(point, frame)
+                  except Exception:
+                      continue
+                  if not outside:
+                      continue
+
+                  # Reuse the normal ground-bounce classifier so line-contact
+                  # overrides and court-specific geometry remain authoritative.
+                  try:
+                      in_bounds, reason, _ = self._classify_ground_bounce(point, frame)
+                  except Exception:
+                      in_bounds, reason = False, None
+                  if in_bounds:
+                      continue
+
+                  reason_text = str(reason or '').lower()
+                  if reason is None or ('outside' not in reason_text and 'out' not in reason_text):
+                      reason = f"Ball bounced out of court ({boundary})"
+
+                  print(
+                      f"Frame {self.frame_count}: [BOUNDARY-REVERSAL OUT] "
+                      f"point={point} boundary={boundary} "
+                      f"motion=({float(self.last_motion.get('dx', 0.0) or 0.0):.1f},"
+                      f"{curr_dy:.1f}) prev_dy={prev_dy:.1f} "
+                      f"speed={curr_speed:.1f} size={ball_size:.1f}"
+                  )
+                  return True, reason
+
+              return False, None
+
+          '''
+          helper = textwrap.indent(textwrap.dedent(helper), '    ')
+          text = text.replace(detect_marker, helper + detect_marker, 1)
+
+          old = '''        if reacq_protect_active and not stationary_ball_override:
+              print(
+                  f"Frame {self.frame_count}: [PLAYER-REACQ END SUPPRESSED] "
+                  f"holding {ball_position} until f{self._player_reacq_protect_until_frame}"
+              )
+              return False, "Player-occlusion reacquisition grace"
+          '''
+          new = '''        if reacq_protect_active and not stationary_ball_override:
+              boundary_out, boundary_reason = self._confirmed_boundary_reversal_out_candidate(
+                  ball_position, frame
+              )
+              if boundary_out:
+                  return True, boundary_reason
+              print(
+                  f"Frame {self.frame_count}: [PLAYER-REACQ END SUPPRESSED] "
+                  f"holding {ball_position} until f{self._player_reacq_protect_until_frame}"
+              )
+              return False, "Player-occlusion reacquisition grace"
+          '''
+          if old not in text:
+              raise RuntimeError('player reacq suppression block not found')
+          text = text.replace(old, new, 1)
+          path.write_text(text, encoding='utf-8')
+          print('patched generic boundary reversal OUT priority')
           PY
+
+          python -m py_compile interactive_ball_analyzer.py ball_local_ai_recovery.py
+          git diff --check
+
+      - name: Commit source and remove temporary workflow
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm --ignore-unmatch .github/workflows/inspect-boundary-bounce.yml
+          git add interactive_ball_analyzer.py
+          git diff --cached --check
+          git commit -m "Prioritize confirmed boundary bounces over reacq grace"
+          git push origin HEAD:revert_1
