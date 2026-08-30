@@ -1,0 +1,39 @@
+name: Inspect f12890 turn
+
+on:
+  push:
+    branches:
+      - revert_1
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: revert_1
+      - name: Show direction and tight ROI code
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          lines = Path('interactive_ball_analyzer.py').read_text(encoding='utf-8').splitlines()
+          needles = [
+              'Direction change detected',
+              "trigger = f'player-turn:",
+              "_local_ai_tight_roi_follow = {",
+          ]
+          for needle in needles:
+              print('\n===== NEEDLE:', needle, '=====')
+              for idx, line in enumerate(lines):
+                  if needle in line:
+                      start = max(0, idx - 80)
+                      end = min(len(lines), idx + 90)
+                      print('HIT', idx + 1)
+                      for n in range(start, end):
+                          print(f'{n+1:05d}: {lines[n]}')
+                      break
+          PY
