@@ -249,7 +249,7 @@ class LocalBallAIRecovery:
             for image_path in image_paths:
                 image_path.unlink(missing_ok=True)
 
-    def rank_local_roi_candidate(
+    def rank_local_roi_candidates(
         self,
         frame_index: int,
         image: np.ndarray,
@@ -257,17 +257,15 @@ class LocalBallAIRecovery:
         anchor: tuple[int, int],
         radius: float = 25.0,
         maximum_candidates: int = 12,
-    ) -> Optional[dict]:
-        """Return the model's top contour inside one tightly bounded ROI.
+    ) -> list[dict]:
+        """Return model-ranked real HSV contours inside one bounded ROI.
 
-        This is intentionally a *ranker*, not an acceptance decision.  The
-        caller must still prove that the candidate follows the trusted
-        trajectory and has real inter-frame motion.  Keeping those guards in
-        the tracker lets this narrow near-player check use relative model rank
-        without weakening the normal 0.985/0.9995 recovery thresholds.
+        This function intentionally does not decide whether a candidate is safe
+        enough to rewrite the tracker.  The caller can combine the relative AI
+        ranking with trajectory, motion, size, and player-context evidence.
         """
         if image is None or anchor is None:
-            return None
+            return []
         roi_radius = max(8.0, float(radius))
         roi_anchor = (int(anchor[0]), int(anchor[1]))
         candidates = collect_candidates(
@@ -282,7 +280,7 @@ class LocalBallAIRecovery:
             : max(1, int(maximum_candidates))
         ]
         if not candidates:
-            return None
+            return []
 
         scored = self._score(image, int(frame_index), candidates)
         ranked = sorted(
@@ -290,12 +288,36 @@ class LocalBallAIRecovery:
             key=lambda item: float(item.get("ai_score", 0.0)),
             reverse=True,
         )
+        result: list[dict] = []
+        for index, candidate in enumerate(ranked):
+            item = dict(candidate)
+            item["roi_anchor"] = roi_anchor
+            item["roi_radius"] = roi_radius
+            item["roi_candidates"] = len(ranked)
+            item["roi_rank"] = index + 1
+            result.append(item)
+        return result
+
+    def rank_local_roi_candidate(
+        self,
+        frame_index: int,
+        image: np.ndarray,
+        *,
+        anchor: tuple[int, int],
+        radius: float = 25.0,
+        maximum_candidates: int = 12,
+    ) -> Optional[dict]:
+        """Return the model's top contour inside one tightly bounded ROI."""
+        ranked = self.rank_local_roi_candidates(
+            frame_index,
+            image,
+            anchor=anchor,
+            radius=radius,
+            maximum_candidates=maximum_candidates,
+        )
         if not ranked:
             return None
         selected = dict(ranked[0])
-        selected["roi_anchor"] = roi_anchor
-        selected["roi_radius"] = roi_radius
-        selected["roi_candidates"] = len(ranked)
         selected["roi_score_margin"] = (
             float(selected.get("ai_score", 0.0)) -
             float(ranked[1].get("ai_score", 0.0))

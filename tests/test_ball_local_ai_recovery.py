@@ -790,5 +790,106 @@ class LocalBallAIRecoveryTests(unittest.TestCase):
         self.assertIn("rightward reentry progress", reason)
 
 
+class TrajectoryAwareLocalAITests(unittest.TestCase):
+    @staticmethod
+    def _analyzer(candidate, *, zone="player_body", motion=(12.0, 90.0)):
+        analyzer = InteractiveBallAnalyzer.__new__(InteractiveBallAnalyzer)
+        analyzer.frame_count = 100
+        analyzer._player_point_zone = lambda point: zone
+        analyzer._candidate_motion_metrics = lambda *args, **kwargs: {
+            "mean": motion[0], "max": motion[1]
+        }
+
+        class Recovery:
+            def __init__(self):
+                self.events = []
+
+            def rank_local_roi_candidates(self, *args, **kwargs):
+                return [dict(candidate)]
+
+            def _write_event(self, payload):
+                self.events.append(payload)
+
+        analyzer.local_ai_recovery = Recovery()
+        return analyzer
+
+    def test_trajectory_rescue_accepts_lower_ai_candidate_on_physical_prediction(self):
+        candidate = {
+            "x": 87, "y": 115, "area": 10.0, "ai_score": 0.52,
+            "mode": "regular_court", "roi_rank": 2,
+        }
+        analyzer = self._analyzer(candidate)
+        snapshot = {
+            "last_motion": {"dx": -13.0, "dy": 15.0, "distance": 19.85},
+            "last_nonzero_motion": {"dx": -13.0, "dy": 15.0, "distance": 19.85},
+            "ball_size": 24.0,
+            "ball_velocity_history": [18.0, 19.0, 20.0],
+            "_prev_frame_gray": np.zeros((180, 180), dtype=np.uint8),
+        }
+        result = analyzer._try_local_ai_trajectory_rescue(
+            np.zeros((180, 180, 3), dtype=np.uint8),
+            (100, 100),
+            (100, 100),
+            0,
+            snapshot,
+            "player-region:player_body",
+        )
+        self.assertIsNotNone(result)
+        self.assertTrue(result["trajectory_rescue"])
+        self.assertEqual((result["x"], result["y"]), (87, 115))
+        self.assertLess(result["ai_score"], 0.985)
+        self.assertTrue(analyzer.local_ai_recovery.events[-1]["accepted"])
+
+    def test_trajectory_rescue_does_not_override_a_moving_normal_track(self):
+        candidate = {
+            "x": 87, "y": 115, "area": 10.0, "ai_score": 0.90,
+            "mode": "regular_court", "roi_rank": 1,
+        }
+        analyzer = self._analyzer(candidate)
+        snapshot = {
+            "last_motion": {"dx": -13.0, "dy": 15.0, "distance": 19.85},
+            "last_nonzero_motion": {"dx": -13.0, "dy": 15.0, "distance": 19.85},
+            "ball_size": 24.0,
+            "_prev_frame_gray": np.zeros((180, 180), dtype=np.uint8),
+        }
+        result = analyzer._try_local_ai_trajectory_rescue(
+            np.zeros((180, 180, 3), dtype=np.uint8),
+            (100, 100),
+            (118, 118),
+            0,
+            snapshot,
+            "player-region:player_body",
+        )
+        self.assertIsNone(result)
+        self.assertEqual(analyzer.local_ai_recovery.events, [])
+
+    def test_trajectory_rescue_rejects_static_prediction_artifact(self):
+        candidate = {
+            "x": 87, "y": 115, "area": 10.0, "ai_score": 0.99,
+            "mode": "regular_court", "roi_rank": 1,
+        }
+        analyzer = self._analyzer(candidate, motion=(0.5, 4.0))
+        snapshot = {
+            "last_motion": {"dx": -13.0, "dy": 15.0, "distance": 19.85},
+            "last_nonzero_motion": {"dx": -13.0, "dy": 15.0, "distance": 19.85},
+            "ball_size": 24.0,
+            "_prev_frame_gray": np.zeros((180, 180), dtype=np.uint8),
+        }
+        result = analyzer._try_local_ai_trajectory_rescue(
+            np.zeros((180, 180, 3), dtype=np.uint8),
+            (100, 100),
+            (100, 100),
+            1,
+            snapshot,
+            "player-region:player_body",
+        )
+        self.assertIsNone(result)
+        self.assertFalse(analyzer.local_ai_recovery.events[-1]["accepted"])
+        self.assertEqual(
+            analyzer.local_ai_recovery.events[-1]["candidates"][0]["reject_reason"],
+            "motion",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
