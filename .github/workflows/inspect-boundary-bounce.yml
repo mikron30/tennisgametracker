@@ -15,25 +15,26 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: revert_1
-      - name: Show boundary bounce code
+      - name: Show exact point-end and far-boundary functions
         shell: bash
         run: |
           python - <<'PY'
           from pathlib import Path
           lines = Path('interactive_ball_analyzer.py').read_text(encoding='utf-8').splitlines()
           needles = [
+              'PLAYER-REACQ END SUPPRESSED',
               'TOP-FAR-OUT TURN',
-              'def _detect_out_of_court_bounce',
-              '_detect_out_of_court_bounce(ball_position, frame)',
           ]
           for needle in needles:
               print('\n===== NEEDLE:', needle, '=====')
-              for idx, line in enumerate(lines):
-                  if needle in line:
-                      start = max(0, idx - 120)
-                      end = min(len(lines), idx + 140)
-                      print('HIT', idx + 1)
-                      for n in range(start, end):
-                          print(f'{n+1:05d}: {lines[n]}')
-                      break
+              hits = [i for i, line in enumerate(lines) if needle in line]
+              for idx in hits:
+                  fn = idx
+                  while fn >= 0 and not lines[fn].lstrip().startswith('def '):
+                      fn -= 1
+                  print('HIT', idx + 1, 'FUNCTION', lines[fn].strip() if fn >= 0 else 'UNKNOWN')
+                  start = max(fn, idx - 90) if fn >= 0 else max(0, idx - 90)
+                  end = min(len(lines), idx + 130)
+                  for n in range(start, end):
+                      print(f'{n+1:05d}: {lines[n]}')
           PY
