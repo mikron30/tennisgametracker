@@ -1,0 +1,32 @@
+name: Inspect player reacq
+
+on:
+  push:
+    branches:
+      - revert_1
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: revert_1
+      - name: Show player reacquisition code
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          text = Path('interactive_ball_analyzer.py').read_text(encoding='utf-8').splitlines()
+          needle = 'PLAYER-REACQ MOTION CONFIRMED'
+          hits = [i for i, line in enumerate(text) if needle in line]
+          print('hits=', hits)
+          for idx in hits:
+              start = max(0, idx - 55)
+              end = min(len(text), idx + 45)
+              for n in range(start, end):
+                  print(f'{n+1:05d}: {text[n]}')
+          PY
