@@ -22,6 +22,7 @@ jobs:
         run: |
           python - <<'PY'
           from pathlib import Path
+          import textwrap
 
           path = Path('interactive_ball_analyzer.py')
           text = path.read_text(encoding='utf-8')
@@ -31,7 +32,7 @@ jobs:
           if marker not in text:
               if text.count(anchor) != 1:
                   raise RuntimeError('tight-hold call anchor not unique: %d' % text.count(anchor))
-              guard = '''        # Keep a weak player/background reacquisition from becoming the
+              guard_body = '''# Keep a weak player/background reacquisition from becoming the
           # next tracking anchor before tight local AI can arbitrate it.
           if (
                   pre_track_snapshot is not None and
@@ -83,6 +84,7 @@ jobs:
                       )
 
           '''
+              guard = textwrap.indent(textwrap.dedent(guard_body), '        ')
               text = text.replace(anchor, guard + anchor, 1)
               path.write_text(text, encoding='utf-8')
               print('patched')
