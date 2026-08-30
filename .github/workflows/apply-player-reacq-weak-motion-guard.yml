@@ -1,9 +1,8 @@
-name: Apply guarded player reacquisition fix
+name: Apply player reacq guard
 
 on:
   push:
-    branches:
-      - revert_1
+    branches: [revert_1]
 
 permissions:
   contents: write
@@ -12,38 +11,28 @@ jobs:
   patch:
     runs-on: ubuntu-latest
     steps:
-      - name: Check out revert_1
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           ref: revert_1
           fetch-depth: 0
 
-      - name: Patch player reacquisition guards
+      - name: Patch source
         shell: bash
         run: |
           python - <<'PY'
           from pathlib import Path
 
-          path = Path("interactive_ball_analyzer.py")
-          text = path.read_text(encoding="utf-8")
+          path = Path('interactive_ball_analyzer.py')
+          text = path.read_text(encoding='utf-8')
+          marker = '[PLAYER_REACQ_WEAK_PLAYER_REJECTED]'
+          anchor = '        tight_hold_recovery = self._try_active_tight_local_ai_hold('
 
-          marker = "[PLAYER_REACQ_WEAK_PLAYER_REJECTED]"
-          if marker in text:
-              print("Player reacquisition weak-motion guards already present")
-              raise SystemExit(0)
+          if marker not in text:
+              if text.count(anchor) != 1:
+                  raise RuntimeError('tight-hold call anchor not unique: %d' % text.count(anchor))
 
-          anchor = "        tight_hold_recovery = self._try_active_tight_local_ai_hold("
-          if text.count(anchor) != 1:
-              raise RuntimeError(
-                  f"Expected exactly one tight-hold call anchor, found {text.count(anchor)}"
-              )
-
-          guard = '''        # Preserve player-occlusion recovery state before the normal HSV
-          # candidate can poison it.  A static shoe/racket fragment can reset
-          # stuck_frame_count to zero, while a weak distant background blob can
-          # falsely clear PLAYER-REACQ.  Reject both using the causal pre-track
-          # snapshot, then let the existing tight local-AI hold run immediately
-          # from the restored state.
+              guard = '''        # Keep a weak player/background reacquisition from becoming the
+          # next tracking anchor before tight local AI can arbitrate it.
           if (
                   pre_track_snapshot is not None and
                   previous_position is not None and
@@ -60,7 +49,6 @@ jobs:
                   getattr(self, '_last_tracked_candidate_motion_max', 0.0) or 0.0
               )
               reacq_zone = self._player_point_zone(tracked_position)
-
               weak_player_candidate = (
                   reacq_zone is not None and
                   reacq_motion_mean < 8.0 and
@@ -71,7 +59,6 @@ jobs:
                   reacq_motion_mean < 12.0 and
                   reacq_motion_max < 80.0
               )
-
               if weak_player_candidate or weak_long_jump:
                   rejected_position = tuple(tracked_position)
                   self._restore_tracking_state_for_provisional_guard(pre_track_snapshot)
@@ -80,43 +67,32 @@ jobs:
                   if getattr(self, '_last_motion_reacq_frame', -1000000) == self.frame_count:
                       self._last_motion_reacq_frame = -1000000
                       self._last_motion_reacq_pos = None
-
                   if weak_player_candidate:
                       print(
-                          f"[PLAYER_REACQ_WEAK_PLAYER_REJECTED] f{self.frame_count}: "
-                          f"rejected {rejected_position} zone={reacq_zone} "
-                          f"motion={reacq_motion_mean:.1f}/{reacq_motion_max:.1f}; "
-                          f"restored {previous_position} stuck={self.stuck_frame_count}"
+                          f'[PLAYER_REACQ_WEAK_PLAYER_REJECTED] f{self.frame_count}: '
+                          f'rejected {rejected_position} zone={reacq_zone} '
+                          f'motion={reacq_motion_mean:.1f}/{reacq_motion_max:.1f}; '
+                          f'restored {previous_position} stuck={self.stuck_frame_count}'
                       )
                   else:
                       print(
-                          f"[PLAYER_REACQ_WEAK_JUMP_REJECTED] f{self.frame_count}: "
-                          f"rejected {rejected_position} jump={reacq_jump:.1f}px "
-                          f"motion={reacq_motion_mean:.1f}/{reacq_motion_max:.1f}; "
-                          f"restored {previous_position} stuck={self.stuck_frame_count}"
+                          f'[PLAYER_REACQ_WEAK_JUMP_REJECTED] f{self.frame_count}: '
+                          f'rejected {rejected_position} jump={reacq_jump:.1f}px '
+                          f'motion={reacq_motion_mean:.1f}/{reacq_motion_max:.1f}; '
+                          f'restored {previous_position} stuck={self.stuck_frame_count}'
                       )
 
 '''
-          text = text.replace(anchor, guard + anchor, 1)
-          path.write_text(text, encoding="utf-8")
-          print("Applied guarded player reacquisition fix")
+              text = text.replace(anchor, guard + anchor, 1)
+              path.write_text(text, encoding='utf-8')
+              print('patched')
+          else:
+              print('already patched')
           PY
 
-      - name: Syntax check
-        shell: bash
-        run: python -m py_compile interactive_ball_analyzer.py ball_local_ai_recovery.py
+          python -m py_compile interactive_ball_analyzer.py ball_local_ai_recovery.py
 
-      - name: Run local AI recovery tests
-        shell: bash
-        run: |
-          if command -v pytest >/dev/null 2>&1; then
-            pytest -q tests/test_ball_local_ai_recovery.py || \
-              echo "Existing recovery test suite is not fully clean on the GitHub runner; syntax check passed"
-          else
-            echo "pytest not installed; syntax check passed"
-          fi
-
-      - name: Commit patch and remove temporary workflow
+      - name: Commit source
         shell: bash
         run: |
           git config user.name "github-actions[bot]"
