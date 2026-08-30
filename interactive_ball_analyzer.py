@@ -17492,20 +17492,114 @@ class InteractiveBallAnalyzer:
                 )
                 motion_mean = selected_motion['mean'] if selected_motion is not None else 0.0
                 motion_max = selected_motion['max'] if selected_motion is not None else 0.0
-                if (
-                        int(getattr(self, '_player_reacq_protect_until_frame', -1)) >= self.frame_count and
-                        (motion_mean >= 6.0 or motion_max >= 25.0) and
-                        self._player_point_zone((cx, cy)) is None
-                ):
-                    print(
-                        f"Frame {self.frame_count}: [PLAYER-REACQ MOTION CONFIRMED] "
-                        f"clearing guard at ({cx},{cy}) motion={motion_mean:.1f}/{motion_max:.1f}"
-                    )
-                    self._player_reacq_protect_until_frame = -1
+                player_reacq_guard_active = int(
+                    getattr(self, '_player_reacq_protect_until_frame', -1)
+                ) >= self.frame_count
                 selected_predicted_distance = (
                     math.hypot(cx - predicted_point[0], cy - predicted_point[1])
                     if predicted_point is not None else None
                 )
+
+                # Do not let a distant, weakly moving background blob end the
+                # protected player-contact reacquisition window. A real fast
+                # ball may travel far, so large jumps are still allowed when
+                # inter-frame motion is strong or the candidate agrees with
+                # the predicted trajectory.
+                player_reacq_strong_motion = (
+                    motion_mean >= 12.0 or motion_max >= 80.0
+                )
+                player_reacq_prediction_close = (
+                    selected_predicted_distance is not None and
+                    selected_predicted_distance <= 60.0
+                )
+                player_reacq_close_to_anchor = actual_distance <= 80.0
+                player_reacq_weak_large_jump = (
+                    player_reacq_guard_active and
+                    actual_distance >= 150.0 and
+                    not player_reacq_strong_motion and
+                    not player_reacq_prediction_close
+                )
+                if player_reacq_weak_large_jump:
+                    self._record_rejected_contour_debug(
+                        best_contour,
+                        x1,
+                        y1,
+                        cx,
+                        cy,
+                        selected_area_for_guard,
+                        (
+                            f"player-reacq weak large jump {actual_distance:.1f}px "
+                            f"motion={motion_mean:.1f}/{motion_max:.1f}"
+                        ),
+                        source=best_source,
+                    )
+                    self.stuck_frame_count = max(
+                        int(getattr(self, 'stuck_frame_count', 0)) + 1,
+                        1,
+                    )
+                    print(
+                        f"Frame {self.frame_count}: [PLAYER-REACQ WEAK-JUMP REJECT] "
+                        f"holding {self.ball_center} instead of ({cx},{cy}) "
+                        f"jump={actual_distance:.1f}px motion="
+                        f"{motion_mean:.1f}/{motion_max:.1f} "
+                        f"pred_dist={selected_predicted_distance}"
+                    )
+                    visible_ball = self._find_night_visible_ball_candidate(frame, frame_gray)
+                    if visible_ball is not None:
+                        visible_pos = tuple(visible_ball['pos'])
+                        visible_jump = math.hypot(
+                            float(visible_pos[0]) - float(self.ball_center[0]),
+                            float(visible_pos[1]) - float(self.ball_center[1]),
+                        )
+                        visible_mean = float(visible_ball.get('motion_mean', 0.0) or 0.0)
+                        visible_max = float(visible_ball.get('motion_max', 0.0) or 0.0)
+                        visible_pred_dist = (
+                            math.hypot(
+                                float(visible_pos[0]) - float(predicted_point[0]),
+                                float(visible_pos[1]) - float(predicted_point[1]),
+                            )
+                            if predicted_point is not None else None
+                        )
+                        visible_safe = (
+                            visible_jump <= 80.0 or
+                            visible_mean >= 12.0 or
+                            visible_max >= 80.0 or
+                            (visible_pred_dist is not None and visible_pred_dist <= 60.0)
+                        )
+                        if visible_safe:
+                            print(
+                                f"Frame {self.frame_count}: [PLAYER-REACQ WEAK-JUMP VISIBLE BALL] "
+                                f"using {visible_pos} instead; jump={visible_jump:.1f}px "
+                                f"motion={visible_mean:.1f}/{visible_max:.1f}"
+                            )
+                            return self._commit_night_visible_ball_recovery(visible_ball, frame)
+                        print(
+                            f"Frame {self.frame_count}: [PLAYER-REACQ WEAK-JUMP FALLBACK REJECT] "
+                            f"ignoring visible candidate {visible_pos} jump={visible_jump:.1f}px "
+                            f"motion={visible_mean:.1f}/{visible_max:.1f}"
+                        )
+                    return self.ball_center
+
+                # Clearing the protection now needs either strong image motion
+                # or geometric continuity. This preserves slow nearby tracks
+                # while preventing a 300+ px weak-motion blob from becoming a
+                # new anchor simply because it is outside the player box.
+                if (
+                        player_reacq_guard_active and
+                        (
+                            player_reacq_strong_motion or
+                            player_reacq_prediction_close or
+                            player_reacq_close_to_anchor
+                        ) and
+                        self._player_point_zone((cx, cy)) is None
+                ):
+                    print(
+                        f"Frame {self.frame_count}: [PLAYER-REACQ MOTION CONFIRMED] "
+                        f"clearing guard at ({cx},{cy}) motion={motion_mean:.1f}/{motion_max:.1f} "
+                        f"jump={actual_distance:.1f}px pred_dist={selected_predicted_distance}"
+                    )
+                    self._player_reacq_protect_until_frame = -1
+
                 relaxed_contact_min_y = self._contact_reacquire_min_y(
                     contact_reacquire_bounds,
                     selected_predicted_distance,
