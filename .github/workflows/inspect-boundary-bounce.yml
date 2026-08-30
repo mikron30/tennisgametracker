@@ -35,16 +35,15 @@ jobs:
           if detect_marker not in text:
               raise RuntimeError('detect_point_end insertion point not found')
 
-          helper = '''
+          helper_body = '''
           def _confirmed_boundary_reversal_out_candidate(self, ball_position, frame):
               """Return a geometry-confirmed OUT bounce during a direction reversal.
 
               Player-occlusion/reacquisition guards protect against body and racket
-              fragments becoming point-ending positions.  They must not, however,
-              hide a real bounce whose tracked trajectory reaches a singles-court
-              boundary and reverses vertically.  This helper uses only general
-              evidence: current motion, the recorded direction-change event, court
-              geometry, ball-size plausibility, and verified racket-contact state.
+              fragments becoming point-ending positions. They must not hide a real
+              bounce whose tracked trajectory reaches a singles-court boundary and
+              reverses vertically. Evidence here is general: motion, court geometry,
+              ball-size plausibility, and verified racket-contact state.
               """
               if ball_position is None or frame is None:
                   return False, None
@@ -66,25 +65,25 @@ jobs:
               if prev_speed < 5.0 or curr_speed < 6.0:
                   return False, None
 
-              # Do not reinterpret a verified recent racket strike as a bounce.
+              # A verified racket event wins over a geometric bounce hypothesis.
               last_racket = int(getattr(self, '_last_racket_contact_frame', -1000000))
               if 0 <= int(self.frame_count) - last_racket <= 1:
                   return False, None
 
-              height, width = frame.shape[:2]
+              _, width = frame.shape[:2]
               ball_size = float(getattr(self, 'ball_size', 0.0) or 0.0)
               plausible_ball_cap = max(90.0, min(180.0, float(width) * 0.025))
               if ball_size <= 0.0 or ball_size > plausible_ball_cap:
                   return False, None
 
-              candidates = []
+              points = []
               change_point = getattr(self, '_last_direction_change_point', None)
               if change_point is not None:
-                  candidates.append(tuple(change_point))
-              candidates.append(tuple(ball_position))
+                  points.append(tuple(change_point))
+              points.append(tuple(ball_position))
 
               seen = set()
-              for point in candidates:
+              for point in points:
                   point = (int(point[0]), int(point[1]))
                   if point in seen:
                       continue
@@ -96,8 +95,8 @@ jobs:
                   if not outside:
                       continue
 
-                  # Reuse the normal ground-bounce classifier so line-contact
-                  # overrides and court-specific geometry remain authoritative.
+                  # Keep the existing line-contact and court-specific bounce rules
+                  # authoritative rather than inventing a second geometry model.
                   try:
                       in_bounds, reason, _ = self._classify_ground_bounce(point, frame)
                   except Exception:
@@ -119,19 +118,19 @@ jobs:
                   return True, reason
 
               return False, None
-
           '''
-          helper = textwrap.indent(textwrap.dedent(helper), '    ')
-          text = text.replace(detect_marker, helper + detect_marker, 1)
+          helper = textwrap.indent(textwrap.dedent(helper_body), '    ')
+          text = text.replace(detect_marker, helper + '\n' + detect_marker, 1)
 
-          old = '''        if reacq_protect_active and not stationary_ball_override:
-              print(
-                  f"Frame {self.frame_count}: [PLAYER-REACQ END SUPPRESSED] "
-                  f"holding {ball_position} until f{self._player_reacq_protect_until_frame}"
-              )
-              return False, "Player-occlusion reacquisition grace"
-          '''
-          new = '''        if reacq_protect_active and not stationary_ball_override:
+          block_start = text.find('        if reacq_protect_active and not stationary_ball_override:\n')
+          if block_start < 0:
+              raise RuntimeError('player reacq suppression start not found')
+          block_end = text.find('        if stationary_ball_override:\n', block_start)
+          if block_end < 0:
+              raise RuntimeError('player reacq suppression end not found')
+
+          replacement_body = '''
+          if reacq_protect_active and not stationary_ball_override:
               boundary_out, boundary_reason = self._confirmed_boundary_reversal_out_candidate(
                   ball_position, frame
               )
@@ -143,9 +142,8 @@ jobs:
               )
               return False, "Player-occlusion reacquisition grace"
           '''
-          if old not in text:
-              raise RuntimeError('player reacq suppression block not found')
-          text = text.replace(old, new, 1)
+          replacement = textwrap.indent(textwrap.dedent(replacement_body), '        ')
+          text = text[:block_start] + replacement + text[block_end:]
           path.write_text(text, encoding='utf-8')
           print('patched generic boundary reversal OUT priority')
           PY
