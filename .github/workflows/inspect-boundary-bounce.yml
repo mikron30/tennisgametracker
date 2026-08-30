@@ -1,0 +1,39 @@
+name: Inspect boundary bounce logic
+
+on:
+  push:
+    branches:
+      - revert_1
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: revert_1
+      - name: Show boundary bounce code
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          lines = Path('interactive_ball_analyzer.py').read_text(encoding='utf-8').splitlines()
+          needles = [
+              'TOP-FAR-OUT TURN',
+              'def _detect_out_of_court_bounce',
+              '_detect_out_of_court_bounce(ball_position, frame)',
+          ]
+          for needle in needles:
+              print('\n===== NEEDLE:', needle, '=====')
+              for idx, line in enumerate(lines):
+                  if needle in line:
+                      start = max(0, idx - 120)
+                      end = min(len(lines), idx + 140)
+                      print('HIT', idx + 1)
+                      for n in range(start, end):
+                          print(f'{n+1:05d}: {lines[n]}')
+                      break
+          PY
