@@ -1008,12 +1008,22 @@ class InteractiveBallAnalyzer:
         return self._commit_night_visible_ball_recovery(preferred, frame)
 
     def _debug_local_ai_shadow_frame(self, frame, previous_position, normal_position):
+        """Inspect raw Local-AI ranking and optional HSV sweeps without changing tracking."""
         frame_range = getattr(self, "_debug_local_ai_range", None)
         if frame_range is None or frame is None or self.local_ai_recovery is None:
             return
         start_frame, end_frame = frame_range
         if not (int(start_frame) <= int(self.frame_count) <= int(end_frame)):
             return
+
+        from ball_ai_recovery_probe import collect_candidates
+
+        top_n = max(1, int(getattr(self, "_debug_local_ai_top_n", 10)))
+        do_hsv_sweep = bool(getattr(self, "_debug_hsv_sweep", False))
+        radius = float(self._debug_local_ai_radius)
+        out_dir = self.local_ai_recovery.work_dir / "shadow_frames"
+        out_dir.mkdir(parents=True, exist_ok=True)
+
         anchors = []
         for label, point in (("previous", previous_position), ("normal", normal_position)):
             if point is None:
@@ -1022,40 +1032,103 @@ class InteractiveBallAnalyzer:
             if any(existing[1] == point for existing in anchors):
                 continue
             anchors.append((label, point))
-        debug_image = frame.copy()
-        for label, anchor in anchors:
-            try:
-                ranked = self.local_ai_recovery.rank_local_roi_candidate(
-                    int(self.frame_count), frame, anchor=anchor,
-                    radius=float(self._debug_local_ai_radius), maximum_candidates=32,
-                )
-            except Exception as error:
-                print(f"[LOCAL_AI_SHADOW_RANK] f{self.frame_count} anchor={label}:{anchor} ERROR={error}")
-                continue
-            if ranked is None:
-                print(f"[LOCAL_AI_SHADOW_RANK] f{self.frame_count} anchor={label}:{anchor} no-candidate radius={self._debug_local_ai_radius:.0f}px")
-                continue
-            point = (int(ranked["x"]), int(ranked["y"]))
-            zone = self._player_point_zone(point)
-            distance = math.hypot(point[0] - anchor[0], point[1] - anchor[1])
-            score = float(ranked.get("ai_score", 0.0) or 0.0)
-            margin = ranked.get("roi_score_margin")
-            margin_text = "n/a" if margin is None else f"{float(margin):.6f}"
-            print(
-                f"[LOCAL_AI_SHADOW_RANK] f{self.frame_count} anchor={label}:{anchor} "
-                f"top={point} score={score:.6f} margin={margin_text} "
-                f"distance={distance:.1f}px zone={zone or "clear"} "
-                f"candidates={int(ranked.get("roi_candidates", 0) or 0)}"
+
+        def score_candidates(anchor, config, modes, *, pool_limit=96):
+            candidates = collect_candidates(
+                frame, config, modes=modes,
+                min_area=3.0, max_area=2000.0,
+                around=anchor, radius=radius,
             )
-            cv2.circle(debug_image, anchor, 14, (0, 255, 255), 2)
-            cv2.circle(debug_image, point, 20, (255, 0, 255), 3)
-            cv2.putText(debug_image, f"AI {score:.4f}", (point[0] + 10, point[1] + 20),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 0, 255), 2)
-        out_dir = self.local_ai_recovery.work_dir / "shadow_frames"
-        out_dir.mkdir(parents=True, exist_ok=True)
-        output_path = out_dir / f"shadow_f{int(self.frame_count):08d}.jpg"
-        cv2.imwrite(str(output_path), debug_image)
-        print(f"[LOCAL_AI_SHADOW_IMAGE] f{self.frame_count} saved={output_path}")
+            ordered = sorted(
+                candidates,
+                key=lambda item: math.hypot(item["x"] - anchor[0], item["y"] - anchor[1]),
+            )
+            subset = ordered[:max(top_n, min(int(pool_limit), 96))]
+            scored = self.local_ai_recovery._score(frame, int(self.frame_count), subset) if subset else []
+            ranked = sorted(
+                scored,
+                key=lambda item: float(item.get("ai_score", 0.0) or 0.0),
+                reverse=True,
+            )
+            return candidates, ranked
+
+        def print_ranked(prefix, anchor_label, anchor, variant, candidates, ranked, limit):
+            print(
+                f"[{prefix}] f{self.frame_count} anchor={anchor_label}:{anchor} "
+                f"variant={variant} contours={len(candidates)} scored={len(ranked)} radius={radius:.0f}px"
+            )
+            for rank, candidate in enumerate(ranked[:limit], 1):
+                point = (int(candidate["x"]), int(candidate["y"]))
+                zone = self._player_point_zone(point) or "clear"
+                distance = math.hypot(point[0] - anchor[0], point[1] - anchor[1])
+                print(
+                    f"[{prefix}_TOP] f{self.frame_count} {variant} #{rank} "
+                    f"pos={point} ai={float(candidate.get('ai_score', 0.0) or 0.0):.6f} "
+                    f"zone={zone} dist={distance:.1f}px area={float(candidate.get('area', 0.0) or 0.0):.1f} "
+                    f"mode={candidate.get('mode', '?')}"
+                )
+
+        def save_rank_image(anchor_label, anchor, variant, ranked, limit):
+            image = frame.copy()
+            cv2.circle(image, anchor, 14, (0, 255, 255), 2)
+            cv2.putText(image, f"anchor:{anchor_label}", (anchor[0] + 10, anchor[1] - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2)
+            for rank, candidate in enumerate(ranked[:limit], 1):
+                point = (int(candidate["x"]), int(candidate["y"]))
+                score = float(candidate.get("ai_score", 0.0) or 0.0)
+                cv2.circle(image, point, 16, (255, 0, 255), 2)
+                cv2.putText(image, f"#{rank} {score:.3f}", (point[0] + 8, point[1] + 18),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 2)
+            safe_variant = variant.replace(':', '_').replace('/', '_')
+            output_path = out_dir / (
+                f"shadow_f{int(self.frame_count):08d}_{anchor_label}_{safe_variant}.jpg"
+            )
+            cv2.imwrite(str(output_path), image)
+            print(f"[LOCAL_AI_SHADOW_IMAGE] f{self.frame_count} variant={variant} saved={output_path}")
+
+        config = self.local_ai_recovery._config
+        default_modes = ("regular_court", "alt1", "alt2", "alt3", "s_30", "h_10")
+        for anchor_label, anchor in anchors:
+            candidates, ranked = score_candidates(anchor, config, default_modes)
+            print_ranked("LOCAL_AI_SHADOW", anchor_label, anchor, "combined", candidates, ranked, top_n)
+            save_rank_image(anchor_label, anchor, "combined", ranked, top_n)
+
+            if not do_hsv_sweep:
+                continue
+            regular = config.get("regular_court")
+            alt2 = config.get("alt2")
+            if not isinstance(regular, dict) or not isinstance(alt2, dict):
+                print(f"[HSV_SWEEP] f{self.frame_count} skipped: regular_court/alt2 missing")
+                continue
+
+            hsv_keys = ("h_min", "h_max", "s_min", "s_max", "v_min", "v_max")
+            for name, fraction in (
+                ("regular", 0.0),
+                ("mix25", 0.25),
+                ("mix50", 0.50),
+                ("mix75", 0.75),
+                ("alt2", 1.0),
+            ):
+                values = {}
+                for key in hsv_keys:
+                    a = float(regular.get(key, 0))
+                    b = float(alt2.get(key, a))
+                    values[key] = int(round(a + (b - a) * fraction))
+                sweep_config = {"debug_sweep": values}
+                candidates, ranked = score_candidates(anchor, sweep_config, ("debug_sweep",))
+                hsv_text = (
+                    f"H={values['h_min']}-{values['h_max']} "
+                    f"S={values['s_min']}-{values['s_max']} "
+                    f"V={values['v_min']}-{values['v_max']}"
+                )
+                print(
+                    f"[HSV_SWEEP] f{self.frame_count} anchor={anchor_label}:{anchor} "
+                    f"variant={name} {hsv_text} contours={len(candidates)} scored={len(ranked)}"
+                )
+                print_ranked(
+                    "HSV_SWEEP", anchor_label, anchor, name, candidates, ranked, min(top_n, 5)
+                )
+                save_rank_image(anchor_label, anchor, f"hsv_{name}", ranked, min(top_n, 5))
 
     def _try_local_ai_recovery(
             self, previous_position, tracked_position, previous_stuck,
@@ -25180,6 +25253,10 @@ if __name__ == "__main__":
                         help="Raw Local-AI rank debug for an inclusive frame range; does not change tracking")
     parser.add_argument("--debug-local-ai-radius", type=float, default=140.0,
                         help="ROI radius for --debug-local-ai-range (default 140 px)")
+    parser.add_argument("--debug-local-ai-top-n", type=int, default=10,
+                        help="Print/save Top-N raw Local-AI candidates in debug range (default 10)")
+    parser.add_argument("--debug-hsv-sweep", action="store_true",
+                        help="Compare regular-to-alt2 interpolated HSV ranges in Local-AI debug frames")
     parser.add_argument("--disable-player-tracking", action="store_true",
                         help="Disable player/racket context tracking and overlays")
     parser.add_argument("--player-tracking-interval", type=int, default=5,
@@ -25274,6 +25351,8 @@ if __name__ == "__main__":
                                                    debug_local_ai_range=args.debug_local_ai_range,
                                                    debug_local_ai_radius=args.debug_local_ai_radius)
                 analyzer.pause_at_frame = args.pause_at_frame if sequence_index == 0 else None
+                analyzer._debug_local_ai_top_n = args.debug_local_ai_top_n
+                analyzer._debug_hsv_sweep = args.debug_hsv_sweep
                 result = analyzer.process_video(auto_play=args.auto_play, max_frames=max_frames_for_run)
                 if args.audit_points:
                     if args.no_point_history or not analyzer.point_history_file:
