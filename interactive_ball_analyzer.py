@@ -20658,6 +20658,90 @@ class InteractiveBallAnalyzer:
             f"{crossing_text}"
         )
         return True, reason
+
+    def _confirmed_boundary_reversal_out_candidate(self, ball_position, frame):
+        """Return a geometry-confirmed OUT bounce during a direction reversal.
+
+        Player-occlusion/reacquisition guards protect against body and racket
+        fragments becoming point-ending positions. They must not hide a real
+        bounce whose tracked trajectory reaches a singles-court boundary and
+        reverses vertically. Evidence here is general: motion, court geometry,
+        ball-size plausibility, and verified racket-contact state.
+        """
+        if ball_position is None or frame is None:
+            return False, None
+        if int(getattr(self, '_last_direction_change_frame', -1000000)) != int(self.frame_count):
+            return False, None
+        if not bool(getattr(self, '_last_direction_change_vertical_reversal', False)):
+            return False, None
+        if self.prev_motion is None or self.last_motion is None:
+            return False, None
+        if getattr(self, '_awaiting_serve_bounce', False):
+            return False, None
+
+        prev_dy = float(self.prev_motion.get('dy', 0.0) or 0.0)
+        curr_dy = float(self.last_motion.get('dy', 0.0) or 0.0)
+        prev_speed = float(self.prev_motion.get('distance', 0.0) or 0.0)
+        curr_speed = float(self.last_motion.get('distance', 0.0) or 0.0)
+        if prev_dy < 4.0 or curr_dy > -4.0:
+            return False, None
+        if prev_speed < 5.0 or curr_speed < 6.0:
+            return False, None
+
+        # A verified racket event wins over a geometric bounce hypothesis.
+        last_racket = int(getattr(self, '_last_racket_contact_frame', -1000000))
+        if 0 <= int(self.frame_count) - last_racket <= 1:
+            return False, None
+
+        _, width = frame.shape[:2]
+        ball_size = float(getattr(self, 'ball_size', 0.0) or 0.0)
+        plausible_ball_cap = max(90.0, min(180.0, float(width) * 0.025))
+        if ball_size <= 0.0 or ball_size > plausible_ball_cap:
+            return False, None
+
+        points = []
+        change_point = getattr(self, '_last_direction_change_point', None)
+        if change_point is not None:
+            points.append(tuple(change_point))
+        points.append(tuple(ball_position))
+
+        seen = set()
+        for point in points:
+            point = (int(point[0]), int(point[1]))
+            if point in seen:
+                continue
+            seen.add(point)
+            try:
+                outside, boundary, _, _, _, _ = self._point_outside_singles_court(point, frame)
+            except Exception:
+                continue
+            if not outside:
+                continue
+
+            # Keep the existing line-contact and court-specific bounce rules
+            # authoritative rather than inventing a second geometry model.
+            try:
+                in_bounds, reason, _ = self._classify_ground_bounce(point, frame)
+            except Exception:
+                in_bounds, reason = False, None
+            if in_bounds:
+                continue
+
+            reason_text = str(reason or '').lower()
+            if reason is None or ('outside' not in reason_text and 'out' not in reason_text):
+                reason = f"Ball bounced out of court ({boundary})"
+
+            print(
+                f"Frame {self.frame_count}: [BOUNDARY-REVERSAL OUT] "
+                f"point={point} boundary={boundary} "
+                f"motion=({float(self.last_motion.get('dx', 0.0) or 0.0):.1f},"
+                f"{curr_dy:.1f}) prev_dy={prev_dy:.1f} "
+                f"speed={curr_speed:.1f} size={ball_size:.1f}"
+            )
+            return True, reason
+
+        return False, None
+
     def detect_point_end(self, ball_position, frame):
         """Detect if a point has ended based on ball position and behavior."""
         height, width = frame.shape[:2]
@@ -20843,7 +20927,13 @@ class InteractiveBallAnalyzer:
                 stuck_now >= 5 and court_ball_zone and small_ball_blob and
                 slow_now and slow_prev and prior_play
             )
+
         if reacq_protect_active and not stationary_ball_override:
+            boundary_out, boundary_reason = self._confirmed_boundary_reversal_out_candidate(
+                ball_position, frame
+            )
+            if boundary_out:
+                return True, boundary_reason
             print(
                 f"Frame {self.frame_count}: [PLAYER-REACQ END SUPPRESSED] "
                 f"holding {ball_position} until f{self._player_reacq_protect_until_frame}"
