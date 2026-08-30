@@ -1,0 +1,180 @@
+name: Apply guarded player reacquisition fix
+
+on:
+  push:
+    branches:
+      - revert_1
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out revert_1
+        uses: actions/checkout@v4
+        with:
+          ref: revert_1
+          fetch-depth: 0
+
+      - name: Patch player reacquisition guards
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("interactive_ball_analyzer.py")
+          text = path.read_text(encoding="utf-8")
+
+          marker = "[PLAYER_REACQ_WEAK_PLAYER_REJECTED]"
+          if marker in text:
+              print("Player reacquisition weak-motion guards already present")
+              raise SystemExit(0)
+
+          old_signature = '''    def _try_active_tight_local_ai_hold(
+                  self, frame, tracked_position, previous_gray=None):'''
+          new_signature = '''    def _try_active_tight_local_ai_hold(
+                  self, frame, tracked_position, previous_gray=None,
+                  previous_stuck=0):'''
+          if text.count(old_signature) != 1:
+              raise RuntimeError(
+                  f"Expected one tight ROI hold signature, found {text.count(old_signature)}"
+              )
+          text = text.replace(old_signature, new_signature, 1)
+
+          old_stuck_gate = '''                int(self.frame_count) <= int(follow.get('last_frame', -1)) or
+                  int(getattr(self, 'stuck_frame_count', 0)) < 3):'''
+          new_stuck_gate = '''                int(self.frame_count) <= int(follow.get('last_frame', -1)) or
+                  max(
+                      int(getattr(self, 'stuck_frame_count', 0)),
+                      int(previous_stuck or 0),
+                  ) < 3):'''
+          if text.count(old_stuck_gate) != 1:
+              raise RuntimeError(
+                  f"Expected one tight ROI stuck gate, found {text.count(old_stuck_gate)}"
+              )
+          text = text.replace(old_stuck_gate, new_stuck_gate, 1)
+
+          old_call = '''        tight_hold_recovery = self._try_active_tight_local_ai_hold(
+              frame,
+              tracked_position,
+              previous_gray=(pre_track_snapshot or {}).get('_prev_frame_gray'),
+          )'''
+          new_call = '''        tight_hold_recovery = self._try_active_tight_local_ai_hold(
+              frame,
+              tracked_position,
+              previous_gray=(pre_track_snapshot or {}).get('_prev_frame_gray'),
+              previous_stuck=previous_stuck,
+          )'''
+          if text.count(old_call) != 1:
+              raise RuntimeError(
+                  f"Expected one tight ROI hold call, found {text.count(old_call)}"
+              )
+          text = text.replace(old_call, new_call, 1)
+
+          old_anchor = '''        if tight_hold_recovery is not None:
+              return tight_hold_recovery
+          reason = self._local_ai_recovery_reason(
+              previous_position, tracked_position, previous_stuck
+          )'''
+          guard_block = '''        if tight_hold_recovery is not None:
+              return tight_hold_recovery
+
+          # During a player-occlusion reacquisition, normal HSV can briefly
+          # commit a static shoe/racket/background fragment before local AI gets
+          # a chance to arbitrate it.  Do not let that weak candidate reset the
+          # stuck counter or become the next search anchor.  Use the state from
+          # before track_ball_in_frame so this remains causal and frame-agnostic.
+          if (
+                  pre_track_snapshot is not None and
+                  previous_position is not None and
+                  tracked_position is not None and
+                  int(previous_stuck or 0) >= 3):
+              reacq_jump = math.hypot(
+                  float(tracked_position[0]) - float(previous_position[0]),
+                  float(tracked_position[1]) - float(previous_position[1]),
+              )
+              reacq_motion_mean = float(
+                  getattr(self, '_last_tracked_candidate_motion_mean', 0.0) or 0.0
+              )
+              reacq_motion_max = float(
+                  getattr(self, '_last_tracked_candidate_motion_max', 0.0) or 0.0
+              )
+              reacq_zone = self._player_point_zone(tracked_position)
+
+              weak_player_candidate = (
+                  reacq_zone is not None and
+                  reacq_motion_mean < 8.0 and
+                  reacq_motion_max < 50.0
+              )
+              weak_long_jump = (
+                  reacq_jump >= 150.0 and
+                  reacq_motion_mean < 12.0 and
+                  reacq_motion_max < 80.0
+              )
+
+              if weak_player_candidate or weak_long_jump:
+                  rejected_position = tuple(tracked_position)
+                  self._restore_tracking_state_for_provisional_guard(pre_track_snapshot)
+                  self.stuck_frame_count = int(previous_stuck or 0) + 1
+                  if getattr(self, '_last_motion_reacq_frame', -1000000) == self.frame_count:
+                      self._last_motion_reacq_frame = -1000000
+                      self._last_motion_reacq_pos = None
+
+                  if weak_player_candidate:
+                      print(
+                          f"[PLAYER_REACQ_WEAK_PLAYER_REJECTED] f{self.frame_count}: "
+                          f"rejected {rejected_position} zone={reacq_zone} "
+                          f"motion={reacq_motion_mean:.1f}/{reacq_motion_max:.1f}; "
+                          f"restored {previous_position} stuck={self.stuck_frame_count}"
+                      )
+                  else:
+                      print(
+                          f"[PLAYER_REACQ_WEAK_JUMP_REJECTED] f{self.frame_count}: "
+                          f"rejected {rejected_position} jump={reacq_jump:.1f}px "
+                          f"motion={reacq_motion_mean:.1f}/{reacq_motion_max:.1f}; "
+                          f"restored {previous_position} stuck={self.stuck_frame_count}"
+                      )
+                  return previous_position
+
+          reason = self._local_ai_recovery_reason(
+              previous_position, tracked_position, previous_stuck
+          )'''
+          if text.count(old_anchor) != 1:
+              raise RuntimeError(
+                  f"Expected one local AI recovery anchor, found {text.count(old_anchor)}"
+              )
+          text = text.replace(old_anchor, guard_block, 1)
+
+          path.write_text(text, encoding="utf-8")
+          print("Applied guarded player reacquisition fix")
+          PY
+
+      - name: Syntax check
+        shell: bash
+        run: python -m py_compile interactive_ball_analyzer.py ball_local_ai_recovery.py
+
+      - name: Run local AI recovery tests
+        shell: bash
+        run: |
+          if command -v pytest >/dev/null 2>&1; then
+            pytest -q tests/test_ball_local_ai_recovery.py
+          else
+            echo "pytest not installed; syntax check passed"
+          fi
+
+      - name: Commit patch and remove temporary workflow
+        if: success()
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm --ignore-unmatch .github/workflows/apply-player-reacq-weak-motion-guard.yml
+          git add interactive_ball_analyzer.py
+          if git diff --cached --quiet; then
+            echo "Nothing to commit"
+            exit 0
+          fi
+          git commit -m "Guard weak player reacquisition candidates"
+          git push origin HEAD:revert_1
