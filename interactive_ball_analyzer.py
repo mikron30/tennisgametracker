@@ -139,6 +139,20 @@ def _parse_start_score(value: str) -> Tuple[int, int, int, int]:
     return games[0], games[1], points[0], points[1]
 
 
+def _parse_frame_range(value: str) -> Tuple[int, int]:
+    raw = str(value or "").strip()
+    if ":" not in raw:
+        raise argparse.ArgumentTypeError("frame range must be START:END")
+    left, right = raw.split(":", 1)
+    try:
+        start, end = int(left), int(right)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("frame range must contain integers") from error
+    if start < 0 or end < start:
+        raise argparse.ArgumentTypeError("frame range must satisfy 0 <= START <= END")
+    return start, end
+
+
 class _QuietTrackerOutput:
     """Drop contour-by-contour diagnostics while preserving audit heartbeats.
 
@@ -209,6 +223,8 @@ class InteractiveBallAnalyzer:
         local_ai_model: Optional[str] = None,
         local_ai_python: Optional[str] = None,
         local_ai_recovery_dir: Optional[str] = None,
+        debug_local_ai_range: Optional[Tuple[int, int]] = None,
+        debug_local_ai_radius: float = 140.0,
     ):
         self.video_path = video_path
         self.config_file = config_file
@@ -264,6 +280,8 @@ class InteractiveBallAnalyzer:
                 f"{self.ball_dataset_exporter.run_dir}"
             )
         self.local_ai_recovery = None
+        self._debug_local_ai_range = debug_local_ai_range
+        self._debug_local_ai_radius = max(20.0, float(debug_local_ai_radius))
         self._local_ai_frame_buffer = frame_buffer(12)
         self._local_ai_recovery_count = 0
         self._local_ai_all_body_rejections = 0
@@ -988,6 +1006,56 @@ class InteractiveBallAnalyzer:
         if preferred.get('source') != 'local_ai_tight_roi':
             return None
         return self._commit_night_visible_ball_recovery(preferred, frame)
+
+    def _debug_local_ai_shadow_frame(self, frame, previous_position, normal_position):
+        frame_range = getattr(self, "_debug_local_ai_range", None)
+        if frame_range is None or frame is None or self.local_ai_recovery is None:
+            return
+        start_frame, end_frame = frame_range
+        if not (int(start_frame) <= int(self.frame_count) <= int(end_frame)):
+            return
+        anchors = []
+        for label, point in (("previous", previous_position), ("normal", normal_position)):
+            if point is None:
+                continue
+            point = (int(point[0]), int(point[1]))
+            if any(existing[1] == point for existing in anchors):
+                continue
+            anchors.append((label, point))
+        debug_image = frame.copy()
+        for label, anchor in anchors:
+            try:
+                ranked = self.local_ai_recovery.rank_local_roi_candidate(
+                    int(self.frame_count), frame, anchor=anchor,
+                    radius=float(self._debug_local_ai_radius), maximum_candidates=32,
+                )
+            except Exception as error:
+                print(f"[LOCAL_AI_SHADOW_RANK] f{self.frame_count} anchor={label}:{anchor} ERROR={error}")
+                continue
+            if ranked is None:
+                print(f"[LOCAL_AI_SHADOW_RANK] f{self.frame_count} anchor={label}:{anchor} no-candidate radius={self._debug_local_ai_radius:.0f}px")
+                continue
+            point = (int(ranked["x"]), int(ranked["y"]))
+            zone = self._player_point_zone(point)
+            distance = math.hypot(point[0] - anchor[0], point[1] - anchor[1])
+            score = float(ranked.get("ai_score", 0.0) or 0.0)
+            margin = ranked.get("roi_score_margin")
+            margin_text = "n/a" if margin is None else f"{float(margin):.6f}"
+            print(
+                f"[LOCAL_AI_SHADOW_RANK] f{self.frame_count} anchor={label}:{anchor} "
+                f"top={point} score={score:.6f} margin={margin_text} "
+                f"distance={distance:.1f}px zone={zone or "clear"} "
+                f"candidates={int(ranked.get("roi_candidates", 0) or 0)}"
+            )
+            cv2.circle(debug_image, anchor, 14, (0, 255, 255), 2)
+            cv2.circle(debug_image, point, 20, (255, 0, 255), 3)
+            cv2.putText(debug_image, f"AI {score:.4f}", (point[0] + 10, point[1] + 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 0, 255), 2)
+        out_dir = self.local_ai_recovery.work_dir / "shadow_frames"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        output_path = out_dir / f"shadow_f{int(self.frame_count):08d}.jpg"
+        cv2.imwrite(str(output_path), debug_image)
+        print(f"[LOCAL_AI_SHADOW_IMAGE] f{self.frame_count} saved={output_path}")
 
     def _try_local_ai_recovery(
             self, previous_position, tracked_position, previous_stuck,
@@ -23735,6 +23803,7 @@ class InteractiveBallAnalyzer:
                         self._local_ai_frame_buffer[-1]["normal_position"] = (
                             tuple(tracked_position) if tracked_position is not None else None
                         )
+                    self._debug_local_ai_shadow_frame(frame, prev_ball_center, tracked_position)
                     tracked_position = self._try_local_ai_recovery(
                         prev_ball_center, tracked_position, prev_stuck,
                         pre_track_snapshot=pre_track_snapshot,
@@ -25107,6 +25176,10 @@ if __name__ == "__main__":
                         help="Python 3.10 runtime containing the local AI dependencies")
     parser.add_argument("--local-ai-recovery-dir", default="tmp/local_ai_recovery",
                         help="Directory for local-AI recovery decision logs (default: tmp/local_ai_recovery)")
+    parser.add_argument("--debug-local-ai-range", type=_parse_frame_range, metavar="START:END", default=None,
+                        help="Raw Local-AI rank debug for an inclusive frame range; does not change tracking")
+    parser.add_argument("--debug-local-ai-radius", type=float, default=140.0,
+                        help="ROI radius for --debug-local-ai-range (default 140 px)")
     parser.add_argument("--disable-player-tracking", action="store_true",
                         help="Disable player/racket context tracking and overlays")
     parser.add_argument("--player-tracking-interval", type=int, default=5,
@@ -25197,7 +25270,9 @@ if __name__ == "__main__":
                                                    ball_dataset_dir=args.export_ball_dataset,
                                                    local_ai_model=args.local_ai_model,
                                                    local_ai_python=args.local_ai_python,
-                                                   local_ai_recovery_dir=args.local_ai_recovery_dir)
+                                                   local_ai_recovery_dir=args.local_ai_recovery_dir,
+                                                   debug_local_ai_range=args.debug_local_ai_range,
+                                                   debug_local_ai_radius=args.debug_local_ai_radius)
                 analyzer.pause_at_frame = args.pause_at_frame if sequence_index == 0 else None
                 result = analyzer.process_video(auto_play=args.auto_play, max_frames=max_frames_for_run)
                 if args.audit_points:
