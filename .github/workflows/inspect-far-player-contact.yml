@@ -1,0 +1,28 @@
+name: Inspect far player contact
+on:
+  push:
+    branches: [revert_1]
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: revert_1
+      - name: Show contact logic
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p=Path('interactive_ball_analyzer.py')
+          lines=p.read_text(encoding='utf-8').splitlines()
+          needles=['FAR-PLAYER RACKET CONTACT','Resetting bounce count after racket-below contact','Allowing racket-contact continuation']
+          for needle in needles:
+              print('\n###',needle)
+              for i,line in enumerate(lines):
+                  if needle in line:
+                      lo=max(0,i-70); hi=min(len(lines),i+70)
+                      for j in range(lo,hi): print(f'{j+1}: {lines[j]}')
+                      break
+          PY
