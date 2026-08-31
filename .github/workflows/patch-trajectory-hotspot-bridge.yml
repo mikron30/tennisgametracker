@@ -34,8 +34,26 @@ jobs:
           python -m py_compile interactive_ball_analyzer.py
           git diff --check
 
-      - name: Run serve launch regression tests
-        run: python -m unittest discover -s tests -p 'test_serve_launch_handoff.py' -v
+      - name: Run serve launch regression tests and capture result
+        run: |
+          set +e
+          python -m unittest discover -s tests -p 'test_serve_launch_handoff.py' -v > .github/scripts/serve_regression_output.txt 2>&1
+          status=$?
+          cat .github/scripts/serve_regression_output.txt
+          echo "$status" > .github/scripts/serve_regression_status.txt
+          exit 0
+
+      - name: Preserve failure details if tests fail
+        run: |
+          status=$(cat .github/scripts/serve_regression_status.txt)
+          if [ "$status" != "0" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add .github/scripts/serve_regression_output.txt
+            git commit -m "Capture serve regression failure"
+            git push origin HEAD:revert_1
+            exit 1
+          fi
 
       - name: Commit tested source and remove temporary inspection files
         run: |
@@ -44,6 +62,8 @@ jobs:
           rm -f .github/workflows/inspect-fp-trajectory.yml
           rm -f .github/scripts/patch_trajectory_hotspot_bridge.py
           rm -f .github/workflows/patch-trajectory-hotspot-bridge.yml
+          rm -f .github/scripts/serve_regression_output.txt
+          rm -f .github/scripts/serve_regression_status.txt
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A
