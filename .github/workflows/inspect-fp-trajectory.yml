@@ -1,0 +1,31 @@
+name: Inspect FP trajectory interaction
+
+on:
+  push:
+    branches:
+      - revert_1
+    paths:
+      - '.github/scripts/inspect_fp_trajectory.py'
+      - '.github/workflows/inspect-fp-trajectory.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: revert_1
+      - name: Capture source context
+        run: python .github/scripts/inspect_fp_trajectory.py
+      - name: Commit captured context
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .github/scripts/fp_trajectory_context.txt
+          if ! git diff --cached --quiet; then
+            git commit -m "Capture trajectory FP source context"
+            git push origin HEAD:revert_1
+          fi
