@@ -1,0 +1,36 @@
+name: Patch serve launch handoff
+on:
+  push:
+    branches: [revert_1]
+    paths:
+      - '.github/scripts/patch_serve_launch_handoff.py'
+      - '.github/workflows/patch-serve-launch-handoff.yml'
+permissions:
+  contents: write
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: revert_1
+      - name: Apply patch
+        run: python .github/scripts/patch_serve_launch_handoff.py
+      - name: Validate
+        run: |
+          python -m py_compile interactive_ball_analyzer.py
+          git diff --check
+          grep -n "SERVE-LAUNCH HANDOFF" interactive_ball_analyzer.py
+          grep -n "TOP-RETURN DEFER" interactive_ball_analyzer.py
+      - name: Commit patched analyzer and cleanup temporary files
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          rm -f .github/scripts/patch_serve_launch_handoff.py
+          rm -f .github/workflows/patch-serve-launch-handoff.yml
+          rm -f .github/scripts/inspect_serve_launch_tracking.py
+          rm -f .github/scripts/serve_launch_context.txt
+          rm -f .github/workflows/inspect-serve-launch-tracking.yml
+          git add -A
+          git commit -m "Hand off serve launch to trajectory tracking"
+          git push origin HEAD:revert_1
