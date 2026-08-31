@@ -756,6 +756,47 @@ class InteractiveBallAnalyzer:
         """Return a narrow recovery trigger; normal tracking remains primary."""
         if self.local_ai_recovery is None:
             return None
+
+        # POST_SERVE_LAUNCH_LOCK_GUARD_V1
+        # Once a serve launch was verified, do not let a large wrong-way jump
+        # immediately re-anchor tracking on the server/player body. We only
+        # reject a strong reversal inside this short post-contact window.
+        _post_serve_lock_until = int(
+            getattr(self, "_post_serve_launch_lock_until_frame", -1)
+        )
+        if (
+                int(self.frame_count) <= _post_serve_lock_until and
+                previous_position is not None and
+                tracked_position is not None
+        ):
+            _ps_dx = float(tracked_position[0] - previous_position[0])
+            _ps_dy = float(tracked_position[1] - previous_position[1])
+            _ps_distance = math.hypot(_ps_dx, _ps_dy)
+            _ps_expected_dy = int(getattr(self, "serve_direction_dy", 0) or 0)
+
+            _ps_recent_speed = 0.0
+            _ps_velocity_history = getattr(self, "ball_velocity_history", None) or []
+            if _ps_velocity_history:
+                try:
+                    _ps_recent_speed = float(np.median(_ps_velocity_history[-5:]))
+                except Exception:
+                    _ps_recent_speed = 0.0
+
+            _ps_jump_floor = max(100.0, _ps_recent_speed * 1.55)
+            _ps_wrong_way = (
+                (_ps_expected_dy < 0 and _ps_dy >= 70.0) or
+                (_ps_expected_dy > 0 and _ps_dy <= -70.0)
+            )
+
+            if _ps_wrong_way and _ps_distance >= _ps_jump_floor:
+                self._post_serve_launch_lock_last_reject_frame = int(self.frame_count)
+                print(
+                    f"[POST_SERVE_LAUNCH_REJECT] f{self.frame_count}: "
+                    f"tracked={tracked_position} previous={previous_position} "
+                    f"dy={_ps_dy:+.0f}px dist={_ps_distance:.1f}px "
+                    f"floor={_ps_jump_floor:.1f}px; forcing Local AI recovery"
+                )
+                return "post-serve-launch-wrong-way"
         # The tight near-player ROI ranker runs before the candidate is
         # committed.  Do not immediately run the broad buffered recovery on
         # the same accepted frame merely because the real ball still lies
@@ -3219,6 +3260,18 @@ class InteractiveBallAnalyzer:
             f"{chosen['pos']} area={chosen['area']:.1f}px lateral={lateral_progress:.1f} "
             f"signed_dy={signed_dy:.1f} score={chosen['score']:.1f} motion="
             f"{chosen['motion_mean']:.1f}/{chosen['motion_max']:.1f} direction_x={inferred_direction:+d}"
+        )
+        # POST_SERVE_LAUNCH_LOCK_ARM_V1
+        # For the next few frames, a large vertical jump back toward the server
+        # is treated as a player-body latch and handed to Local AI recovery.
+        self._post_serve_launch_lock_until_frame = max(
+            int(getattr(self, "_post_serve_launch_lock_until_frame", -1)),
+            int(self.frame_count) + 7,
+        )
+        self._post_serve_launch_lock_last_reject_frame = -1000000
+        print(
+            f"[POST_SERVE_LAUNCH_LOCK] f{self.frame_count}: armed through "
+            f"f{self._post_serve_launch_lock_until_frame} direction={self.serve_direction_label()}"
         )
         return chosen
 
