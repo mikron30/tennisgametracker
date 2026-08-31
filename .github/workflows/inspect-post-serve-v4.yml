@@ -1,4 +1,4 @@
-name: Inspect post-serve v4
+name: Apply strict pre-net post-serve recovery
 
 on:
   push:
@@ -8,43 +8,88 @@ on:
       - .github/workflows/inspect-post-serve-v4.yml
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  inspect:
+  patch:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           ref: revert_1
           fetch-depth: 1
-      - name: Print net crossing and recovery commit
+
+      - name: Patch strict pre-net guard
         shell: bash
         run: |
           python - <<'PY'
           from pathlib import Path
-          lines = Path('interactive_ball_analyzer.py').read_text(encoding='utf-8').splitlines()
-          needles = [
-              'SERVE-BOUNCE-OUT SUPPRESSED',
-              'net_y',
-              'crossed_net',
-              'net_cross',
-              'repaired_position',
-              '_awaiting_serve_bounce',
+
+          path = Path('interactive_ball_analyzer.py')
+          text = path.read_text(encoding='utf-8')
+
+          def replace_once(old, new, label):
+              global text
+              count = text.count(old)
+              if count != 1:
+                  raise RuntimeError(f'{label}: expected 1 match, found {count}')
+              text = text.replace(old, new, 1)
+
+          # 1) Add two small helpers next to the existing Local-AI recovery reason.
+          old = '''        return None\n\n    def _local_ai_recovery_reason(self, previous_position, tracked_position, previous_stuck):\n'''
+          new = '''        return None\n\n    def _post_serve_pre_net_recovery_reason(self, previous_position, tracked_position):\n        \"\"\"Keep a repaired near-side serve causal until it really reaches the net.\n\n        This guard is armed only after an actual post-serve wrong-way rejection.\n        While it is active, no player/racket/head/shoe pixel may become the\n        endpoint of recovery, and even a clear candidate may not move materially\n        back toward the server.  The guard is cleared only by a plausible,\n        player-free near-to-far step that reaches the net band.\n        \"\"\"\n        if not bool(getattr(self, '_post_serve_pre_net_recovery_active', False)):\n            return None\n        if tracked_position is None:\n            return None\n\n        zone = self._player_point_zone(tracked_position)\n        if zone is not None:\n            return f\"post-serve-launch-pre-net-player:{zone}\"\n\n        if previous_position is not None:\n            expected_dy = int(getattr(self, 'serve_direction_dy', 0) or 0)\n            step_dy = float(tracked_position[1]) - float(previous_position[1])\n            # Once the launch has been repaired, a modest amount of blur/jitter\n            # is fine, but a 18+ px step back toward the near-side server is not.\n            if expected_dy < 0 and step_dy >= 18.0:\n                return f\"post-serve-launch-pre-net-wrong-way:{step_dy:.0f}px\"\n            if expected_dy > 0 and step_dy <= -18.0:\n                return f\"post-serve-launch-pre-net-wrong-way:{step_dy:.0f}px\"\n        return None\n\n    def _maybe_clear_post_serve_pre_net_recovery(self, previous_position, tracked_position, source):\n        \"\"\"Clear the strict guard only on a plausible player-free net arrival.\"\"\"\n        if not bool(getattr(self, '_post_serve_pre_net_recovery_active', False)):\n            return False\n        if previous_position is None or tracked_position is None or not hasattr(self, 'net_y'):\n            return False\n        if self._player_point_zone(tracked_position) is not None:\n            return False\n\n        dx = float(tracked_position[0]) - float(previous_position[0])\n        dy = float(tracked_position[1]) - float(previous_position[1])\n        step = math.hypot(dx, dy)\n        expected_dy = int(getattr(self, 'serve_direction_dy', 0) or 0)\n        toward_net = (expected_dy < 0 and dy < 0.0) or (expected_dy > 0 and dy > 0.0)\n        if not toward_net or step > 400.0:\n            return False\n\n        net_y = float(self.net_y)\n        reached_net_band = (\n            (expected_dy < 0 and float(tracked_position[1]) <= net_y + 25.0) or\n            (expected_dy > 0 and float(tracked_position[1]) >= net_y - 25.0)\n        )\n        if not reached_net_band:\n            return False\n\n        self._post_serve_pre_net_recovery_active = False\n        print(\n            f\"[POST_SERVE_PRE_NET_CLEAR] f{self.frame_count}: source={source} \"\n            f\"prev={previous_position} tracked={tracked_position} \"\n            f\"net_y={net_y:.1f} step={step:.1f}px\"\n        )\n        return True\n\n    def _local_ai_recovery_reason(self, previous_position, tracked_position, previous_stuck):\n'''
+          replace_once(old, new, 'insert strict pre-net helpers')
+
+          # 2) Arm the strict state only after a real post-serve wrong-way rejection.
+          old = '''                self._post_serve_recovery_hold_until_frame = max(\n                    int(getattr(self, \"_post_serve_recovery_hold_until_frame\", -1000000)),\n                    int(self.frame_count) + 10,\n                )\n                print(\n'''
+          new = '''                self._post_serve_recovery_hold_until_frame = max(\n                    int(getattr(self, \"_post_serve_recovery_hold_until_frame\", -1000000)),\n                    int(self.frame_count) + 10,\n                )\n                if not bool(getattr(self, '_post_serve_pre_net_recovery_active', False)):\n                    self._post_serve_pre_net_recovery_active = True\n                    self._post_serve_pre_net_recovery_started_frame = int(self.frame_count)\n                    print(\n                        f\"[POST_SERVE_PRE_NET_GUARD] f{self.frame_count}: armed until trusted net crossing \"\n                        f\"from last_good={previous_position}\"\n                    )\n                print(\n'''
+          replace_once(old, new, 'arm strict pre-net state')
+
+          # 3) Keep the strict reason in force after the old 10-frame hold expires.
+          old = '''                return \"post-serve-launch-wrong-way\"\n        # The tight near-player ROI ranker runs before the candidate is\n'''
+          new = '''                return \"post-serve-launch-wrong-way\"\n\n        strict_pre_net_reason = self._post_serve_pre_net_recovery_reason(\n            previous_position, tracked_position\n        )\n        if strict_pre_net_reason is not None:\n            return strict_pre_net_reason\n\n        # The tight near-player ROI ranker runs before the candidate is\n'''
+          replace_once(old, new, 'apply strict reason after initial rejection')
+
+          # 4) A normal, safe candidate may clear the guard only when it actually reaches the net band.
+          old = '''        if reason is None:\n            return tracked_position\n        post_serve_recovery_active = (\n            int(self.frame_count) <= max(\n                int(getattr(self, \"_post_serve_launch_lock_until_frame\", -1)),\n                int(getattr(self, \"_post_serve_recovery_hold_until_frame\", -1000000)),\n            )\n        )\n'''
+          new = '''        if reason is None:\n            self._maybe_clear_post_serve_pre_net_recovery(\n                previous_position, tracked_position, source='normal-tracker'\n            )\n            return tracked_position\n        post_serve_recovery_active = (\n            bool(getattr(self, '_post_serve_pre_net_recovery_active', False)) or\n            int(self.frame_count) <= max(\n                int(getattr(self, \"_post_serve_launch_lock_until_frame\", -1)),\n                int(getattr(self, \"_post_serve_recovery_hold_until_frame\", -1000000)),\n            )\n        )\n'''
+          replace_once(old, new, 'extend recovery active through net crossing')
+
+          # 5) Defense in depth: even if Local AI returns a high-score player blob,
+          # reject it before any recovered metadata can mutate live tracking state.
+          old = '''        repaired_position = (int(recovered[\"x\"]), int(recovered[\"y\"]))\n        repaired_motion = recovered.get(\"trajectory_motion\")\n'''
+          new = '''        repaired_position = (int(recovered[\"x\"]), int(recovered[\"y\"]))\n        strict_repaired_reason = self._post_serve_pre_net_recovery_reason(\n            previous_position, repaired_position\n        )\n        if strict_repaired_reason is not None:\n            rejected_position = tuple(repaired_position)\n            self._restore_tracking_state_for_provisional_guard(pre_track_snapshot)\n            self.stuck_frame_count = max(\n                int(previous_stuck or 0) + 1,\n                int(getattr(self, 'stuck_frame_count', 0) or 0),\n            )\n            print(\n                f\"[POST_SERVE_PRE_NET_AI_REJECT] f{self.frame_count}: \"\n                f\"rejected={rejected_position} reason={strict_repaired_reason}; \"\n                f\"restored={previous_position} stuck={self.stuck_frame_count}\"\n            )\n            return tuple(previous_position) if previous_position is not None else None\n\n        # A Local-AI temporal path is also allowed to prove the actual net arrival.\n        self._maybe_clear_post_serve_pre_net_recovery(\n            previous_position, repaired_position, source='local-ai'\n        )\n        repaired_motion = recovered.get(\"trajectory_motion\")\n'''
+          replace_once(old, new, 'reject Local-AI pre-net player endpoints')
+
+          # 6) Reset strict state for every new point.
+          old = '''        self._discard_provisional_serve_from_ai = False\n        self._post_serve_recovery_hold_until_frame = -1000000\n        self._local_ai_follow_until_frame = -1\n'''
+          new = '''        self._discard_provisional_serve_from_ai = False\n        self._post_serve_recovery_hold_until_frame = -1000000\n        self._post_serve_pre_net_recovery_active = False\n        self._post_serve_pre_net_recovery_started_frame = -1000000\n        self._local_ai_follow_until_frame = -1\n'''
+          replace_once(old, new, 'reset strict pre-net state')
+
+          # Static checks for the exact guarantees introduced here.
+          required = [
+              'POST_SERVE_PRE_NET_GUARD',
+              'POST_SERVE_PRE_NET_CLEAR',
+              'POST_SERVE_PRE_NET_AI_REJECT',
+              '_post_serve_pre_net_recovery_active',
+              'post-serve-launch-pre-net-player:',
+              'post-serve-launch-pre-net-wrong-way:',
           ]
-          printed=set()
-          for needle in needles:
-              hits=[i for i,line in enumerate(lines) if needle in line]
-              print(f'\n===== {needle}: {[i+1 for i in hits]} =====')
-              for i in hits:
-                  start=max(0,i-28); end=min(len(lines),i+55)
-                  key=(start,end)
-                  if key in printed: continue
-                  printed.add(key)
-                  for n in range(start,end):
-                      print(f'{n+1:05d}: {lines[n]}')
-                  print('---')
-          print('\n===== direct recovery commit 1870-1930 =====')
-          for n in range(1869, min(1930,len(lines))):
-              print(f'{n+1:05d}: {lines[n]}')
+          for marker in required:
+              if marker not in text:
+                  raise RuntimeError(f'missing marker after patch: {marker}')
+
+          path.write_text(text, encoding='utf-8')
+          print('strict pre-net post-serve guard applied')
           PY
+
+          python -m py_compile interactive_ball_analyzer.py ball_local_ai_recovery.py
+
+      - name: Commit tracker patch
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add interactive_ball_analyzer.py
+          git commit -m "Keep post-serve recovery strict until net crossing"
+          git push origin HEAD:revert_1
