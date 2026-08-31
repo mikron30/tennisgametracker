@@ -1,0 +1,28 @@
+name: Inspect post-serve trajectory corridor
+
+on:
+  push:
+    branches: [revert_1]
+    paths:
+      - '.github/scripts/inspect_post_serve_corridor.py'
+      - '.github/workflows/inspect-post-serve-corridor.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: revert_1
+      - name: Extract current trajectory handoff code
+        run: python .github/scripts/inspect_post_serve_corridor.py
+      - name: Commit inspection context
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .github/scripts/post_serve_corridor_context.txt
+          git commit -m "Capture post-serve trajectory corridor context"
+          git push origin HEAD:revert_1
