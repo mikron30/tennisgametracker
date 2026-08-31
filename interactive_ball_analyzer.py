@@ -1,4 +1,12 @@
 import argparse
+
+# Compact console output is the default.  Detailed contour/search diagnostics
+# can be restored with --verbose-debug when a difficult frame needs inspection.
+_verbose_debug_enabled = False
+
+def _verbose_debug_print(*args, **kwargs):
+    if _verbose_debug_enabled:
+        print(*args, **kwargs)
 import contextlib
 import csv
 import os
@@ -15658,9 +15666,9 @@ class InteractiveBallAnalyzer:
                 x2 = min(frame.shape[1], x + search_radius)
                 y2 = min(frame.shape[0], y + search_radius)
                 search_frame = frame[y1:y2, x1:x2]
-                print(f"\n  DEBUG: Serve-scan hint search around ({x},{y}) radius {search_radius}px region ({x1},{y1})-({x2},{y2})")
+                _verbose_debug_print(f"\n  DEBUG: Serve-scan hint search around ({x},{y}) radius {search_radius}px region ({x1},{y1})-({x2},{y2})")
             else:
-                print(f"\n  DEBUG: No previous ball position, searching entire frame")
+                _verbose_debug_print(f"\n  DEBUG: No previous ball position, searching entire frame")
         
         if search_radius is not None:
             search_anchor_y = y
@@ -15694,10 +15702,10 @@ class InteractiveBallAnalyzer:
             # Determine which HSV config will be used
             _, _, hsv_mode_check = self.select_hsv_for_position(search_anchor_y)
             if serve_direction_search:
-                print(f"\n  DEBUG: [SERVE-DIR] Searching {self.serve_direction_label()} from ({x},{y}) "
+                _verbose_debug_print(f"\n  DEBUG: [SERVE-DIR] Searching {self.serve_direction_label()} from ({x},{y}) "
                       f"with radius {search_radius}px, region: ({x1},{y1})-({x2},{y2}), HSV mode: {hsv_mode_check}")
             else:
-                print(f"\n  DEBUG: Searching at ({x},{y}) with radius {search_radius}px, region: ({x1},{y1})-({x2},{y2}), HSV mode: {hsv_mode_check}")
+                _verbose_debug_print(f"\n  DEBUG: Searching at ({x},{y}) with radius {search_radius}px, region: ({x1},{y1})-({x2},{y2}), HSV mode: {hsv_mode_check}")
         
         # Convert frame to HSV
         hsv_frame = cv2.cvtColor(search_frame, cv2.COLOR_BGR2HSV)
@@ -15714,7 +15722,7 @@ class InteractiveBallAnalyzer:
                 should_check_both = True
         if is_dual_mode and contact_recovery_active:
             should_check_both = True
-            print(f"  DEBUG: Contact recovery active - checking BOTH HSV filters")
+            _verbose_debug_print(f"  DEBUG: Contact recovery active - checking BOTH HSV filters")
 
         top_return_search_context = self._top_return_wait_active() or top_return_expired_this_frame
         back_return_search_context = self._back_return_wait_active()
@@ -15921,34 +15929,34 @@ class InteractiveBallAnalyzer:
                     )
                     contours.extend([(extra_source, c) for c in extra_contours])
                 if extra_ball_specs:
-                    print("  DEBUG: [LOWER-COURT BALL MASKS] added regular/alt2 candidates")
+                    _verbose_debug_print("  DEBUG: [LOWER-COURT BALL MASKS] added regular/alt2 candidates")
             
-            print(f"  DEBUG: Found {len(contours)} total contours in search region (mode: {hsv_mode} incl alt)")
+            _verbose_debug_print(f"  DEBUG: Found {len(contours)} total contours in search region (mode: {hsv_mode} incl alt)")
         
         if not contours:
-            print("  DEBUG: [PROBLEM] No contours found in search region!")
+            _verbose_debug_print("  DEBUG: [PROBLEM] No contours found in search region!")
             if 'hsv_lower_use' in dir() and 'hsv_upper_use' in dir():
-                print(f"  DEBUG: HSV filter range ({hsv_mode}): H={hsv_lower_use[0]}-{hsv_upper_use[0]}, S={hsv_lower_use[1]}-{hsv_upper_use[1]}, V={hsv_lower_use[2]}-{hsv_upper_use[2]}")
+                _verbose_debug_print(f"  DEBUG: HSV filter range ({hsv_mode}): H={hsv_lower_use[0]}-{hsv_upper_use[0]}, S={hsv_lower_use[1]}-{hsv_upper_use[1]}, V={hsv_lower_use[2]}-{hsv_upper_use[2]}")
             else:
-                print(f"  DEBUG: HSV filter mode: {hsv_mode}")
-            print(f"  DEBUG: Search region: ({x1},{y1})-({x2},{y2}), size: {x2-x1}x{y2-y1}px")
+                _verbose_debug_print(f"  DEBUG: HSV filter mode: {hsv_mode}")
+            _verbose_debug_print(f"  DEBUG: Search region: ({x1},{y1})-({x2},{y2}), size: {x2-x1}x{y2-y1}px")
             if self.ball_center:
-                print(f"  DEBUG: Previous ball position: {self.ball_center}")
-                print(f"  DEBUG: KEEPING marker at last known position: {self.ball_center}")
+                _verbose_debug_print(f"  DEBUG: Previous ball position: {self.ball_center}")
+                _verbose_debug_print(f"  DEBUG: KEEPING marker at last known position: {self.ball_center}")
                 print(f"[BALL_LOST] f{self.frame_count}: no contours found, keeping pos={self.ball_center} stuck={self.stuck_frame_count}")
                 self._record_ball_loss_event(
                     'no HSV contours',
                     position=self.ball_center,
                     recovery='motion reacquisition attempted',
                 )
-            print(f"  DEBUG: REASON: Ball may have:")
-            print(f"  DEBUG:   - Gone off screen (check edge detection)")
-            print(f"  DEBUG:   - Changed color/lighting dramatically")
+            _verbose_debug_print(f"  DEBUG: REASON: Ball may have:")
+            _verbose_debug_print(f"  DEBUG:   - Gone off screen (check edge detection)")
+            _verbose_debug_print(f"  DEBUG:   - Changed color/lighting dramatically")
             if search_radius is not None:
-                print(f"  DEBUG:   - Moved faster than {search_radius}px/frame")
+                _verbose_debug_print(f"  DEBUG:   - Moved faster than {search_radius}px/frame")
             else:
-                print(f"  DEBUG:   - Fallen outside the current full-frame HSV search")
-            print(f"  DEBUG:   - Be occluded by player/net")
+                _verbose_debug_print(f"  DEBUG:   - Fallen outside the current full-frame HSV search")
+            _verbose_debug_print(f"  DEBUG:   - Be occluded by player/net")
             print(f"  DEBUG: Will continue searching in next frame at same position...")
 
             if allow_inactive:
@@ -16503,7 +16511,7 @@ class InteractiveBallAnalyzer:
             # incorrectly classified as background (e.g. court 2 ball area ~280-360px²).
             if area > bg_threshold:
                 if i < 3:  # Only print first few to avoid spam
-                    print(f"  DEBUG: Contour {i} REJECTED - area={area:.1f}px (background region)")
+                    _verbose_debug_print(f"  DEBUG: Contour {i} REJECTED - area={area:.1f}px (background region)")
                 continue
 
             # Size filter: tighter in inactive serve scan, looser when tracking.
@@ -16513,11 +16521,11 @@ class InteractiveBallAnalyzer:
             # the next frame is not dropped by the old fixed 800/1100px ceilings.
             if allow_inactive:
                 if area < self.serve_ball_size_min or area > self.serve_ball_size_max:
-                    print(f"  DEBUG: Contour {i} REJECTED - area={area:.1f}px (serve scan outside {self.serve_ball_size_min}-{self.serve_ball_size_max})")
+                    _verbose_debug_print(f"  DEBUG: Contour {i} REJECTED - area={area:.1f}px (serve scan outside {self.serve_ball_size_min}-{self.serve_ball_size_max})")
                     continue
             else:
                 if area < 1 or area > ball_size_max_tracking:
-                    print(f"  DEBUG: Contour {i} REJECTED - area={area:.1f}px (outside 1-{ball_size_max_tracking})")
+                    _verbose_debug_print(f"  DEBUG: Contour {i} REJECTED - area={area:.1f}px (outside 1-{ball_size_max_tracking})")
                     continue
 
             # Reject extremely small candidates when we already have a valid previous ball size
@@ -16528,13 +16536,13 @@ class InteractiveBallAnalyzer:
                     self.ball_size and self.ball_size > 40 and
                     area < self._min_area_for_previous_ball_size(self.ball_size, self.ball_center, frame.shape)):
                 min_area = self._min_area_for_previous_ball_size(self.ball_size, self.ball_center, frame.shape)
-                print(f"  DEBUG: Contour {i} REJECTED - area={area:.1f}px "
+                _verbose_debug_print(f"  DEBUG: Contour {i} REJECTED - area={area:.1f}px "
                       f"(too small relative to previous ball size {self.ball_size:.1f}px, min_area={min_area})")
                 continue
 
             # Additional reject: belt-and-suspenders guard in case allow_inactive fell through
             if area < 1 or area > ball_size_max_tracking:
-                print(f"  DEBUG: Contour {i} REJECTED - area={area:.1f}px (outside 1-{ball_size_max_tracking})")
+                _verbose_debug_print(f"  DEBUG: Contour {i} REJECTED - area={area:.1f}px (outside 1-{ball_size_max_tracking})")
                 continue
             
             # Calculate center
@@ -16554,7 +16562,7 @@ class InteractiveBallAnalyzer:
                     active_serve_y_min = max(active_serve_y_min, 24)
                 if not (self.serve_area_x_min <= cx <= self.serve_area_x_max and
                         active_serve_y_min <= cy <= self.serve_area_y_max):
-                    print(f"  DEBUG: Contour {i} REJECTED - pos=({cx},{cy}) outside serve area")
+                    _verbose_debug_print(f"  DEBUG: Contour {i} REJECTED - pos=({cx},{cy}) outside serve area")
                     continue
 
             # Calculate distance from previous position
@@ -16582,12 +16590,12 @@ class InteractiveBallAnalyzer:
                     )
                 signed_dx = self._signed_serve_dx(cx - self.ball_center[0])
                 if signed_dx < serve_direction_min_dx:
-                    print(f"  DEBUG: Contour {i} REJECTED - serve-direction dx={signed_dx:.1f}px < {serve_direction_min_dx}")
+                    _verbose_debug_print(f"  DEBUG: Contour {i} REJECTED - serve-direction dx={signed_dx:.1f}px < {serve_direction_min_dx}")
                     continue
                 if self.serve_direction_dy != 0:
                     signed_dy = self._signed_serve_dy(cy - self.ball_center[1])
                     if signed_dy < serve_direction_min_dy:
-                        print(f"  DEBUG: Contour {i} REJECTED - serve-direction dy={signed_dy:.1f}px < {serve_direction_min_dy}")
+                        _verbose_debug_print(f"  DEBUG: Contour {i} REJECTED - serve-direction dy={signed_dy:.1f}px < {serve_direction_min_dy}")
                         continue
 
             pre_ignore_motion_metrics = None
@@ -16678,31 +16686,31 @@ class InteractiveBallAnalyzer:
                             not upper_post_miss_rebound_override and
                             not upper_racket_below_escape_override and
                             not night_outbound_escape_override):
-                        print(f"  DEBUG: Contour {i} REJECTED - learned hotspot at ({cx},{cy}) "
+                        _verbose_debug_print(f"  DEBUG: Contour {i} REJECTED - learned hotspot at ({cx},{cy}) "
                               f"reason={ignored_entry.get('reason', 'n/a')}")
                         continue
                     if top_return_motion_override:
-                        print(
+                        _verbose_debug_print(
                             f"  DEBUG: Contour {i} ALLOWED - top-return motion overrides learned hotspot "
                             f"at ({cx},{cy}) motion={pre_ignore_motion_metrics['mean']:.1f}/"
                             f"{pre_ignore_motion_metrics['max']:.1f}"
                         )
                     elif upper_post_miss_rebound_override:
-                        print(
+                        _verbose_debug_print(
                             f"  DEBUG: Contour {i} ALLOWED - upper post-miss rebound overrides learned hotspot "
                             f"at ({cx},{cy}) motion={pre_ignore_motion_metrics['mean']:.1f}/"
                             f"{pre_ignore_motion_metrics['max']:.1f} "
                             f"reason={ignored_entry.get('reason', 'n/a')}"
                         )
                     elif upper_racket_below_escape_override:
-                        print(
+                        _verbose_debug_print(
                             f"  DEBUG: Contour {i} ALLOWED - upper racket-below escape overrides learned hotspot "
                             f"at ({cx},{cy}) motion={pre_ignore_motion_metrics['mean']:.1f}/"
                             f"{pre_ignore_motion_metrics['max']:.1f} "
                             f"reason={ignored_entry.get('reason', 'n/a')}"
                         )
                     elif night_outbound_escape_override:
-                        print(
+                        _verbose_debug_print(
                             f"  DEBUG: Contour {i} ALLOWED - night outbound escape overrides learned hotspot "
                             f"at ({cx},{cy}) delta=({night_outbound_escape_debug['dx']:.1f},"
                             f"{night_outbound_escape_debug['dy']:.1f}) "
@@ -16711,7 +16719,7 @@ class InteractiveBallAnalyzer:
                             f"reason={ignored_entry.get('reason', 'n/a')}"
                         )
                     else:
-                        print(
+                        _verbose_debug_print(
                             f"  DEBUG: Contour {i} ALLOWED - predicted path overrides learned hotspot "
                             f"at ({cx},{cy}) pred_dist={predicted_path_hotspot_debug['predicted_distance']:.1f}/"
                             f"{predicted_path_hotspot_debug['predicted_cap']:.1f} "
@@ -16724,17 +16732,17 @@ class InteractiveBallAnalyzer:
                 if contact_recovery_active and self.ball_center:
                     contact_band = max(120, int(frame_height * 0.06))
                     if abs(cy - self.ball_center[1]) > contact_band:
-                        print(f"  DEBUG: Contour {i} REJECTED - contact-recovery band dy={cy - self.ball_center[1]}")
+                        _verbose_debug_print(f"  DEBUG: Contour {i} REJECTED - contact-recovery band dy={cy - self.ball_center[1]}")
                         continue
                     contact_lateral_cap = max(180, int(frame_width * 0.05))
                     if abs(cx - self.ball_center[0]) > contact_lateral_cap:
-                        print(f"  DEBUG: Contour {i} REJECTED - contact-recovery lateral dx={cx - self.ball_center[0]}")
+                        _verbose_debug_print(f"  DEBUG: Contour {i} REJECTED - contact-recovery lateral dx={cx - self.ball_center[0]}")
                         continue
                     if predicted_point is not None:
                         predicted_distance = np.sqrt((cx - predicted_point[0])**2 + (cy - predicted_point[1])**2)
                         predicted_cap = max(140, int(frame_width * 0.04))
                         if predicted_distance > predicted_cap:
-                            print(f"  DEBUG: Contour {i} REJECTED - contact-recovery predicted-dist={predicted_distance:.1f}px > {predicted_cap}")
+                            _verbose_debug_print(f"  DEBUG: Contour {i} REJECTED - contact-recovery predicted-dist={predicted_distance:.1f}px > {predicted_cap}")
                             continue
              
             # Weighted score: distance + size penalty
@@ -17016,7 +17024,7 @@ class InteractiveBallAnalyzer:
                     if (cx < contact_reacquire_bounds['min_x'] or
                             cx > contact_reacquire_bounds['max_x'] or
                             cy > contact_reacquire_bounds['max_y']):
-                        print(f"  DEBUG: Contour {i} REJECTED - upper-exit bounds "
+                        _verbose_debug_print(f"  DEBUG: Contour {i} REJECTED - upper-exit bounds "
                               f"x={contact_reacquire_bounds['min_x']}-{contact_reacquire_bounds['max_x']} "
                               f"max_y={contact_reacquire_bounds['max_y']}")
                         continue
@@ -17031,7 +17039,7 @@ class InteractiveBallAnalyzer:
                         )
                     if (cx < contact_reacquire_bounds['min_x'] or cx > contact_reacquire_bounds['max_x'] or
                             cy < relaxed_min_y):
-                        print(f"  DEBUG: Contour {i} REJECTED - upper-contact bounds "
+                        _verbose_debug_print(f"  DEBUG: Contour {i} REJECTED - upper-contact bounds "
                               f"x={contact_reacquire_bounds['min_x']}-{contact_reacquire_bounds['max_x']} "
                               f"min_y={relaxed_min_y}")
                         continue
@@ -17050,14 +17058,14 @@ class InteractiveBallAnalyzer:
                 if (frame0_hotspot is not None and motion_mean < 8.0 and motion_max < 35.0 and
                         not predicted_path_hotspot_override):
                     score += 1800
-                    print(f"  DEBUG: Contour {i} PENALIZED - frame0 hotspot at ({cx},{cy}) "
+                    _verbose_debug_print(f"  DEBUG: Contour {i} PENALIZED - frame0 hotspot at ({cx},{cy}) "
                           f"motion_mean={motion_mean:.1f} motion_max={motion_max:.1f}")
                 static_hotspot = ((area <= 3 and motion_mean < 1.0 and motion_max < 5.0) or
                                   (cy < 100 and motion_mean < 2.5 and motion_max < 10.0))
                 if static_hotspot and not predicted_path_hotspot_override:
                     score += 1200
                 if self._night_static_side_artifact((cx, cy), area, motion_mean, motion_max, frame.shape):
-                    print(f"  DEBUG: Contour {i} REJECTED - night static side artifact at ({cx},{cy}) "
+                    _verbose_debug_print(f"  DEBUG: Contour {i} REJECTED - night static side artifact at ({cx},{cy}) "
                           f"motion_mean={motion_mean:.1f} motion_max={motion_max:.1f}")
                     continue
                 if (
@@ -17069,7 +17077,7 @@ class InteractiveBallAnalyzer:
                         motion_mean < 2.0 and
                         motion_max <= 8.0 and
                         getattr(self, 'stuck_frame_count', 0) >= 2):
-                    print(f"  DEBUG: Contour {i} REJECTED - night upper static drop at ({cx},{cy}) "
+                    _verbose_debug_print(f"  DEBUG: Contour {i} REJECTED - night upper static drop at ({cx},{cy}) "
                           f"motion_mean={motion_mean:.1f} motion_max={motion_max:.1f}")
                     continue
                 player_penalty, player_reason = self._player_candidate_penalty(
@@ -17082,7 +17090,7 @@ class InteractiveBallAnalyzer:
                 )
                 if player_penalty:
                     score += float(player_penalty)
-                    print(
+                    _verbose_debug_print(
                         f"  DEBUG: Player-context penalty {player_penalty:.0f} "
                         f"at ({cx},{cy}) reason={player_reason} "
                         f"area={area:.1f}px motion={motion_mean:.1f}/{motion_max:.1f}"
@@ -17097,7 +17105,7 @@ class InteractiveBallAnalyzer:
                         steady_reason = "steady repeated false point"
                     if steady_reason is not None and self._observe_steady_false_point(
                             (cx, cy), candidate_filter_key, area, motion_mean, motion_max, steady_reason):
-                        print(f"  DEBUG: Contour {i} REJECTED - persistent false point at ({cx},{cy}) "
+                        _verbose_debug_print(f"  DEBUG: Contour {i} REJECTED - persistent false point at ({cx},{cy}) "
                               f"filter={candidate_filter_key}")
                         continue
             if upper_wall_search_context and self.ball_center is not None:
@@ -17131,7 +17139,7 @@ class InteractiveBallAnalyzer:
                 'contour': contour,
             })
             source_label = f"[{source}]" if source != 'single' else ""
-            print(f"  DEBUG: Contour {i} {source_label} CANDIDATE - pos=({cx},{cy}), area={area:.1f}px, distance={distance:.1f}px, size_ratio={size_ratio:.2f}, score={score:.1f}{motion_note}")
+            _verbose_debug_print(f"  DEBUG: Contour {i} {source_label} CANDIDATE - pos=({cx},{cy}), area={area:.1f}px, distance={distance:.1f}px, size_ratio={size_ratio:.2f}, score={score:.1f}{motion_note}")
             
             if score < best_score:
                 best_score = score
@@ -17994,7 +18002,7 @@ class InteractiveBallAnalyzer:
                     print(f"  DEBUG: [REJECTED] Candidate at ({cx},{cy}), distance={actual_distance:.1f}px")
                     print(f"  DEBUG: Ball was at edge (y={y_prev}), closest match is {actual_distance:.1f}px away")
                     print(f"  DEBUG: This is likely a FALSE POSITIVE - ball probably went off-screen")
-                    print(f"  DEBUG: KEEPING marker at last edge position: {self.ball_center}")
+                    _verbose_debug_print(f"  DEBUG: KEEPING marker at last edge position: {self.ball_center}")
                     print(f"  DEBUG: Will wait for ball to return...")
                     return self.ball_center
 
@@ -20353,8 +20361,8 @@ class InteractiveBallAnalyzer:
             
             return self.ball_center
         
-        print(f"  DEBUG: [PROBLEM] No valid candidate found!")
-        print(f"  DEBUG: Total contours: {len(contours)}, Valid candidates: {len(candidates)}")
+        _verbose_debug_print(f"  DEBUG: [PROBLEM] No valid candidate found!")
+        _verbose_debug_print(f"  DEBUG: Total contours: {len(contours)}, Valid candidates: {len(candidates)}")
         if self.ball_center is not None and not allow_inactive:
             self._record_ball_loss_event(
                 'all HSV candidates rejected',
@@ -20366,17 +20374,17 @@ class InteractiveBallAnalyzer:
             if 'ball_size_max_tracking' in locals():
                 tracking_size_cap = ball_size_max_tracking
             size_cap = f"{self.serve_ball_size_min}-{self.serve_ball_size_max}px (serve scan)" if allow_inactive else f"1-{tracking_size_cap}px"
-            print(f"  DEBUG: All {len(contours)} contours were rejected by size filter ({size_cap})")
+            _verbose_debug_print(f"  DEBUG: All {len(contours)} contours were rejected by size filter ({size_cap})")
             # Show the actual sizes that were rejected
             rejected_sizes = []
             for source, contour in contours[:5]:  # Show first 5
                 rejected_sizes.append(f"{cv2.contourArea(contour):.1f}px")
-            print(f"  DEBUG: Rejected sizes (first 5): {', '.join(rejected_sizes)}")
-            print(f"  DEBUG: REASON: Ball size changed outside {size_cap}")
-            print(f"  DEBUG:   - Ball may be too small (far away) or too large (very close)")
-            print(f"  DEBUG:   - Consider adjusting size filter if ball is visible")
+            _verbose_debug_print(f"  DEBUG: Rejected sizes (first 5): {', '.join(rejected_sizes)}")
+            _verbose_debug_print(f"  DEBUG: REASON: Ball size changed outside {size_cap}")
+            _verbose_debug_print(f"  DEBUG:   - Ball may be too small (far away) or too large (very close)")
+            _verbose_debug_print(f"  DEBUG:   - Consider adjusting size filter if ball is visible")
             if predicted_point:
-                print(f"  DEBUG: Predicted point was {predicted_point}, consider widening search around it")
+                _verbose_debug_print(f"  DEBUG: Predicted point was {predicted_point}, consider widening search around it")
         if (best_contour is None and not allow_inactive and self._is_night_session_config()
                 and self.ball_center is not None):
             night_recover = self._find_night_visible_ball_candidate(frame, frame_gray)
@@ -20518,7 +20526,7 @@ class InteractiveBallAnalyzer:
                 )
                 return self.ball_center
         if self.ball_center:
-            print(f"  DEBUG: KEEPING marker at last known position: {self.ball_center}")
+            _verbose_debug_print(f"  DEBUG: KEEPING marker at last known position: {self.ball_center}")
             print(f"  DEBUG: Will continue searching in next frame at same position...")
             # Increment so the state-machine STUCK_TIMEOUT (stuck≥15) can fire and
             # return to serve-scan mode even when every FFS candidate is filtered out
@@ -25708,6 +25716,8 @@ if __name__ == "__main__":
                         help="Run without display (no GUI windows)")
     parser.add_argument("--quiet", action="store_true",
                         help="Suppress tracker debug/status console output")
+    parser.add_argument("--verbose-debug", action="store_true",
+                        help="Show detailed contour/search rejection diagnostics")
     parser.add_argument("--disable-false-points", dest="disable_false_points", action="store_true",
                         help="Disable learned false-point hiding in debug/tuner views (default)")
     parser.add_argument("--enable-false-points", dest="disable_false_points", action="store_false",
@@ -25790,6 +25800,7 @@ if __name__ == "__main__":
                                   action="store_const", const="near", help=argparse.SUPPRESS)
     parser.set_defaults(disable_false_points=True)
     args = parser.parse_args()
+    globals()['_verbose_debug_enabled'] = bool(args.verbose_debug)
 
     def configured_video_sequence(start_key):
         night_keys = ["night", "night2", "night3"]
