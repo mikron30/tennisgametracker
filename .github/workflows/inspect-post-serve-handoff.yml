@@ -1,4 +1,4 @@
-name: Inspect post-serve handoff
+name: Apply post-serve handoff v3
 
 on:
   push:
@@ -8,30 +8,88 @@ on:
       - .github/workflows/inspect-post-serve-handoff.yml
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  inspect:
+  patch:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           ref: revert_1
           fetch-depth: 1
-      - name: Print verified serve launch code
+      - name: Patch post-serve rollback handoff
         shell: bash
         run: |
           python - <<'PY'
           from pathlib import Path
-          p = Path('interactive_ball_analyzer.py')
-          lines = p.read_text(encoding='utf-8').splitlines()
-          for needle in ['_verified_serve_launch_frame', '_verified_serve_launch_position']:
-              hits = [i for i, line in enumerate(lines) if needle in line]
-              print(f'\n===== {needle}: {[i+1 for i in hits]} =====')
-              for i in hits:
-                  start = max(0, i - 14)
-                  end = min(len(lines), i + 24)
-                  for n in range(start, end):
-                      print(f'{n+1:05d}: {lines[n]}')
-                  print('---')
+
+          def replace_once(text, old, new, label):
+              count = text.count(old)
+              if count != 1:
+                  raise RuntimeError(f'{label}: expected exactly 1 match, found {count}')
+              return text.replace(old, new, 1)
+
+          tracker_path = Path('interactive_ball_analyzer.py')
+          tracker = tracker_path.read_text(encoding='utf-8')
+
+          old = '''            if _ps_wrong_way and _ps_distance >= _ps_jump_floor:\n                self._post_serve_launch_lock_last_reject_frame = int(self.frame_count)\n                print(\n'''
+          new = '''            if _ps_wrong_way and _ps_distance >= _ps_jump_floor:\n                self._post_serve_launch_lock_last_reject_frame = int(self.frame_count)\n                # POST_SERVE_RECOVERY_HOLD_V3\n                # A rejected player-body reversal must not become the anchor on\n                # the next frame.  Give the emergency recovery a short bounded\n                # window to find the outgoing ball while holding the last sane\n                # state.  This starts only after an actual rejection, so normal\n                # receiver returns later in the rally are unaffected.\n                self._post_serve_recovery_hold_until_frame = max(\n                    int(getattr(self, "_post_serve_recovery_hold_until_frame", -1000000)),\n                    int(self.frame_count) + 10,\n                )\n                print(\n'''
+          tracker = replace_once(tracker, old, new, 'arm recovery hold')
+
+          old = '''        self._discard_provisional_serve_from_ai = False\n        self._local_ai_follow_until_frame = -1\n'''
+          new = '''        self._discard_provisional_serve_from_ai = False\n        self._post_serve_recovery_hold_until_frame = -1000000\n        self._local_ai_follow_until_frame = -1\n'''
+          tracker = replace_once(tracker, old, new, 'reset recovery hold per point')
+
+          old = '''        reason = self._local_ai_recovery_reason(\n            previous_position, tracked_position, previous_stuck\n        )\n        if reason is None:\n            return tracked_position\n        trajectory_recovered = self._try_local_ai_trajectory_rescue(\n'''
+          new = '''        reason = self._local_ai_recovery_reason(\n            previous_position, tracked_position, previous_stuck\n        )\n        if reason is None:\n            return tracked_position\n        post_serve_recovery_active = (\n            int(self.frame_count) <= max(\n                int(getattr(self, "_post_serve_launch_lock_until_frame", -1)),\n                int(getattr(self, "_post_serve_recovery_hold_until_frame", -1000000)),\n            )\n        )\n        trajectory_recovered = self._try_local_ai_trajectory_rescue(\n'''
+          tracker = replace_once(tracker, old, new, 'compute post-serve recovery state')
+
+          old = '''        else:\n            recovered = self.local_ai_recovery.recover(\n                self.frame_count,\n                self._local_ai_frame_buffer,\n                predicted_position=previous_position,\n                player_zone=self._player_point_zone,\n                reason=reason,\n                force=False,\n            )\n'''
+          new = '''        else:\n            recovery_reason = reason\n            if post_serve_recovery_active and reason.startswith("player-region:"):\n                # Keep using the post-serve low-saturation candidate pool on\n                # the frames after the first rejected jump.  The normal tracker\n                # may keep proposing a player contour until the ball emerges.\n                recovery_reason = f"post-serve-launch-occlusion:{reason}"\n                print(\n                    f"[POST_SERVE_RECOVERY_RETRY] f{self.frame_count}: "\n                    f"{reason} -> {recovery_reason}"\n                )\n            recovered = self.local_ai_recovery.recover(\n                self.frame_count,\n                self._local_ai_frame_buffer,\n                predicted_position=previous_position,\n                player_zone=self._player_point_zone,\n                reason=recovery_reason,\n                force=False,\n            )\n'''
+          tracker = replace_once(tracker, old, new, 'reuse emergency AI pool')
+
+          old = '''                        self._local_ai_all_body_rejections >= 1 and\n                        # A previously accepted non-body recovery is positive\n'''
+          new = '''                        self._local_ai_all_body_rejections >= 1 and\n                        not post_serve_recovery_active and\n                        # A previously accepted non-body recovery is positive\n'''
+          tracker = replace_once(tracker, old, new, 'protect verified post-serve occlusion')
+
+          old = '''            print(f"[LOCAL_AI_RECOVERY] f{self.frame_count}: no safe path ({reason})")\n            # If HSV just teleported from a physically coherent ball path into a\n'''
+          new = '''            print(f"[LOCAL_AI_RECOVERY] f{self.frame_count}: no safe path ({reason})")\n            # POST_SERVE_STATE_ROLLBACK_V3\n            # The reason detector runs after normal HSV tracking has already\n            # mutated ball_center/motion/history.  If the post-serve guard says\n            # that mutation is unsafe and AI cannot replace it, restore the\n            # complete pre-track snapshot immediately.  Returning the previous\n            # position makes the main loop log/record the held sane point rather\n            # than the rejected player pixel.\n            if (\n                    post_serve_recovery_active and\n                    pre_track_snapshot is not None and\n                    previous_position is not None and\n                    (\n                        reason.startswith("post-serve-launch-") or\n                        reason.startswith("player-region:")\n                    )):\n                rejected_position = (\n                    tuple(tracked_position) if tracked_position is not None else None\n                )\n                self._restore_tracking_state_for_provisional_guard(pre_track_snapshot)\n                self.stuck_frame_count = max(\n                    int(previous_stuck or 0) + 1,\n                    int(getattr(self, "stuck_frame_count", 0) or 0),\n                )\n                if getattr(self, "_last_motion_reacq_frame", -1000000) == self.frame_count:\n                    self._last_motion_reacq_frame = -1000000\n                    self._last_motion_reacq_pos = None\n                print(\n                    f"[POST_SERVE_LAUNCH_ROLLBACK] f{self.frame_count}: "\n                    f"rejected={rejected_position} reason={reason}; "\n                    f"restored={previous_position} stuck={self.stuck_frame_count} "\n                    f"retry_through=f{int(getattr(self, '_post_serve_recovery_hold_until_frame', -1))}"\n                )\n                return tuple(previous_position)\n            # If HSV just teleported from a physically coherent ball path into a\n'''
+          tracker = replace_once(tracker, old, new, 'rollback rejected post-serve state')
+
+          tracker_path.write_text(tracker, encoding='utf-8')
+
+          recovery_path = Path('ball_local_ai_recovery.py')
+          recovery = recovery_path.read_text(encoding='utf-8')
+          recovery = replace_once(
+              recovery,
+              'post_serve_emergency = str(reason or "").startswith("post-serve-launch-wrong-way")',
+              'post_serve_emergency = str(reason or "").startswith("post-serve-launch-")',
+              'broaden post-serve emergency candidate pool',
+          )
+          recovery = replace_once(
+              recovery,
+              'str(reason).startswith("post-serve-launch-wrong-way")',
+              'str(reason).startswith("post-serve-launch-")',
+              'broaden post-serve rapid retry',
+          )
+          recovery_path.write_text(recovery, encoding='utf-8')
+
+          # Static regression checks against the exact failure shape in the log.
+          assert 'POST_SERVE_STATE_ROLLBACK_V3' in tracker
+          assert 'post-serve-launch-occlusion:' in tracker
+          assert 'not post_serve_recovery_active' in tracker
+          assert 'startswith("post-serve-launch-")' in recovery
+          print('post-serve handoff v3 patch applied')
           PY
+
+          python -m py_compile interactive_ball_analyzer.py ball_local_ai_recovery.py
+
+      - name: Commit patched tracker
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add interactive_ball_analyzer.py ball_local_ai_recovery.py
+          git commit -m "Rollback unsafe post-serve tracking state"
+          git push origin HEAD:revert_1
