@@ -12287,7 +12287,7 @@ class InteractiveBallAnalyzer:
                 frame_shape = frame_gray.shape if frame_gray is not None else None
                 min_area = self._min_area_for_previous_ball_size(self.ball_size, prev_pos, frame_shape)
                 if area < min_area:
-                    print(f"  DEBUG: retrack_using_alt2 skipping too-small contour area={area:.1f} "
+                    _verbose_debug_print(f"  DEBUG: retrack_using_alt2 skipping too-small contour area={area:.1f} "
                           f"prev_ball_size={self.ball_size:.1f} min_area={min_area}")
                     continue
 
@@ -12317,7 +12317,7 @@ class InteractiveBallAnalyzer:
                         predicted_path_hotspot_override = False
                         predicted_path_hotspot_debug = None
                     if not predicted_path_hotspot_override:
-                        print(f"  DEBUG: retrack_using_alt2 skipping learned hotspot at ({cx},{cy}) "
+                        _verbose_debug_print(f"  DEBUG: retrack_using_alt2 skipping learned hotspot at ({cx},{cy}) "
                               f"reason={ignored_entry.get('reason', 'n/a')}")
                         continue
                     print(
@@ -12334,18 +12334,18 @@ class InteractiveBallAnalyzer:
                 if getattr(self, '_contact_recovery_frames', 0) > 0 and prev_pos is not None:
                     contact_band = max(120, int((frame_gray.shape[0] if frame_gray is not None else search_frame.shape[0]) * 0.06))
                     if abs(cy - prev_pos[1]) > contact_band:
-                        print(f"  DEBUG: retrack_using_alt2 skipping contact-band outlier at ({cx},{cy}) "
+                        _verbose_debug_print(f"  DEBUG: retrack_using_alt2 skipping contact-band outlier at ({cx},{cy}) "
                               f"dy={cy - prev_pos[1]}")
                         continue
                     contact_lateral_cap = 180
                     if abs(cx - prev_pos[0]) > contact_lateral_cap:
-                        print(f"  DEBUG: retrack_using_alt2 skipping contact-lateral outlier at ({cx},{cy}) "
+                        _verbose_debug_print(f"  DEBUG: retrack_using_alt2 skipping contact-lateral outlier at ({cx},{cy}) "
                               f"dx={cx - prev_pos[0]}")
                         continue
                     if predicted_point is not None:
                         predicted_distance = math.hypot(cx - predicted_point[0], cy - predicted_point[1])
                         if predicted_distance > 140:
-                            print(f"  DEBUG: retrack_using_alt2 skipping predicted outlier at ({cx},{cy}) "
+                            _verbose_debug_print(f"  DEBUG: retrack_using_alt2 skipping predicted outlier at ({cx},{cy}) "
                                   f"pred_dist={predicted_distance:.1f}")
                             continue
 
@@ -12407,19 +12407,19 @@ class InteractiveBallAnalyzer:
                     if trajectory_priority_candidate:
                         score -= min(60.0, max(0.0, predicted_cap - predicted_distance) * 4.0)
                 if frame0_hotspot is not None and motion_mean < 8.0 and motion_max < 35.0 and not trajectory_priority_candidate:
-                    print(f"  DEBUG: retrack_using_alt2 skipping frame0 hotspot at ({cx},{cy}) "
+                    _verbose_debug_print(f"  DEBUG: retrack_using_alt2 skipping frame0 hotspot at ({cx},{cy}) "
                           f"motion_mean={motion_mean:.1f} motion_max={motion_max:.1f}")
                     continue
                 static_hotspot = ((area <= 3 and motion_mean < 1.0 and motion_max < 5.0) or
                                   (cy < 100 and motion_mean < 2.5 and motion_max < 10.0))
                 if static_hotspot and not trajectory_priority_candidate:
-                    print(f"  DEBUG: retrack_using_alt2 skipping static hotspot at ({cx},{cy}) "
+                    _verbose_debug_print(f"  DEBUG: retrack_using_alt2 skipping static hotspot at ({cx},{cy}) "
                           f"motion_mean={motion_mean:.1f} motion_max={motion_max:.1f}")
                     continue
                 if self._night_static_side_artifact(
                         (cx, cy), area, motion_mean, motion_max,
                         frame_gray.shape if frame_gray is not None else search_frame.shape):
-                    print(f"  DEBUG: retrack_using_alt2 skipping night static side artifact at ({cx},{cy}) "
+                    _verbose_debug_print(f"  DEBUG: retrack_using_alt2 skipping night static side artifact at ({cx},{cy}) "
                           f"motion_mean={motion_mean:.1f} motion_max={motion_max:.1f}")
                     continue
 
@@ -15168,7 +15168,7 @@ class InteractiveBallAnalyzer:
                     self._top_return_expired_anchor = (anchor_x, anchor_y)
                     self._top_return_expired_frame = self.frame_count
                 elapsed = max(0, self.frame_count - self._top_return_origin_frame)
-                print(f"\n  DEBUG: [TOP-RETURN WAIT] holding near top edge from ({anchor_x},{anchor_y}), "
+                _verbose_debug_print(f"\n  DEBUG: [TOP-RETURN WAIT] holding near top edge from ({anchor_x},{anchor_y}), "
                       f"frames_left={self._top_return_wait_frames}")
                 x, y, x1_custom, y1_custom, x2_custom, y2_custom = self._build_top_return_search_region(frame.shape)
                 custom_search_region = (x1_custom, y1_custom, x2_custom, y2_custom)
@@ -15292,7 +15292,7 @@ class InteractiveBallAnalyzer:
                     print(f"  DEBUG: [RALLY-CONTACT] wide search radius={search_radius}px, frames_left={self._rally_contact_grace_frames}")
                 if serve_contact_descending:
                     search_radius = max(search_radius, self.max_ball_speed)
-                    print(f"  DEBUG: [SERVE-CONTACT] wide search radius={search_radius}px, frames_left={self._serve_contact_grace_frames}")
+                    _verbose_debug_print(f"  DEBUG: [SERVE-CONTACT] wide search radius={search_radius}px, frames_left={self._serve_contact_grace_frames}")
                 if ground_bounce_grace:
                     search_radius = max(search_radius, max(self.max_ball_speed, 110))
                     print(f"  DEBUG: [GROUND-BOUNCE] wide search radius={search_radius}px, frames_left={self._ground_bounce_grace_frames}")
@@ -15395,7 +15395,7 @@ class InteractiveBallAnalyzer:
                         )
                         if ground_bounce_context is not None:
                             search_radius = max(search_radius, max(self.max_ball_speed, 110))
-                            print(f"  DEBUG: [GROUND-BOUNCE PREP] wide search radius={search_radius}px "
+                            _verbose_debug_print(f"  DEBUG: [GROUND-BOUNCE PREP] wide search radius={search_radius}px "
                                   f"origin={ground_bounce_context['origin']} "
                                   f"expected={ground_bounce_context['expected']} "
                                   f"incoming=({ground_bounce_context.get('incoming_dx', 0.0):.1f},"
@@ -18228,7 +18228,7 @@ class InteractiveBallAnalyzer:
                             source=best_source,
                         )
                         self.stuck_frame_count = min(self.stuck_frame_count, 4)
-                        print(f"Frame {self.frame_count}: [TOP-RETURN WAIT] ignoring non-reentry blob ({cx},{cy}) "
+                        _verbose_debug_print(f"Frame {self.frame_count}: [TOP-RETURN WAIT] ignoring non-reentry blob ({cx},{cy}) "
                               f"reason={top_return_reason}")
                         return self.ball_center
                     accepted_top_return_reentry = True
@@ -18623,7 +18623,7 @@ class InteractiveBallAnalyzer:
                         return self.ball_center
 
             source_label = f" from [{best_source}] filter" if best_source and best_source != 'single' else ""
-            print(f"  DEBUG: [SELECTED] contour at ({cx},{cy}), score={best_score:.1f}{source_label}")
+            _verbose_debug_print(f"  DEBUG: [SELECTED] contour at ({cx},{cy}), score={best_score:.1f}{source_label}")
 
             selected_override = None
             upper_far_player_override_context = (
@@ -21798,7 +21798,7 @@ class InteractiveBallAnalyzer:
             'margin': max(12.0, width * 0.0035),
         }
         self._singles_sideline_frame_shape = frame_shape
-        print(
+        _verbose_debug_print(
             f"  DEBUG: Singles sideline model built: "
             f"left_x@{y_ref}={left_best['x_ref']:.1f} angle={left_best['angle']:.1f}, "
             f"right_x@{y_ref}={right_best['x_ref']:.1f} angle={right_best['angle']:.1f}"
@@ -22237,7 +22237,7 @@ class InteractiveBallAnalyzer:
             'net_margin': max(24.0, width * 0.0080),
         }
         self._service_box_frame_shape = frame_shape
-        print(
+        _verbose_debug_print(
             f"  DEBUG: Service box model built: net_y={net_y:.1f} "
             f"service_y_mid={service_line['y_mid']:.1f}"
         )
@@ -24818,7 +24818,7 @@ class InteractiveBallAnalyzer:
                                 game_state = "POINT_ENDED"
                             reset_tracking_state(hold_end_marker=True, end_position=tracked_position)
                         else:
-                            print(f"Frame {self.frame_count}: Ball tracking continued")
+                            _verbose_debug_print(f"Frame {self.frame_count}: Ball tracking continued")
                 else:
                     # Ball lost - might be end of point
                     if getattr(self, '_back_return_timed_out', False):
