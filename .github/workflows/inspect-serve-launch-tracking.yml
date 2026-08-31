@@ -1,0 +1,20 @@
+name: Inspect serve launch tracking
+
+on:
+  push:
+    branches:
+      - revert_1
+    paths:
+      - '.github/scripts/inspect_serve_launch_tracking.py'
+      - '.github/workflows/inspect-serve-launch-tracking.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Print relevant source context
+        run: python .github/scripts/inspect_serve_launch_tracking.py
