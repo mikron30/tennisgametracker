@@ -752,6 +752,66 @@ class InteractiveBallAnalyzer:
             return zone
         return None
 
+    def _post_serve_pre_net_recovery_reason(self, previous_position, tracked_position):
+        """Keep a repaired near-side serve causal until it really reaches the net.
+
+        This guard is armed only after an actual post-serve wrong-way rejection.
+        While it is active, no player/racket/head/shoe pixel may become the
+        endpoint of recovery, and even a clear candidate may not move materially
+        back toward the server. The guard is cleared only by a plausible,
+        player-free step that reaches the net band.
+        """
+        if not bool(getattr(self, '_post_serve_pre_net_recovery_active', False)):
+            return None
+        if tracked_position is None:
+            return None
+
+        zone = self._player_point_zone(tracked_position)
+        if zone is not None:
+            return f"post-serve-launch-pre-net-player:{zone}"
+
+        if previous_position is not None:
+            expected_dy = int(getattr(self, 'serve_direction_dy', 0) or 0)
+            step_dy = float(tracked_position[1]) - float(previous_position[1])
+            if expected_dy < 0 and step_dy >= 18.0:
+                return f"post-serve-launch-pre-net-wrong-way:{step_dy:.0f}px"
+            if expected_dy > 0 and step_dy <= -18.0:
+                return f"post-serve-launch-pre-net-wrong-way:{step_dy:.0f}px"
+        return None
+
+    def _maybe_clear_post_serve_pre_net_recovery(self, previous_position, tracked_position, source):
+        """Clear the strict guard only on a plausible player-free net arrival."""
+        if not bool(getattr(self, '_post_serve_pre_net_recovery_active', False)):
+            return False
+        if previous_position is None or tracked_position is None or not hasattr(self, 'net_y'):
+            return False
+        if self._player_point_zone(tracked_position) is not None:
+            return False
+
+        dx = float(tracked_position[0]) - float(previous_position[0])
+        dy = float(tracked_position[1]) - float(previous_position[1])
+        step = math.hypot(dx, dy)
+        expected_dy = int(getattr(self, 'serve_direction_dy', 0) or 0)
+        toward_net = (expected_dy < 0 and dy < 0.0) or (expected_dy > 0 and dy > 0.0)
+        if not toward_net or step > 400.0:
+            return False
+
+        net_y = float(self.net_y)
+        reached_net_band = (
+            (expected_dy < 0 and float(tracked_position[1]) <= net_y + 25.0) or
+            (expected_dy > 0 and float(tracked_position[1]) >= net_y - 25.0)
+        )
+        if not reached_net_band:
+            return False
+
+        self._post_serve_pre_net_recovery_active = False
+        print(
+            f"[POST_SERVE_PRE_NET_CLEAR] f{self.frame_count}: source={source} "
+            f"prev={previous_position} tracked={tracked_position} "
+            f"net_y={net_y:.1f} step={step:.1f}px"
+        )
+        return True
+
     def _local_ai_recovery_reason(self, previous_position, tracked_position, previous_stuck):
         """Return a narrow recovery trigger; normal tracking remains primary."""
         if self.local_ai_recovery is None:
@@ -804,6 +864,13 @@ class InteractiveBallAnalyzer:
                     int(getattr(self, "_post_serve_recovery_hold_until_frame", -1000000)),
                     int(self.frame_count) + 10,
                 )
+                if not bool(getattr(self, '_post_serve_pre_net_recovery_active', False)):
+                    self._post_serve_pre_net_recovery_active = True
+                    self._post_serve_pre_net_recovery_started_frame = int(self.frame_count)
+                    print(
+                        f"[POST_SERVE_PRE_NET_GUARD] f{self.frame_count}: armed until trusted net crossing "
+                        f"from last_good={previous_position}"
+                    )
                 print(
                     f"[POST_SERVE_LAUNCH_REJECT] f{self.frame_count}: "
                     f"tracked={tracked_position} previous={previous_position} "
@@ -811,6 +878,13 @@ class InteractiveBallAnalyzer:
                     f"floor={_ps_jump_floor:.1f}px; forcing Local AI recovery"
                 )
                 return "post-serve-launch-wrong-way"
+
+        strict_pre_net_reason = self._post_serve_pre_net_recovery_reason(
+            previous_position, tracked_position
+        )
+        if strict_pre_net_reason is not None:
+            return strict_pre_net_reason
+
         # The tight near-player ROI ranker runs before the candidate is
         # committed.  Do not immediately run the broad buffered recovery on
         # the same accepted frame merely because the real ball still lies
@@ -1722,8 +1796,12 @@ class InteractiveBallAnalyzer:
             previous_position, tracked_position, previous_stuck
         )
         if reason is None:
+            self._maybe_clear_post_serve_pre_net_recovery(
+                previous_position, tracked_position, source='normal-tracker'
+            )
             return tracked_position
         post_serve_recovery_active = (
+            bool(getattr(self, '_post_serve_pre_net_recovery_active', False)) or
             int(self.frame_count) <= max(
                 int(getattr(self, "_post_serve_launch_lock_until_frame", -1)),
                 int(getattr(self, "_post_serve_recovery_hold_until_frame", -1000000)),
@@ -1881,6 +1959,27 @@ class InteractiveBallAnalyzer:
             return tracked_position
         self._local_ai_all_body_rejections = 0
         repaired_position = (int(recovered["x"]), int(recovered["y"]))
+        strict_repaired_reason = self._post_serve_pre_net_recovery_reason(
+            previous_position, repaired_position
+        )
+        if strict_repaired_reason is not None:
+            rejected_position = tuple(repaired_position)
+            if pre_track_snapshot is not None:
+                self._restore_tracking_state_for_provisional_guard(pre_track_snapshot)
+            self.stuck_frame_count = max(
+                int(previous_stuck or 0) + 1,
+                int(getattr(self, 'stuck_frame_count', 0) or 0),
+            )
+            print(
+                f"[POST_SERVE_PRE_NET_AI_REJECT] f{self.frame_count}: "
+                f"rejected={rejected_position} reason={strict_repaired_reason}; "
+                f"restored={previous_position} stuck={self.stuck_frame_count}"
+            )
+            return tuple(previous_position) if previous_position is not None else None
+
+        self._maybe_clear_post_serve_pre_net_recovery(
+            previous_position, repaired_position, source='local-ai'
+        )
         self.ball_center = repaired_position
         self.ball_size = float(recovered.get("area", self.ball_size or 0.0))
         if recovered.get("trajectory_rescue"):
@@ -8068,6 +8167,8 @@ class InteractiveBallAnalyzer:
         self._local_ai_tight_roi_previous_gray = None
         self._discard_provisional_serve_from_ai = False
         self._post_serve_recovery_hold_until_frame = -1000000
+        self._post_serve_pre_net_recovery_active = False
+        self._post_serve_pre_net_recovery_started_frame = -1000000
         self._local_ai_follow_until_frame = -1
         self._local_ai_handoff_deadline_frame = -1
         self._reset_point_score_context()
