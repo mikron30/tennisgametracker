@@ -13,24 +13,13 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: revert_1
-      - name: Print selected metadata handoff
+      - name: Print false-positive guard metadata assignment
         run: |
           python - <<'PY'
           from pathlib import Path
           lines=Path('interactive_ball_analyzer.py').read_text(encoding='utf-8').splitlines()
-          needles=[
-            'selected_meta_for_guard =',
-            '_prefer_predicted_continuation_candidate(',
-            'trajectory_continuation_selected',
-          ]
-          hits=[]
-          for needle in needles:
-            for i,line in enumerate(lines):
-              if needle in line:
-                hits.append((i,needle))
-          for i,needle in hits:
-            a=max(0,i-130); b=min(len(lines),i+170)
-            print(f'\n===== {needle} at {i+1}; lines {a+1}-{b} =====')
-            for j in range(a,b):
+          for a,b in [(18100,18190),(17280,17540)]:
+            print(f'\n===== SOURCE {a}:{b} =====')
+            for j in range(a-1,min(b,len(lines))):
               print(f'{j+1:6d}: {lines[j]}')
           PY
