@@ -18,25 +18,19 @@ jobs:
         with:
           ref: revert_1
           fetch-depth: 1
-      - name: Print handoff code
+      - name: Print verified serve launch code
         shell: bash
         run: |
           python - <<'PY'
           from pathlib import Path
           p = Path('interactive_ball_analyzer.py')
           lines = p.read_text(encoding='utf-8').splitlines()
-          needles = [
-              '_post_serve_launch_lock_until_frame',
-              'POST_SERVE_LAUNCH_LOCK',
-              '_discard_provisional_serve_from_ai',
-              '_post_serve_launch_lock_last_reject_frame',
-          ]
-          for needle in needles:
+          for needle in ['_verified_serve_launch_frame', '_verified_serve_launch_position']:
               hits = [i for i, line in enumerate(lines) if needle in line]
               print(f'\n===== {needle}: {[i+1 for i in hits]} =====')
               for i in hits:
-                  start = max(0, i - 16)
-                  end = min(len(lines), i + 28)
+                  start = max(0, i - 14)
+                  end = min(len(lines), i + 24)
                   for n in range(start, end):
                       print(f'{n+1:05d}: {lines[n]}')
                   print('---')
