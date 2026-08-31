@@ -1,0 +1,65 @@
+name: Inspect post-serve recovery
+
+on:
+  push:
+    branches:
+      - revert_1
+    paths:
+      - .github/workflows/inspect-post-serve-recovery.yml
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: revert_1
+          fetch-depth: 1
+      - name: Print relevant tracker code
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          checks = {
+              'interactive_ball_analyzer.py': [
+                  'def serve_direction_label',
+                  'serve_direction_dy',
+                  'serve_direction',
+                  'POST_SERVE_LAUNCH_LOCK_GUARD_V1',
+                  'def _local_ai_recovery_reason',
+                  '_local_ai_recovery_reason(',
+                  'def _try_local_ai_trajectory_rescue',
+                  'player_body',
+                  '_player_point_zone',
+              ],
+              'ball_local_ai_recovery.py': [
+                  'def recover(',
+                  'player_zone',
+                  'all-player-body-path',
+                  'predicted_position',
+              ],
+          }
+
+          for filename, needles in checks.items():
+              p = Path(filename)
+              print(f'\n===== {filename} =====')
+              lines = p.read_text(encoding='utf-8').splitlines()
+              shown = set()
+              for needle in needles:
+                  print(f'\n--- SEARCH: {needle} ---')
+                  hits = [i for i, line in enumerate(lines) if needle in line]
+                  print('hits:', [i + 1 for i in hits])
+                  for i in hits[:8]:
+                      start = max(0, i - 18)
+                      end = min(len(lines), i + 36)
+                      key = (start, end)
+                      if key in shown:
+                          continue
+                      shown.add(key)
+                      for n in range(start, end):
+                          print(f'{n+1:05d}: {lines[n]}')
+          PY
