@@ -23,6 +23,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add .github/scripts/post_serve_corridor_context.txt
-          git commit -m "Capture post-serve trajectory corridor context"
+          git add .github/scripts/post_serve_corridor_context.txt .github/scripts/post_serve_trajectory_function.txt
+          git diff --cached --quiet && exit 0
+          git commit -m "Capture exact post-serve trajectory function"
           git push origin HEAD:revert_1
