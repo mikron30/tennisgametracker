@@ -1,0 +1,35 @@
+name: Patch compact debug
+on:
+  push:
+    branches: [revert_1]
+    paths:
+      - '.github/scripts/patch_compact_debug.py'
+      - '.github/workflows/patch-compact-debug.yml'
+permissions:
+  contents: write
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: revert_1
+      - name: Apply compact logging patch
+        run: python .github/scripts/patch_compact_debug.py
+      - name: Validate
+        run: |
+          python -m py_compile interactive_ball_analyzer.py
+          git diff --check
+          grep -n -- "--verbose-debug" interactive_ball_analyzer.py
+          grep -n "_verbose_debug_print" interactive_ball_analyzer.py | head -20
+      - name: Commit compact logging and remove temporary patch files
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          rm -f .github/scripts/patch_compact_debug.py
+          rm -f .github/workflows/patch-compact-debug.yml
+          rm -f .github/scripts/inspect_debug_noise.py
+          rm -f .github/workflows/inspect-debug-noise.yml
+          git add -A
+          git commit -m "Make tracker console debug concise by default"
+          git push origin HEAD:revert_1
