@@ -1,0 +1,18 @@
+name: Inspect debug noise
+on:
+  push:
+    branches: [revert_1]
+    paths:
+      - '.github/scripts/inspect_debug_noise.py'
+      - '.github/workflows/inspect-debug-noise.yml'
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: revert_1
+      - name: Inspect noisy debug prints
+        run: python .github/scripts/inspect_debug_noise.py
