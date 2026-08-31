@@ -9,12 +9,25 @@ on:
       - '.github/workflows/inspect-serve-launch-tracking.yml'
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   inspect:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Print relevant source context
+        with:
+          ref: revert_1
+      - name: Capture relevant source context
         run: python .github/scripts/inspect_serve_launch_tracking.py
+      - name: Commit captured context if present
+        run: |
+          if [ -f .github/scripts/serve_launch_context.txt ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add .github/scripts/serve_launch_context.txt
+            if ! git diff --cached --quiet; then
+              git commit -m "Capture serve launch source context"
+              git push origin HEAD:revert_1
+            fi
+          fi
