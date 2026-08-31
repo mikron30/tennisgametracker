@@ -1,0 +1,242 @@
+  1222:     def _try_local_ai_trajectory_rescue(
+  1223:             self, frame, previous_position, tracked_position, previous_stuck,
+  1224:             pre_track_snapshot, reason):
+  1225:         """Rescue a held player-occlusion track using physics plus Local AI.
+  1226: 
+  1227:         This is deliberately general: no frame numbers or court coordinates are
+  1228:         encoded here.  It only activates when the normal tracker is effectively
+  1229:         held at the previous point inside a player-region recovery, then asks AI
+  1230:         to rank candidates in a small ROI around the constant-velocity prediction.
+  1231:         A lower-AI candidate can beat a player fragment only when trajectory,
+  1232:         direction, motion, and size all independently support it.
+  1233:         """
+  1234:         recovery = getattr(self, "local_ai_recovery", None)
+  1235:         ranker = getattr(recovery, "rank_local_roi_candidates", None)
+  1236:         if (
+  1237:                 recovery is None or not callable(ranker) or frame is None or
+  1238:                 previous_position is None or
+  1239:                 not str(reason or "").startswith("player-region:")
+  1240:         ):
+  1241:             return None
+  1242: 
+  1243:         snapshot = pre_track_snapshot or {}
+  1244:         last_motion = snapshot.get("last_motion") or {}
+  1245:         last_nonzero = snapshot.get("last_nonzero_motion") or {}
+  1246:         prior_distance = float(last_motion.get("distance", 0.0) or 0.0)
+  1247:         prior = last_motion if prior_distance >= 5.0 else (last_nonzero or last_motion)
+  1248:         prior_dx = float(prior.get("dx", 0.0) or 0.0)
+  1249:         prior_dy = float(prior.get("dy", 0.0) or 0.0)
+  1250:         prior_speed = math.hypot(prior_dx, prior_dy)
+  1251:         if prior_speed < 6.0:
+  1252:             return None
+  1253: 
+  1254:         if tracked_position is None:
+  1255:             held_distance = 0.0
+  1256:         else:
+  1257:             held_distance = math.hypot(
+  1258:                 float(tracked_position[0]) - float(previous_position[0]),
+  1259:                 float(tracked_position[1]) - float(previous_position[1]),
+  1260:             )
+  1261:         held_limit = max(3.0, min(10.0, prior_speed * 0.25))
+  1262:         if held_distance > held_limit and int(previous_stuck or 0) <= 0:
+  1263:             return None
+  1264: 
+  1265:         predicted = (
+  1266:             int(round(float(previous_position[0]) + prior_dx)),
+  1267:             int(round(float(previous_position[1]) + prior_dy)),
+  1268:         )
+  1269:         roi_radius = max(18.0, min(42.0, prior_speed * 0.80 + 7.0))
+  1270:         try:
+  1271:             ranked = ranker(
+  1272:                 int(self.frame_count),
+  1273:                 frame,
+  1274:                 anchor=predicted,
+  1275:                 radius=roi_radius,
+  1276:                 maximum_candidates=10,
+  1277:             )
+  1278:         except Exception as exc:
+  1279:             print(
+  1280:                 f"[LOCAL_AI_TRAJECTORY] f{self.frame_count}: scorer failed "
+  1281:                 f"({type(exc).__name__}: {exc})"
+  1282:             )
+  1283:             return None
+  1284: 
+  1285:         current_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+  1286:         previous_gray = snapshot.get("_prev_frame_gray")
+  1287:         previous_size = float(snapshot.get("ball_size", 0.0) or 0.0)
+  1288:         prediction_cap = max(9.0, min(22.0, prior_speed * 0.65))
+  1289:         min_step = max(4.0, prior_speed * 0.35)
+  1290:         max_step = max(28.0, prior_speed * 1.80 + 8.0)
+  1291:         diagnostics = []
+  1292:         valid = []
+  1293: 
+  1294:         for candidate in ranked[:10]:
+  1295:             point = (int(candidate["x"]), int(candidate["y"]))
+  1296:             ai_score = float(candidate.get("ai_score", 0.0) or 0.0)
+  1297:             area = float(candidate.get("area", 0.0) or 0.0)
+  1298:             zone = self._player_point_zone(point)
+  1299:             prediction_error = math.hypot(
+  1300:                 float(point[0]) - float(predicted[0]),
+  1301:                 float(point[1]) - float(predicted[1]),
+  1302:             )
+  1303:             step_dx = float(point[0]) - float(previous_position[0])
+  1304:             step_dy = float(point[1]) - float(previous_position[1])
+  1305:             step = math.hypot(step_dx, step_dy)
+  1306:             direction_cos = (
+  1307:                 (step_dx * prior_dx + step_dy * prior_dy) / (step * prior_speed)
+  1308:                 if step > 1e-6 and prior_speed > 1e-6 else -1.0
+  1309:             )
+  1310:             motion = self._candidate_motion_metrics(
+  1311:                 current_gray,
+  1312:                 point[0],
+  1313:                 point[1],
+  1314:                 radius=7,
+  1315:                 previous_gray=previous_gray,
+  1316:             ) or {}
+  1317:             motion_mean = float(motion.get("mean", 0.0) or 0.0)
+  1318:             motion_max = float(motion.get("max", 0.0) or 0.0)
+  1319:             area_ratio = area / previous_size if previous_size > 0.0 else 1.0
+  1320: 
+  1321:             checks = {
+  1322:                 "prediction": prediction_error <= prediction_cap,
+  1323:                 "direction": direction_cos >= 0.45,
+  1324:                 "step": min_step <= step <= max_step,
+  1325:                 "motion": motion_mean >= 4.0 or motion_max >= 25.0,
+  1326:                 "area": previous_size <= 0.0 or 0.12 <= area_ratio <= 5.0,
+  1327:                 "ai": ai_score >= (0.30 if zone is not None else 0.25),
+  1328:             }
+  1329:             reject_reason = next((name for name, ok in checks.items() if not ok), None)
+  1330:             source_penalty = 0.0 if candidate.get("mode") == "regular_court" else 0.75
+  1331:             zone_penalty = 0.75 if zone is not None else 0.0
+  1332:             trajectory_cost = (
+  1333:                 prediction_error +
+  1334:                 max(0.0, 1.0 - direction_cos) * 10.0 +
+  1335:                 max(0.0, 1.0 - ai_score) * 8.0 +
+  1336:                 source_penalty + zone_penalty
+  1337:             )
+  1338:             row = {
+  1339:                 "rank": int(candidate.get("roi_rank", len(diagnostics) + 1)),
+  1340:                 "position": point,
+  1341:                 "ai_score": ai_score,
+  1342:                 "mode": candidate.get("mode"),
+  1343:                 "zone": zone,
+  1344:                 "area": area,
+  1345:                 "area_ratio": area_ratio,
+  1346:                 "prediction_error": prediction_error,
+  1347:                 "direction_cos": direction_cos,
+  1348:                 "step": step,
+  1349:                 "motion_mean": motion_mean,
+  1350:                 "motion_max": motion_max,
+  1351:                 "trajectory_cost": trajectory_cost,
+  1352:                 "valid": reject_reason is None,
+  1353:                 "reject_reason": reject_reason,
+  1354:             }
+  1355:             diagnostics.append(row)
+  1356:             if reject_reason is None:
+  1357:                 valid.append((trajectory_cost, prediction_error, -ai_score, candidate, row))
+  1358: 
+  1359:         for row in diagnostics[:5]:
+  1360:             verdict = "OK" if row["valid"] else f"reject:{row['reject_reason']}"
+  1361:             print(
+  1362:                 f"[LOCAL_AI_TRAJECTORY_CAND] f{self.frame_count} "
+  1363:                 f"#{row['rank']} pos={row['position']} ai={row['ai_score']:.6f} "
+  1364:                 f"mode={row['mode'] or 'unknown'} "
+  1365:                 f"err={row['prediction_error']:.1f}/{prediction_cap:.1f}px "
+  1366:                 f"cos={row['direction_cos']:.2f} step={row['step']:.1f}px "
+  1367:                 f"motion={row['motion_mean']:.1f}/{row['motion_max']:.1f} "
+  1368:                 f"area_ratio={row['area_ratio']:.2f} zone={row['zone'] or 'clear'} "
+  1369:                 f"cost={row['trajectory_cost']:.2f} {verdict}"
+  1370:             )
+  1371: 
+  1372:         selected = min(valid, key=lambda item: (item[0], item[1], item[2])) if valid else None
+  1373:         selected_candidate = dict(selected[3]) if selected is not None else None
+  1374:         selected_row = selected[4] if selected is not None else None
+  1375: 
+  1376:         payload = {
+  1377:             "frame": int(self.frame_count),
+  1378:             "stage": "trajectory-rescue",
+  1379:             "reason": str(reason),
+  1380:             "previous_position": tuple(previous_position),
+  1381:             "normal_position": tuple(tracked_position) if tracked_position is not None else None,
+  1382:             "previous_stuck": int(previous_stuck or 0),
+  1383:             "prior_motion": {"dx": prior_dx, "dy": prior_dy, "speed": prior_speed},
+  1384:             "predicted_position": predicted,
+  1385:             "roi_radius": roi_radius,
+  1386:             "prediction_cap": prediction_cap,
+  1387:             "candidates": diagnostics,
+  1388:             "accepted": selected_candidate is not None,
+  1389:             "selected": selected_row,
+  1390:         }
+  1391:         writer = getattr(recovery, "_write_event", None)
+  1392:         if callable(writer):
+  1393:             try:
+  1394:                 writer(payload)
+  1395:             except Exception as exc:
+  1396:                 print(
+  1397:                     f"[LOCAL_AI_TRAJECTORY] f{self.frame_count}: "
+  1398:                     f"debug event write failed ({type(exc).__name__}: {exc})"
+  1399:                 )
+  1400: 
+  1401:         work_dir = getattr(recovery, "work_dir", None)
+  1402:         if work_dir is not None:
+  1403:             try:
+  1404:                 debug_dir = os.path.join(str(work_dir), "trajectory_frames")
+  1405:                 os.makedirs(debug_dir, exist_ok=True)
+  1406:                 debug_image = frame.copy()
+  1407:                 cv2.circle(debug_image, tuple(map(int, previous_position)), 13, (0, 255, 255), 2)
+  1408:                 cv2.circle(debug_image, predicted, int(round(roi_radius)), (255, 255, 0), 2)
+  1409:                 if tracked_position is not None:
+  1410:                     cv2.circle(debug_image, tuple(map(int, tracked_position)), 11, (0, 0, 255), 2)
+  1411:                 for row in diagnostics[:5]:
+  1412:                     point = tuple(map(int, row["position"]))
+  1413:                     cv2.circle(debug_image, point, 12, (255, 0, 255), 2)
+  1414:                     cv2.putText(
+  1415:                         debug_image,
+  1416:                         f"#{row['rank']} e{row['prediction_error']:.0f} a{row['ai_score']:.2f}",
+  1417:                         (point[0] + 7, point[1] - 7),
+  1418:                         cv2.FONT_HERSHEY_SIMPLEX,
+  1419:                         0.45,
+  1420:                         (255, 0, 255),
+  1421:                         1,
+  1422:                     )
+  1423:                 output_path = os.path.join(
+  1424:                     debug_dir, f"trajectory_f{int(self.frame_count):08d}.jpg"
+  1425:                 )
+  1426:                 cv2.imwrite(output_path, debug_image)
+  1427:                 print(f"[LOCAL_AI_TRAJECTORY_IMAGE] f{self.frame_count} saved={output_path}")
+  1428:             except Exception as exc:
+  1429:                 print(
+  1430:                     f"[LOCAL_AI_TRAJECTORY] f{self.frame_count}: "
+  1431:                     f"debug image failed ({type(exc).__name__}: {exc})"
+  1432:                 )
+  1433: 
+  1434:         if selected_candidate is None:
+  1435:             print(
+  1436:                 f"[LOCAL_AI_TRAJECTORY] f{self.frame_count}: no safe candidate "
+  1437:                 f"prev={previous_position} predicted={predicted} radius={roi_radius:.1f}px"
+  1438:             )
+  1439:             return None
+  1440: 
+  1441:         point = (int(selected_candidate["x"]), int(selected_candidate["y"]))
+  1442:         step_dx = float(point[0]) - float(previous_position[0])
+  1443:         step_dy = float(point[1]) - float(previous_position[1])
+  1444:         step = math.hypot(step_dx, step_dy)
+  1445:         selected_candidate["trajectory_rescue"] = True
+  1446:         selected_candidate["trajectory_prediction"] = predicted
+  1447:         selected_candidate["trajectory_prediction_error"] = float(selected_row["prediction_error"])
+  1448:         selected_candidate["trajectory_cost"] = float(selected_row["trajectory_cost"])
+  1449:         selected_candidate["trajectory_motion"] = {
+  1450:             "dx": step_dx,
+  1451:             "dy": step_dy,
+  1452:             "distance": step,
+  1453:             "direction_deg": math.degrees(math.atan2(step_dy, step_dx)) if step > 0.0 else None,
+  1454:         }
+  1455:         print(
+  1456:             f"[LOCAL_AI_TRAJECTORY_ACCEPT] f{self.frame_count}: "
+  1457:             f"{point} ai={float(selected_candidate.get('ai_score', 0.0)):.6f} "
+  1458:             f"pred={predicted} err={selected_row['prediction_error']:.1f}px "
+  1459:             f"motion={selected_row['motion_mean']:.1f}/{selected_row['motion_max']:.1f} "
+  1460:             f"zone={selected_row['zone'] or 'clear'} cost={selected_row['trajectory_cost']:.2f}"
+  1461:         )
+  1462:         return selected_candidate
+  1463: 
