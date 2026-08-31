@@ -25,8 +25,19 @@ jobs:
           from pathlib import Path
           p = Path('interactive_ball_analyzer.py')
           lines = p.read_text(encoding='utf-8').splitlines()
-          for start, end in [(730, 920), (1380, 1625), (5200, 5365)]:
-              print(f'\n===== lines {start}-{end} =====')
-              for n in range(start - 1, min(end, len(lines))):
-                  print(f'{n+1:05d}: {lines[n]}')
+          needles = [
+              '_post_serve_launch_lock_until_frame',
+              'POST_SERVE_LAUNCH_LOCK',
+              '_discard_provisional_serve_from_ai',
+              '_post_serve_launch_lock_last_reject_frame',
+          ]
+          for needle in needles:
+              hits = [i for i, line in enumerate(lines) if needle in line]
+              print(f'\n===== {needle}: {[i+1 for i in hits]} =====')
+              for i in hits:
+                  start = max(0, i - 16)
+                  end = min(len(lines), i + 28)
+                  for n in range(start, end):
+                      print(f'{n+1:05d}: {lines[n]}')
+                  print('---')
           PY
