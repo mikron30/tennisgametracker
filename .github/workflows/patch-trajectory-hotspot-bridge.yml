@@ -1,0 +1,51 @@
+name: Patch trajectory hotspot bridge
+
+on:
+  push:
+    branches:
+      - revert_1
+    paths:
+      - '.github/scripts/patch_trajectory_hotspot_bridge.py'
+      - '.github/workflows/patch-trajectory-hotspot-bridge.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: revert_1
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install test dependencies
+        run: python -m pip install --quiet numpy opencv-python-headless
+
+      - name: Apply general trajectory-hotspot arbitration patch
+        run: python .github/scripts/patch_trajectory_hotspot_bridge.py
+
+      - name: Validate syntax and whitespace
+        run: |
+          python -m py_compile interactive_ball_analyzer.py
+          git diff --check
+
+      - name: Run serve launch regression tests
+        run: python -m unittest discover -s tests -p 'test_serve_launch_handoff.py' -v
+
+      - name: Commit tested source and remove temporary inspection files
+        run: |
+          rm -f .github/scripts/inspect_fp_trajectory.py
+          rm -f .github/scripts/fp_trajectory_context.txt
+          rm -f .github/workflows/inspect-fp-trajectory.yml
+          rm -f .github/scripts/patch_trajectory_hotspot_bridge.py
+          rm -f .github/workflows/patch-trajectory-hotspot-bridge.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Let trajectory continuation beat static hotspots"
+          git push origin HEAD:revert_1
