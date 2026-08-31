@@ -26,7 +26,13 @@ jobs:
         run: python -m pip install --quiet numpy opencv-python-headless
 
       - name: Apply general post-serve trajectory corridor patch
-        run: python .github/scripts/patch_post_serve_trajectory_corridor.py
+        run: |
+          python .github/scripts/patch_post_serve_trajectory_corridor.py
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('tests/test_serve_launch_handoff.py')
+          path.write_text(path.read_text(encoding='utf-8').rstrip() + '\n', encoding='utf-8')
+          PY
 
       - name: Validate syntax and whitespace
         run: |
