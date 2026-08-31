@@ -782,7 +782,11 @@ class InteractiveBallAnalyzer:
                 except Exception:
                     _ps_recent_speed = 0.0
 
-            _ps_jump_floor = max(100.0, _ps_recent_speed * 1.55)
+            # POST_SERVE_LAUNCH_LOCK_THRESHOLD_V2
+            # Contact frames can contain 300-400 px spikes.  Never let those
+            # spikes raise the reversal threshold above a clearly impossible
+            # wrong-way post-serve jump.
+            _ps_jump_floor = max(100.0, min(220.0, _ps_recent_speed * 1.10))
             _ps_wrong_way = (
                 (_ps_expected_dy < 0 and _ps_dy >= 70.0) or
                 (_ps_expected_dy > 0 and _ps_dy <= -70.0)

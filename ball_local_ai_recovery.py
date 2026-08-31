@@ -20,7 +20,7 @@ from typing import Callable, Iterable, Optional
 import cv2
 import numpy as np
 
-from ball_ai_recovery_probe import collect_candidates
+from ball_ai_recovery_probe import DEFAULT_MODES, collect_candidates
 
 
 class LocalBallAIRecovery:
@@ -337,12 +337,19 @@ class LocalBallAIRecovery:
         player_zone: Callable[[tuple[int, int]], Optional[str]],
         *,
         max_anchor_distance: float = 900.0,
+        reject_player_zones: bool = False,
     ) -> Optional[dict]:
         ranked = sorted(scored, key=lambda item: float(item.get("ai_score", 0.0)), reverse=True)
         for candidate in ranked:
             score = float(candidate.get("ai_score", 0.0))
             point = (int(candidate["x"]), int(candidate["y"]))
             zone = player_zone(point)
+            # POST_SERVE_PLAYER_EXCLUSION_V2
+            # After a verified serve launch has already left the racket, a
+            # recovery caused by a strong wrong-way reversal may not terminate
+            # on torso/head/shoes/racket pixels, regardless of classifier score.
+            if reject_player_zones and zone is not None:
+                continue
             # A candidate inside a player silhouette needs almost conclusive
             # image evidence.  This is the crucial guard against replacing a
             # lost ball with torso/racket/shoe colour fragments.
@@ -382,6 +389,19 @@ class LocalBallAIRecovery:
         samples = list(buffered_frames)[-self.lookback_frames :]
         if len(samples) < 2:
             return None
+
+        # POST_SERVE_LOW_SAT_RECOVERY_V2
+        post_serve_emergency = str(reason or "").startswith("post-serve-launch-wrong-way")
+        candidate_config = self._config
+        recovery_modes = DEFAULT_MODES
+        if post_serve_emergency:
+            candidate_config = dict(self._config)
+            candidate_config["post_serve_low_sat"] = {
+                "h_min": 80, "h_max": 135,
+                "s_min": 10, "s_max": 50,
+                "v_min": 120, "v_max": 230,
+            }
+            recovery_modes = DEFAULT_MODES + ("post_serve_low_sat",)
 
         corridor_anchors, corridor_cap, corridor_info = self._build_recovery_corridor(samples)
         if corridor_info is not None:
@@ -424,7 +444,8 @@ class LocalBallAIRecovery:
 
             candidates = collect_candidates(
                 image,
-                self._config,
+                candidate_config,
+                modes=recovery_modes,
                 min_area=3.0,
                 max_area=2000.0,
                 around=search_anchor,
@@ -480,6 +501,7 @@ class LocalBallAIRecovery:
                 sample_anchor,
                 player_zone,
                 max_anchor_distance=max_anchor_distance,
+                reject_player_zones=post_serve_emergency,
             )
             diagnostics.append({
                 "frame": sample_frame,
@@ -571,7 +593,10 @@ class LocalBallAIRecovery:
         # do not extend it indefinitely.
         if final is not None:
             self._urgent_retry_until_frame = -1_000_000
-        elif str(reason).startswith("player-region:"):
+        elif (
+                str(reason).startswith("player-region:") or
+                str(reason).startswith("post-serve-launch-wrong-way")
+        ):
             current_deadline = int(getattr(self, "_urgent_retry_until_frame", -1_000_000))
             if current_deadline < int(frame_index):
                 self._urgent_retry_until_frame = int(frame_index) + 8
