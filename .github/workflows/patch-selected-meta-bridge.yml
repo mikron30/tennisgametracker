@@ -1,0 +1,65 @@
+name: Patch selected metadata bridge
+
+on:
+  push:
+    branches:
+      - revert_1
+    paths:
+      - '.github/scripts/patch_selected_meta_bridge.py'
+      - '.github/workflows/patch-selected-meta-bridge.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: revert_1
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install test dependencies
+        run: python -m pip install --quiet numpy opencv-python-headless
+
+      - name: Apply selected contour metadata bridge
+        run: python .github/scripts/patch_selected_meta_bridge.py
+
+      - name: Validate metadata bridge and source
+        run: |
+          python -m py_compile interactive_ball_analyzer.py
+          git diff --check
+          python - <<'PY'
+          from pathlib import Path
+          text = Path('interactive_ball_analyzer.py').read_text(encoding='utf-8')
+          assert "meta.get('contour') is best_contour" in text
+          assert "selected_meta_for_guard.get('trajectory_continuation_selected')" in text
+          print('metadata bridge and trajectory marker both present')
+          PY
+
+      - name: Run general serve and player-contact regressions
+        env:
+          PYTHONPATH: tests
+        run: |
+          python -m unittest -v \
+            test_serve_launch_handoff.ServeLaunchHandoffTests \
+            test_serve_launch_handoff.NightFarPlayerContactTests \
+            test_serve_launch_handoff.NightNearPlayerLaunchTests \
+            test_serve_launch_handoff.NightShallowServeBounceTests
+
+      - name: Commit tested source and clean temporary debug files
+        run: |
+          rm -f .github/scripts/patch_selected_meta_bridge.py
+          rm -f .github/workflows/patch-selected-meta-bridge.yml
+          rm -f .github/scripts/inspect_trajectory_metadata_flow.py
+          rm -f .github/scripts/trajectory_metadata_flow.txt
+          rm -f .github/workflows/inspect-trajectory-metadata-flow.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Preserve selected trajectory metadata through FP guard"
+          git push origin HEAD:revert_1
