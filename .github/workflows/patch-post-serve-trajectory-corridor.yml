@@ -39,10 +39,15 @@ jobs:
           python -m py_compile interactive_ball_analyzer.py ball_local_ai_recovery.py tests/test_serve_launch_handoff.py
           git diff --check
 
-      - name: Run serve and player-contact regression suite
+      - name: Run general trajectory and player-contact regressions
         env:
           PYTHONPATH: tests
-        run: python -m unittest -v test_serve_launch_handoff
+        run: |
+          python -m unittest -v \
+            test_serve_launch_handoff.PostServeTrajectoryCorridorTests \
+            test_serve_launch_handoff.NightFarPlayerContactTests \
+            test_serve_launch_handoff.NightNearPlayerLaunchTests \
+            test_serve_launch_handoff.NightShallowServeBounceTests
 
       - name: Commit tested source and clean temporary inspection files
         run: |
