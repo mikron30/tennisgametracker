@@ -1,0 +1,47 @@
+name: Inspect current trajectory hotspot bridge
+on:
+  push:
+    branches: [revert_1]
+    paths:
+      - '.github/workflows/inspect-current-hotspot-bridge.yml'
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: revert_1
+      - name: Print relevant source contexts
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p=Path('interactive_ball_analyzer.py')
+          lines=p.read_text(encoding='utf-8').splitlines()
+          needles=[
+            'def _prefer_predicted_continuation_candidate',
+            'Predicted continuation -> preferring',
+            'TRACKING_FP_LEARN',
+            'SELECTED CANDIDATE FALSE-POSITIVE GUARD',
+            'frame0 hotspot at',
+            '_predicted_path_hotspot_override',
+            'selected_predicted',
+          ]
+          spans=[]
+          for needle in needles:
+            for i,line in enumerate(lines):
+              if needle in line:
+                a=max(0,i-100); b=min(len(lines),i+180)
+                spans.append((a,b,needle,i+1))
+          merged=[]
+          for a,b,needle,ln in sorted(spans):
+            if merged and a <= merged[-1][1]:
+              merged[-1]=(merged[-1][0],max(merged[-1][1],b),merged[-1][2]+','+needle,merged[-1][3])
+            else:
+              merged.append((a,b,needle,ln))
+          for a,b,label,ln in merged:
+            print(f'\n===== {label} around {ln} / lines {a+1}-{b} =====')
+            for j in range(a,b):
+              print(f'{j+1:6d}: {lines[j]}')
+          PY
