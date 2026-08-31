@@ -18,42 +18,33 @@ jobs:
         with:
           ref: revert_1
           fetch-depth: 1
-      - name: Print recovery acceptance code
+      - name: Print net crossing and recovery commit
         shell: bash
         run: |
           python - <<'PY'
           from pathlib import Path
-          targets = {
-              'interactive_ball_analyzer.py': [
-                  'if recovered is None:',
-                  '[LOCAL_AI_RECOVERY]',
-                  '_post_serve_recovery_hold_until_frame',
-                  'def _player_point_zone',
-                  'def _try_local_ai_trajectory_rescue',
-                  'LOCAL_AI_POINT_END_HOLD',
-                  'PLAYER-REACQ MOTION CONFIRMED',
-              ],
-              'ball_local_ai_recovery.py': [
-                  'post_serve_emergency',
-                  'last_rejection',
-                  'return recovered',
-                  'return selected',
-                  'all-player-body-path',
-              ],
-          }
-          for filename, needles in targets.items():
-              lines = Path(filename).read_text(encoding='utf-8').splitlines()
-              print(f'\n######## {filename} ########')
-              printed = set()
-              for needle in needles:
-                  hits = [i for i, line in enumerate(lines) if needle in line]
-                  print(f'\n===== {needle}: {[i+1 for i in hits]} =====')
-                  for i in hits:
-                      start=max(0,i-24); end=min(len(lines),i+60)
-                      key=(start,end)
-                      if key in printed: continue
-                      printed.add(key)
-                      for n in range(start,end):
-                          print(f'{n+1:05d}: {lines[n]}')
-                      print('---')
+          lines = Path('interactive_ball_analyzer.py').read_text(encoding='utf-8').splitlines()
+          needles = [
+              'SERVE-BOUNCE-OUT SUPPRESSED',
+              'net_y',
+              'crossed_net',
+              'net_cross',
+              'repaired_position',
+              '_awaiting_serve_bounce',
+          ]
+          printed=set()
+          for needle in needles:
+              hits=[i for i,line in enumerate(lines) if needle in line]
+              print(f'\n===== {needle}: {[i+1 for i in hits]} =====')
+              for i in hits:
+                  start=max(0,i-28); end=min(len(lines),i+55)
+                  key=(start,end)
+                  if key in printed: continue
+                  printed.add(key)
+                  for n in range(start,end):
+                      print(f'{n+1:05d}: {lines[n]}')
+                  print('---')
+          print('\n===== direct recovery commit 1870-1930 =====')
+          for n in range(1869, min(1930,len(lines))):
+              print(f'{n+1:05d}: {lines[n]}')
           PY
