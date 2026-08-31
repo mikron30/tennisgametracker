@@ -7028,6 +7028,23 @@ class InteractiveBallAnalyzer:
                 self.ground_bounce_count > 0 or
                 ball_size >= 80.0 or
                 recent_vel >= 120.0):
+            # During the initial serve flight, the far-court/receiver band overlaps
+            # the broad "upper side" heuristic.  A single fast tracked step there is
+            # not proof that the ball has left the image.  Keep ordinary tracking for
+            # one more frame; if the ball is genuinely gone, the resulting miss/stuck
+            # evidence can arm the delayed top-return search on the next frame.  True
+            # literal top-edge exits (handled by the stricter branches above) remain
+            # immediate.
+            pre_bounce_serve_flight = (
+                getattr(self, '_serve_contact_grace_frames', 0) > 0 and
+                self.ground_bounce_count == 0
+            )
+            if pre_bounce_serve_flight and getattr(self, 'stuck_frame_count', 0) == 0:
+                _verbose_debug_print(
+                    f"  DEBUG: [TOP-RETURN DEFER] pre-bounce serve flight at "
+                    f"{self.ball_center}; waiting for miss evidence"
+                )
+                return None
             return "upper_side"
         return None
 
@@ -17467,9 +17484,25 @@ class InteractiveBallAnalyzer:
                 serve_launch_meta = self._prefer_night_contact_near_continuation_candidate(
                     candidate_meta, best_contour, frame.shape
                 )
-                if serve_launch_meta is None:
+                # Once a serve launch has already produced a verified forward/upward
+                # motion, hand control back to ordinary trajectory continuation.  Keeping
+                # the broad contact-launch selector active for every grace frame lets a
+                # distant moving player/background blob repeatedly replace an established
+                # airborne path.  The broad selector remains available when the launch has
+                # not been established yet, or when the last motion no longer proves the
+                # forward/upward flight.
+                launch_already_airborne = (
+                    int(getattr(self, '_serve_launch_direction_x', 0) or 0) != 0 and
+                    self._is_forward_serve_launch_motion(self.last_motion)
+                )
+                if serve_launch_meta is None and not launch_already_airborne:
                     serve_launch_meta = self._prefer_serve_contact_launch_candidate(
                         candidate_meta, frame.shape
+                    )
+                elif serve_launch_meta is None and launch_already_airborne:
+                    _verbose_debug_print(
+                        f"  DEBUG: [SERVE-LAUNCH HANDOFF] established flight; "
+                        f"using predicted continuation from {self.ball_center}"
                     )
             if serve_launch_meta is not None:
                 best_contour = serve_launch_meta['contour']
