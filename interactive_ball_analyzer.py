@@ -5652,13 +5652,19 @@ class InteractiveBallAnalyzer:
                 # line can be closer than the real ball.  Keep candidates with
                 # clear local frame-to-frame change; the ball remains moving
                 # even when its HSV area is only a few pixels.
-                if (
-                        motion is not None and motion_mean < 5.0 and motion_max < 25.0 and
-                        # A genuine ball may have weak frame-difference energy
-                        # when it is only a few pixels wide, but it should
-                        # still be a short step from the last ball position.
-                        # Do not admit a distant static court highlight.
-                        (source != 'regular' or distance > 65.0)
+                weak_static_motion = (
+                    motion is not None and motion_mean < 5.0 and motion_max < 25.0
+                )
+                if weak_static_motion and (
+                        # During an established serve flight a real ball must
+                        # produce local frame-to-frame change.  Previously a
+                        # nearby regular-mask court highlight was allowed to
+                        # survive solely because it was within 65 px, which
+                        # could hand the post-contact flight to a static blob.
+                        upward_flight_continuation or
+                        lower_contact_flight or
+                        source != 'regular' or
+                        distance > 65.0
                 ):
                     continue
                 size_ratio = abs(area - previous_size) / max(previous_size, 1.0)
@@ -24618,11 +24624,16 @@ class InteractiveBallAnalyzer:
                             f"Frame {self.frame_count}: [PLAYER-REACQ TIMEOUT SUPPRESSED] "
                             f"holding stale marker {tracked_position}"
                         )
-                    elif reference_target_hold:
-                        self.stuck_frame_count = 14
+                    elif reference_target_hold and self.stuck_frame_count >= 15:
+                        # A reviewed/reference endpoint may keep the point alive,
+                        # but it must not erase evidence that tracking is stuck.
+                        # Preserve the stuck count so the next frame can invoke
+                        # held-position Local AI / reacquisition instead of
+                        # repeatedly pinning a stale marker at count 14.
                         print(
                             f"Frame {self.frame_count}: [REFERENCE_POINT_HOLD] "
-                            f"suppressing stuck timeout until f{reference_target_frame}"
+                            f"suppressing point-end timeout until f{reference_target_frame}; "
+                            f"preserving stuck={self.stuck_frame_count} for recovery"
                         )
                     # Stuck-ball timeout: if ball hasn't moved for 15+ frames, end point
                     elif self.stuck_frame_count >= 15 and not self._top_return_wait_active():
