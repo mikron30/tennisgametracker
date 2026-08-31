@@ -17935,7 +17935,14 @@ class InteractiveBallAnalyzer:
             # Check if this is likely a false positive jump
             # If ball was at edge and closest match is far away, ball likely went off-screen
             # Skip this check during full-frame scan (re-acquisition after occlusion)
-            selected_meta_for_guard = None
+            # Preserve the metadata of the contour that actually won all candidate
+            # arbitration stages.  Several trajectory selectors attach evidence to the
+            # candidate metadata; the false-positive guard must inspect that same entry
+            # instead of starting from None and losing the selection evidence.
+            selected_meta_for_guard = next(
+                (meta for meta in candidate_meta if meta.get('contour') is best_contour),
+                None,
+            )
             should_guard_selected = self.ball_center and not allow_inactive and (
                 int(getattr(self, '_player_reacq_protect_until_frame', -1)) >= self.frame_count or
                 self.stuck_frame_count < 5 or
