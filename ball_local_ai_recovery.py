@@ -391,7 +391,7 @@ class LocalBallAIRecovery:
             return None
 
         # POST_SERVE_LOW_SAT_RECOVERY_V2
-        post_serve_emergency = str(reason or "").startswith("post-serve-launch-wrong-way")
+        post_serve_emergency = str(reason or "").startswith("post-serve-launch-")
         candidate_config = self._config
         recovery_modes = DEFAULT_MODES
         if post_serve_emergency:
@@ -595,7 +595,7 @@ class LocalBallAIRecovery:
             self._urgent_retry_until_frame = -1_000_000
         elif (
                 str(reason).startswith("player-region:") or
-                str(reason).startswith("post-serve-launch-wrong-way")
+                str(reason).startswith("post-serve-launch-")
         ):
             current_deadline = int(getattr(self, "_urgent_retry_until_frame", -1_000_000))
             if current_deadline < int(frame_index):

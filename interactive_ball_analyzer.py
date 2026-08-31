@@ -794,6 +794,16 @@ class InteractiveBallAnalyzer:
 
             if _ps_wrong_way and _ps_distance >= _ps_jump_floor:
                 self._post_serve_launch_lock_last_reject_frame = int(self.frame_count)
+                # POST_SERVE_RECOVERY_HOLD_V3
+                # A rejected player-body reversal must not become the anchor on
+                # the next frame.  Give the emergency recovery a short bounded
+                # window to find the outgoing ball while holding the last sane
+                # state.  This starts only after an actual rejection, so normal
+                # receiver returns later in the rally are unaffected.
+                self._post_serve_recovery_hold_until_frame = max(
+                    int(getattr(self, "_post_serve_recovery_hold_until_frame", -1000000)),
+                    int(self.frame_count) + 10,
+                )
                 print(
                     f"[POST_SERVE_LAUNCH_REJECT] f{self.frame_count}: "
                     f"tracked={tracked_position} previous={previous_position} "
@@ -1547,6 +1557,12 @@ class InteractiveBallAnalyzer:
         )
         if reason is None:
             return tracked_position
+        post_serve_recovery_active = (
+            int(self.frame_count) <= max(
+                int(getattr(self, "_post_serve_launch_lock_until_frame", -1)),
+                int(getattr(self, "_post_serve_recovery_hold_until_frame", -1000000)),
+            )
+        )
         trajectory_recovered = self._try_local_ai_trajectory_rescue(
             frame,
             previous_position,
@@ -1559,12 +1575,22 @@ class InteractiveBallAnalyzer:
             recovered = trajectory_recovered
             reason = f"{reason}+trajectory"
         else:
+            recovery_reason = reason
+            if post_serve_recovery_active and reason.startswith("player-region:"):
+                # Keep using the post-serve low-saturation candidate pool on
+                # the frames after the first rejected jump.  The normal tracker
+                # may keep proposing a player contour until the ball emerges.
+                recovery_reason = f"post-serve-launch-occlusion:{reason}"
+                print(
+                    f"[POST_SERVE_RECOVERY_RETRY] f{self.frame_count}: "
+                    f"{reason} -> {recovery_reason}"
+                )
             recovered = self.local_ai_recovery.recover(
                 self.frame_count,
                 self._local_ai_frame_buffer,
                 predicted_position=previous_position,
                 player_zone=self._player_point_zone,
-                reason=reason,
+                reason=recovery_reason,
                 force=False,
             )
         if recovered is None:
@@ -1577,6 +1603,7 @@ class InteractiveBallAnalyzer:
                 )
                 if (
                         self._local_ai_all_body_rejections >= 1 and
+                        not post_serve_recovery_active and
                         # A previously accepted non-body recovery is positive
                         # evidence that this is a real serve/rally.  A later
                         # player-body-only attempt can happen at contact or
@@ -1588,6 +1615,39 @@ class InteractiveBallAnalyzer:
             else:
                 self._local_ai_all_body_rejections = 0
             print(f"[LOCAL_AI_RECOVERY] f{self.frame_count}: no safe path ({reason})")
+            # POST_SERVE_STATE_ROLLBACK_V3
+            # The reason detector runs after normal HSV tracking has already
+            # mutated ball_center/motion/history.  If the post-serve guard says
+            # that mutation is unsafe and AI cannot replace it, restore the
+            # complete pre-track snapshot immediately.  Returning the previous
+            # position makes the main loop log/record the held sane point rather
+            # than the rejected player pixel.
+            if (
+                    post_serve_recovery_active and
+                    pre_track_snapshot is not None and
+                    previous_position is not None and
+                    (
+                        reason.startswith("post-serve-launch-") or
+                        reason.startswith("player-region:")
+                    )):
+                rejected_position = (
+                    tuple(tracked_position) if tracked_position is not None else None
+                )
+                self._restore_tracking_state_for_provisional_guard(pre_track_snapshot)
+                self.stuck_frame_count = max(
+                    int(previous_stuck or 0) + 1,
+                    int(getattr(self, "stuck_frame_count", 0) or 0),
+                )
+                if getattr(self, "_last_motion_reacq_frame", -1000000) == self.frame_count:
+                    self._last_motion_reacq_frame = -1000000
+                    self._last_motion_reacq_pos = None
+                print(
+                    f"[POST_SERVE_LAUNCH_ROLLBACK] f{self.frame_count}: "
+                    f"rejected={rejected_position} reason={reason}; "
+                    f"restored={previous_position} stuck={self.stuck_frame_count} "
+                    f"retry_through=f{int(getattr(self, '_post_serve_recovery_hold_until_frame', -1))}"
+                )
+                return tuple(previous_position)
             # If HSV just teleported from a physically coherent ball path into a
             # player region and local AI could not verify a replacement, never let
             # that player pixel become the next-frame anchor. Restore the complete
@@ -7841,6 +7901,7 @@ class InteractiveBallAnalyzer:
         self._local_ai_tight_roi_attempt_frame = -1000000
         self._local_ai_tight_roi_previous_gray = None
         self._discard_provisional_serve_from_ai = False
+        self._post_serve_recovery_hold_until_frame = -1000000
         self._local_ai_follow_until_frame = -1
         self._local_ai_handoff_deadline_frame = -1
         self._reset_point_score_context()
