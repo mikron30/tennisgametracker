@@ -47,4 +47,12 @@ for n, line in enumerate(tests, 1):
             out.append(f'{j:6d}: {tests[j-1]}')
 
 Path('.github/scripts/post_serve_corridor_context.txt').write_text('\n'.join(out) + '\n', encoding='utf-8')
-print(f'wrote {len(windows)} source windows, {len(hits)} hits')
+
+start = next(i for i, line in enumerate(src) if line.startswith('    def _try_local_ai_trajectory_rescue('))
+end = next(i for i in range(start + 1, len(src)) if src[i].startswith('    def ') or src[i].startswith('    @'))
+exact = []
+for i in range(start, end):
+    exact.append(f'{i+1:6d}: {src[i]}')
+Path('.github/scripts/post_serve_trajectory_function.txt').write_text('\n'.join(exact) + '\n', encoding='utf-8')
+
+print(f'wrote {len(windows)} source windows, {len(hits)} hits, exact function {start+1}:{end}')
