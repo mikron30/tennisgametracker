@@ -570,3 +570,115 @@ class NightFarPlayerContactTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class PostServeTrajectoryCorridorTests(unittest.TestCase):
+    class FakeRecovery:
+        def __init__(self, *, corridor_candidates=None, roi_candidates=None):
+            self.corridor_candidates = list(corridor_candidates or [])
+            self.roi_candidates = list(roi_candidates or [])
+            self.work_dir = None
+            self.events = []
+            self.corridor_calls = []
+            self.roi_calls = []
+
+        def rank_local_corridor_candidates(self, frame_index, image, *, anchors, radius, maximum_candidates):
+            self.corridor_calls.append((list(anchors), float(radius), int(maximum_candidates)))
+            return list(self.corridor_candidates)
+
+        def rank_local_roi_candidates(self, frame_index, image, *, anchor, radius, maximum_candidates):
+            self.roi_calls.append((tuple(anchor), float(radius), int(maximum_candidates)))
+            return list(self.roi_candidates)
+
+        def _write_event(self, payload):
+            self.events.append(payload)
+
+    @staticmethod
+    def _candidate(x, y, *, score=0.55, area=90.0):
+        return {
+            "x": int(x),
+            "y": int(y),
+            "ai_score": float(score),
+            "area": float(area),
+            "mode": "regular_court",
+            "roi_rank": 1,
+        }
+
+    def _analyzer(self, recovery, *, corridor_active=True):
+        analyzer = InteractiveBallAnalyzer.__new__(InteractiveBallAnalyzer)
+        analyzer.local_ai_recovery = recovery
+        analyzer.frame_count = 20
+        analyzer._post_serve_recovery_hold_until_frame = 24 if corridor_active else -1000000
+        analyzer._post_serve_launch_lock_until_frame = 22 if corridor_active else -1
+        analyzer._serve_launch_direction_x = -1
+        analyzer._player_point_zone = lambda point: None
+        analyzer._candidate_motion_metrics = lambda *args, **kwargs: {"mean": 14.0, "max": 80.0}
+        return analyzer
+
+    @staticmethod
+    def _snapshot(frame_shape):
+        return {
+            "last_motion": {"dx": -80.0, "dy": -160.0, "distance": 178.9},
+            "last_nonzero_motion": {"dx": -80.0, "dy": -160.0, "distance": 178.9},
+            "ball_size": 100.0,
+            "_prev_frame_gray": np.zeros(frame_shape[:2], dtype=np.uint8),
+        }
+
+    def test_post_serve_recovery_accepts_on_direction_candidate_before_full_velocity_prediction(self):
+        candidate = self._candidate(755, 610)
+        recovery = self.FakeRecovery(corridor_candidates=[candidate])
+        analyzer = self._analyzer(recovery, corridor_active=True)
+        frame = np.zeros((1000, 1200, 3), dtype=np.uint8)
+
+        selected = analyzer._try_local_ai_trajectory_rescue(
+            frame,
+            previous_position=(800, 700),
+            tracked_position=(800, 700),
+            previous_stuck=1,
+            pre_track_snapshot=self._snapshot(frame.shape),
+            reason="player-region:racket_fragment",
+        )
+
+        self.assertIsNotNone(selected)
+        self.assertEqual((selected["x"], selected["y"]), (755, 610))
+        self.assertTrue(selected.get("trajectory_post_serve_corridor"))
+        self.assertEqual(len(recovery.corridor_calls), 1)
+        self.assertEqual(len(recovery.roi_calls), 0)
+
+    def test_post_serve_corridor_rejects_candidate_against_outgoing_direction(self):
+        candidate = self._candidate(855, 790, score=0.90)
+        recovery = self.FakeRecovery(corridor_candidates=[candidate])
+        analyzer = self._analyzer(recovery, corridor_active=True)
+        frame = np.zeros((1000, 1200, 3), dtype=np.uint8)
+
+        selected = analyzer._try_local_ai_trajectory_rescue(
+            frame,
+            previous_position=(800, 700),
+            tracked_position=(800, 700),
+            previous_stuck=1,
+            pre_track_snapshot=self._snapshot(frame.shape),
+            reason="player-region:racket_fragment",
+        )
+
+        self.assertIsNone(selected)
+        self.assertEqual(len(recovery.corridor_calls), 1)
+
+    def test_normal_trajectory_rescue_keeps_single_constant_velocity_roi(self):
+        candidate = self._candidate(720, 540)
+        recovery = self.FakeRecovery(roi_candidates=[candidate])
+        analyzer = self._analyzer(recovery, corridor_active=False)
+        frame = np.zeros((1000, 1200, 3), dtype=np.uint8)
+
+        selected = analyzer._try_local_ai_trajectory_rescue(
+            frame,
+            previous_position=(800, 700),
+            tracked_position=(800, 700),
+            previous_stuck=1,
+            pre_track_snapshot=self._snapshot(frame.shape),
+            reason="player-region:racket_fragment",
+        )
+
+        self.assertIsNotNone(selected)
+        self.assertEqual((selected["x"], selected["y"]), (720, 540))
+        self.assertFalse(selected.get("trajectory_post_serve_corridor", False))
+        self.assertEqual(len(recovery.roi_calls), 1)
+        self.assertEqual(len(recovery.corridor_calls), 0)

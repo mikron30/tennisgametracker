@@ -303,6 +303,89 @@ class LocalBallAIRecovery:
             result.append(item)
         return result
 
+    def rank_local_corridor_candidates(
+        self,
+        frame_index: int,
+        image: np.ndarray,
+        *,
+        anchors: Iterable[tuple[int, int]],
+        radius: float = 48.0,
+        maximum_candidates: int = 48,
+    ) -> list[dict]:
+        """Score HSV candidates from a bounded directional corridor in one AI call.
+
+        ``anchors`` describe uncertainty along a motion direction.  Candidate
+        generation is local around each anchor, then de-duplicated and scored as
+        one batch so widening a short recovery corridor does not multiply model
+        process startup cost.
+        """
+        if image is None:
+            return []
+        normalized_anchors = [
+            (int(anchor[0]), int(anchor[1]))
+            for anchor in anchors
+            if isinstance(anchor, (tuple, list)) and len(anchor) >= 2
+        ]
+        if not normalized_anchors:
+            return []
+
+        corridor_radius = max(8.0, float(radius))
+        unique: dict[tuple[int, int, str], dict] = {}
+        for anchor in normalized_anchors:
+            candidates = collect_candidates(
+                image,
+                self._config,
+                min_area=3.0,
+                max_area=2000.0,
+                around=anchor,
+                radius=corridor_radius,
+                dedup_distance=4.0,
+            )
+            for candidate in candidates:
+                item = dict(candidate)
+                point = (int(item["x"]), int(item["y"]))
+                closest_anchor = min(
+                    normalized_anchors,
+                    key=lambda value: self._distance(point, value),
+                )
+                anchor_distance = self._distance(point, closest_anchor)
+                item["corridor_anchor"] = closest_anchor
+                item["corridor_anchor_distance"] = float(anchor_distance)
+                key = (point[0], point[1], str(item.get("mode") or ""))
+                previous = unique.get(key)
+                if (
+                        previous is None or
+                        anchor_distance < float(previous.get("corridor_anchor_distance", float("inf")))
+                ):
+                    unique[key] = item
+
+        if not unique:
+            return []
+        candidates = sorted(
+            unique.values(),
+            key=lambda item: (
+                float(item.get("corridor_anchor_distance", float("inf"))),
+                -float(item.get("area", 0.0) or 0.0),
+            ),
+        )[: max(1, int(maximum_candidates))]
+
+        scored = self._score(image, int(frame_index), candidates)
+        ranked = sorted(
+            scored,
+            key=lambda item: float(item.get("ai_score", 0.0)),
+            reverse=True,
+        )
+        result: list[dict] = []
+        for index, candidate in enumerate(ranked):
+            item = dict(candidate)
+            item["roi_anchor"] = None
+            item["roi_radius"] = corridor_radius
+            item["roi_candidates"] = len(ranked)
+            item["roi_rank"] = index + 1
+            item["corridor_anchor_count"] = len(normalized_anchors)
+            result.append(item)
+        return result
+
     def rank_local_roi_candidate(
         self,
         frame_index: int,
