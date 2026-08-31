@@ -1,0 +1,32 @@
+name: Inspect post-serve handoff
+
+on:
+  push:
+    branches:
+      - revert_1
+    paths:
+      - .github/workflows/inspect-post-serve-handoff.yml
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: revert_1
+          fetch-depth: 1
+      - name: Print handoff code
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('interactive_ball_analyzer.py')
+          lines = p.read_text(encoding='utf-8').splitlines()
+          for start, end in [(730, 920), (1380, 1625), (5200, 5365)]:
+              print(f'\n===== lines {start}-{end} =====')
+              for n in range(start - 1, min(end, len(lines))):
+                  print(f'{n+1:05d}: {lines[n]}')
+          PY
