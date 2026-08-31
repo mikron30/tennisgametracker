@@ -2555,6 +2555,12 @@ class InteractiveBallAnalyzer:
             f"score={chosen['score']:.1f} pred_dist={chosen.get('predicted_distance', float('nan')):.1f} "
             f"over {best_label} {best_entry['pos']} score={best_entry['score']:.1f}"
         )
+        # The normal hotspot-path override is intentionally capped at lower speeds.
+        # A high-speed candidate reaching this point has already passed the stricter
+        # trajectory/direction/motion gates above, so preserve that evidence for the
+        # later false-positive guard instead of globally weakening hotspot protection.
+        if lm_dist > 120.0:
+            chosen['trajectory_continuation_selected'] = True
         return chosen
 
     def _prefer_recent_return_dynamic_candidate(self, candidate_meta, selected_contour, frame_shape):
@@ -18302,9 +18308,16 @@ class InteractiveBallAnalyzer:
                     float(self.last_motion.get('distance', 0.0) or 0.0)
                     if self.last_motion is not None else 0.0
                 )
+                selected_trajectory_continuation = (
+                    selected_meta_for_guard is not None and
+                    bool(selected_meta_for_guard.get('trajectory_continuation_selected'))
+                )
                 selected_predicted_path_override = (
                     selected_meta_for_guard is not None and
-                    bool(selected_meta_for_guard.get('predicted_path_hotspot_override'))
+                    bool(
+                        selected_meta_for_guard.get('predicted_path_hotspot_override') or
+                        selected_trajectory_continuation
+                    )
                 )
                 recent_return_static_hold = (
                     self._recent_offscreen_return_hold_active(window_frames=8) and
