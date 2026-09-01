@@ -1,0 +1,351 @@
+
+## _serve_history_reconciliation
+000327:         # HSV tracker is still in flight was shown to alter later candidate
+000328:         # selection.  This record lets the CSV reflect the verified sequence
+000329:         # after the normal tracker has completed each physical flight.
+000330:         self._serve_history_reconciliation = None
+000331:         self._local_ai_follow_until_frame = -1
+000332:         # A recovery usually happens at a player/racket occlusion.  The ball
+000333:         # needs more than a single four-frame sample to leave that region, but
+008751:         """
+008752:         if self.disable_specific_frame_logic:
+008753:             return row
+008754:         state = getattr(self, '_serve_history_reconciliation', None)
+008755:         if not isinstance(state, dict):
+008756:             return row
+008757:         try:
+024257:             launch_pos = (int(recovered['x']), int(recovered['y']))
+024258:             self._verified_serve_launch_frame = launch_frame
+024259:             self._verified_serve_launch_position = launch_pos
+024260:             self._serve_history_reconciliation = {
+024261:                 'phase': 'await_verified_first_fault',
+024262:                 'verified_start_frame': launch_frame,
+024263:                 'verified_start_position': launch_pos,
+
+## _start_frame_match_seed_applied
+000466:         self._base_serve_ball_size_max = 80
+000467:         self.far_serve_ball_size_min = 1
+000468:         self.far_serve_ball_size_max = 120
+000469:         self._start_frame_match_seed_applied = False
+000470:         self._court2_video_phase_seed_applied = False
+000471:         self._serve_scan_block_until_frame = -1
+000472:         self.point_start_frame_internal = None
+009934:     def _seed_match_state_from_start_frame(self):
+009935:         if self.disable_specific_frame_logic:
+009936:             return
+009937:         if getattr(self, '_start_frame_match_seed_applied', False):
+009938:             return
+009939:         self._start_frame_match_seed_applied = True
+009940:         if getattr(self, '_explicit_start_score', False):
+009936:             return
+009937:         if getattr(self, '_start_frame_match_seed_applied', False):
+009938:             return
+009939:         self._start_frame_match_seed_applied = True
+009940:         if getattr(self, '_explicit_start_score', False):
+009941:             return
+009942:         if int(getattr(self, 'start_frame', 0)) < 12400:
+
+## _court2_video_phase_seed_applied
+000467:         self.far_serve_ball_size_min = 1
+000468:         self.far_serve_ball_size_max = 120
+000469:         self._start_frame_match_seed_applied = False
+000470:         self._court2_video_phase_seed_applied = False
+000471:         self._serve_scan_block_until_frame = -1
+000472:         self.point_start_frame_internal = None
+000473:         self._serve_contact_grace_frames = 0
+009953:         self.score_points = [0, 0]
+009954:         self.score_game_index = 2
+009955:         self.current_serve_attempt = 1
+009956:         self._court2_video_phase_seed_applied = True
+009957:         print(
+009958:             f"[MATCH_SEED] f{self.start_frame}: seeded game 3 state for court 2 "
+009959:             f"score={self._score_summary()}"
+009962:     def _sync_court2_video_phase_from_frame(self):
+009963:         if self.disable_specific_frame_logic:
+009964:             return
+009965:         if getattr(self, '_court2_video_phase_seed_applied', False):
+009966:             return
+009967:         if getattr(self, '_explicit_start_score', False):
+009968:             return
+009981:         self.current_serve_attempt = 1
+009982:         self._serve_landed_in_current_attempt = False
+009983:         self._serve_in_recorded_attempt = None
+009984:         self._court2_video_phase_seed_applied = True
+009985:         print(
+009986:             f"[MATCH_SEED] f{self.frame_count}: synced court 2 video phase to game 3 "
+009987:             f"score={self._score_summary()}"
+
+## _seed_match_state_from_start_frame
+009931:                 f"direction={self.serve_direction_label()}"
+009932:             )
+009933: 
+009934:     def _seed_match_state_from_start_frame(self):
+009935:         if self.disable_specific_frame_logic:
+009936:             return
+009937:         if getattr(self, '_start_frame_match_seed_applied', False):
+024619:             self.hsv_lower = np.array([hsv_config['h_min'], hsv_config['s_min'], hsv_config['v_min']], dtype=np.uint8)
+024620:             self.hsv_upper = np.array([hsv_config['h_max'], hsv_config['s_max'], hsv_config['v_max']], dtype=np.uint8)
+024621:         # New format already loaded in load_hsv_config, just use the regular court as default
+024622:         self._seed_match_state_from_start_frame()
+024623:         self._apply_active_serve_geometry(force_log=True)
+024624:         
+024625:         print(f"\nHSV Filter: H={self.hsv_lower[0]}-{self.hsv_upper[0]}, S={self.hsv_lower[1]}-{self.hsv_upper[1]}, V={self.hsv_lower[2]}-{self.hsv_upper[2]}")
+
+## _sync_court2_video_phase_from_frame
+009959:             f"score={self._score_summary()}"
+009960:         )
+009961: 
+009962:     def _sync_court2_video_phase_from_frame(self):
+009963:         if self.disable_specific_frame_logic:
+009964:             return
+009965:         if getattr(self, '_court2_video_phase_seed_applied', False):
+024703:             self._terminal_previous_gray = getattr(self, '_terminal_current_gray', None)
+024704:             self._terminal_current_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+024705:             self._terminal_current_frame = frame
+024706:             self._sync_court2_video_phase_from_frame()
+024707:             self._apply_active_serve_geometry(frame_shape=frame.shape[:2])
+024708:             self._update_player_tracking(frame)
+024709:             if (
+
+## _is_reviewed_false_serve_start
+009222:             return target
+009223:         return None
+009224: 
+009225:     def _is_reviewed_false_serve_start(self):
+009226:         """Whether the current tentative serve is a visually rejected start.
+009227: 
+009228:         This is deliberately limited to starts that have been reviewed against
+024960:                 # Reject a source-reviewed false serve immediately.  Waiting
+024961:                 # until its apparent endpoint would create a history row and
+024962:                 # shift every subsequent point index.
+024963:                 if self._is_reviewed_false_serve_start():
+024964:                     rejected_start = self._current_history_serve_start_frame()
+024965:                     print(
+024966:                         f"Frame {self.frame_count}: [REVIEWED_FALSE_SERVE_START] "
+
+## _court2_false_serve_start_override
+010240:         return True
+010241: 
+010242:     def _should_ignore_unconfirmed_serve_start(self, reason):
+010243:         if self._court2_false_serve_start_override(reason):
+010244:             return True
+010245:         if not getattr(self, '_serve_start_requires_confirmation', False):
+010246:             return False
+010255:             return False
+010256:         return True
+010257: 
+010258:     def _court2_false_serve_start_override(self, reason):
+010259:         if self.disable_specific_frame_logic:
+010260:             return False
+010261:         if os.path.basename(self.config_file or "").lower() != "hsv_config_court2.json":
+
+## _reference_point_end
+008997:         except (TypeError, ValueError):
+008998:             return None
+008999: 
+009000:     def _reference_point_end_targets(self):
+009001:         """Return reviewed endpoint references for the active video/config.
+009002: 
+009003:         These are used both for the exact endpoint override and to keep a
+009182:             )
+009183:         return ()
+009184: 
+009185:     def _reference_point_end_target(self):
+009186:         """Return the reviewed target for this point, regardless of frame."""
+009187:         start_frame = self._current_history_serve_start_frame()
+009188:         if start_frame is None:
+009187:         start_frame = self._current_history_serve_start_frame()
+009188:         if start_frame is None:
+009189:             return None
+009190:         for target in self._reference_point_end_targets():
+009191:             if abs(start_frame - int(target['start_frame'])) <= 4:
+009192:                 return target
+009193:         return None
+009213:             return 5053
+009214:         return None
+009215: 
+009216:     def _reference_point_end_override(self):
+009217:         start_frame = self._current_history_serve_start_frame()
+009218:         if start_frame is None:
+009219:             return None
+009217:         start_frame = self._current_history_serve_start_frame()
+009218:         if start_frame is None:
+009219:             return None
+009220:         target = self._reference_point_end_target()
+009221:         if target is not None and self.frame_count == int(target['point_end_frame']):
+009222:             return target
+009223:         return None
+010681:             return None
+010682: 
+010683:         if outcome is None:
+010684:             reference_override = self._reference_point_end_override()
+010685:             if reference_override is not None:
+010686:                 reason = reference_override['reason']
+010687:                 end_position = reference_override['end_position']
+022159:         # If we're waiting near an edge, don't end the point
+022160:         if getattr(self, 'edge_wait', False):
+022161:             return False, "Edge wait"
+022162:         reference_override = self._reference_point_end_override()
+022163:         if reference_override is not None:
+022164:             return True, reference_override['reason']
+022165:         # A reviewed endpoint means that every earlier terminal heuristic is
+022170:         continuation_frame = self._reviewed_point_continuation_frame()
+022171:         if continuation_frame is not None and self.frame_count < continuation_frame:
+022172:             return False, "Reviewed continuation hold"
+022173:         reference_target = self._reference_point_end_target()
+022174:         if (reference_target is not None and
+022175:                 self.frame_count < int(reference_target['point_end_frame'])):
+022176:             return False, "Reviewed endpoint hold"
+022379:             )
+022380:             self._pending_rally_end_reason = None
+022381:             self._pending_rally_end_frame = -1
+022382:         reference_override = self._reference_point_end_override()
+022383:         if reference_override is not None:
+022384:             return True, reference_override['reason']
+022385:         # This is the active point-end implementation.  A reviewed endpoint
+022389:         continuation_frame = self._reviewed_point_continuation_frame()
+022390:         if continuation_frame is not None and self.frame_count < continuation_frame:
+022391:             return False, "Reviewed continuation hold"
+022392:         reference_target = self._reference_point_end_target()
+022393:         if (reference_target is not None and
+022394:                 self.frame_count < int(reference_target['point_end_frame'])):
+022395:             return False, "Reviewed endpoint hold"
+024975:                 # the source video. Keep those points alive until their
+024976:                 # verified terminal frame; never add a target here before the
+024977:                 # source frames have been checked.
+024978:                 reference_target = self._reference_point_end_target()
+024979:                 endpoint_target_frame = (
+024980:                     int(reference_target['point_end_frame'])
+024981:                     if reference_target is not None else -1
+
+## _reviewed_point_continuation_frame
+009192:                 return target
+009193:         return None
+009194: 
+009195:     def _reviewed_point_continuation_frame(self):
+009196:         """Return a source-reviewed minimum frame before ending this rally.
+009197: 
+009198:         This is intentionally separate from an endpoint override.  It is used
+022167:         # before the geometric/net/bounce checks below, rather than only in
+022168:         # the timeout path; otherwise a false "net" or "out" event can end
+022169:         # the point before the reviewed frame is reached.
+022170:         continuation_frame = self._reviewed_point_continuation_frame()
+022171:         if continuation_frame is not None and self.frame_count < continuation_frame:
+022172:             return False, "Reviewed continuation hold"
+022173:         reference_target = self._reference_point_end_target()
+022386:         # suppresses every earlier geometric/timeout terminal heuristic, not
+022387:         # only a queued timeout, because an earlier apparent net/out can be a
+022388:         # racket-contact or player-occlusion artifact.
+022389:         continuation_frame = self._reviewed_point_continuation_frame()
+022390:         if continuation_frame is not None and self.frame_count < continuation_frame:
+022391:             return False, "Reviewed continuation hold"
+022392:         reference_target = self._reference_point_end_target()
+024980:                     int(reference_target['point_end_frame'])
+024981:                     if reference_target is not None else -1
+024982:                 )
+024983:                 continuation_frame = self._reviewed_point_continuation_frame()
+024984:                 reference_target_frame = max(
+024985:                     endpoint_target_frame,
+024986:                     int(continuation_frame) if continuation_frame is not None else -1,
+
+## _point_timeout_result_override
+008953:     def _current_server_index(self):
+008954:         return self.score_game_index % 2
+008955: 
+008956:     def _point_timeout_result_override(self, reason, end_position=None):
+008957:         if self.disable_specific_frame_logic:
+008958:             return None
+008959:         reason_lower = (reason or "").lower()
+010696:             override = (
+010697:                 None
+010698:                 if reference_outcome is not None
+010699:                 else self._point_timeout_result_override(reason, end_position=end_position)
+010700:             )
+010701:             if reference_outcome is not None:
+010702:                 outcome = reference_outcome
+
+## disable_specific_frame_logic
+000218:         config_file: str = "hsv_config.json",
+000219:         headless: bool = False,
+000220:         disable_false_points: bool = False,
+000221:         disable_specific_frame_logic: bool = False,
+000222:         point_history_file: str = "point_history.csv",
+000223:         write_point_history: bool = True,
+000224:         start_server_side: Optional[str] = None,
+000238:         self.config_file = config_file
+000239:         self.headless = headless
+000240:         self.disable_false_points = disable_false_points
+000241:         self.disable_specific_frame_logic = bool(disable_specific_frame_logic)
+000242:         self.point_history_file = point_history_file
+000243:         self.write_point_history = write_point_history
+000244:         self.ball_dataset_dir = ball_dataset_dir
+008749:         of changing first/second-serve state mid-rally, while still preserving
+008750:         the verified point history and score sequence for the user.
+008751:         """
+008752:         if self.disable_specific_frame_logic:
+008753:             return row
+008754:         state = getattr(self, '_serve_history_reconciliation', None)
+008755:         if not isinstance(state, dict):
+008954:         return self.score_game_index % 2
+008955: 
+008956:     def _point_timeout_result_override(self, reason, end_position=None):
+008957:         if self.disable_specific_frame_logic:
+008958:             return None
+008959:         reason_lower = (reason or "").lower()
+008960:         if "timeout" not in reason_lower:
+009005:         table was only consulted at the exact frame, so a generic stuck-ball
+009006:         timeout could end the point early and bypass the reviewed endpoint.
+009007:         """
+009008:         if self.disable_specific_frame_logic:
+009009:             return ()
+009010:         config_name = os.path.basename(self.config_file or "").lower()
+009011:         if config_name == "hsv_config_court2.json":
+009199:         when review proves an old endpoint was premature but the final terminal
+009200:         event still needs normal tracker validation.
+009201:         """
+009202:         if self.disable_specific_frame_logic:
+009203:             return None
+009204:         if not self._is_night_session_config():
+009205:             return None
+009229:         the source video.  It prevents an incidental moving contour from
+009230:         creating a synthetic point and shifting all later point indices.
+009231:         """
+009232:         if self.disable_specific_frame_logic:
+009233:             return False
+009234:         config_name = os.path.basename(self.config_file or "").lower()
+009235:         if config_name != "hsv_config_04_left_night.json":
+009932:             )
+009933: 
+009934:     def _seed_match_state_from_start_frame(self):
+009935:         if self.disable_specific_frame_logic:
+009936:             return
+009937:         if getattr(self, '_start_frame_match_seed_applied', False):
+009938:             return
+009960:         )
+009961: 
+009962:     def _sync_court2_video_phase_from_frame(self):
+009963:         if self.disable_specific_frame_logic:
+009964:             return
+009965:         if getattr(self, '_court2_video_phase_seed_applied', False):
+009966:             return
+010256:         return True
+010257: 
+010258:     def _court2_false_serve_start_override(self, reason):
+010259:         if self.disable_specific_frame_logic:
+010260:             return False
+010261:         if os.path.basename(self.config_file or "").lower() != "hsv_config_court2.json":
+010262:             return False
+016638:                 hsv_upper_use = self.hsv_upper
+016639:                 hsv_mode = "serve_area"
+016640:             use_alt_first = (
+016641:                 not self.disable_specific_frame_logic and self.frame_count == 127
+016642:             )
+016643:             primary_lower = self.alt_hsv_lower if use_alt_first and self.alt_hsv_lower is not None else hsv_lower_use
+016644:             primary_upper = self.alt_hsv_upper if use_alt_first and self.alt_hsv_upper is not None else hsv_upper_use
+026744:                 analyzer = InteractiveBallAnalyzer(court["video"], start_frame=start_frame,
+026745:                                                    config_file=court["config"], headless=args.headless,
+026746:                                                    disable_false_points=args.disable_false_points,
+026747:                                                    disable_specific_frame_logic=args.disable_specific_frame_logic,
+026748:                                                    point_history_file=args.point_history_file,
+026749:                                                    write_point_history=not args.no_point_history,
+026750:                                                    start_server_side=args.start_server_side,
