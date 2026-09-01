@@ -1357,6 +1357,8 @@ class InteractiveBallAnalyzer:
         saved_min_score = float(getattr(self, '_force_local_ai_min_score', 0.985))
         saved_return_none = bool(getattr(self, '_force_local_ai_return_none_on_miss', False))
         saved_max_scored = int(getattr(self, '_force_local_ai_max_score_candidates', 128))
+        saved_allow_gap = bool(getattr(self, '_force_local_ai_allow_history_gap', False))
+        saved_continuity_guard = bool(getattr(self, '_force_local_ai_continuity_guard', False))
         try:
             self._force_local_ai_range = (
                 int(state['start_frame']), int(state['deadline'])
@@ -1370,6 +1372,8 @@ class InteractiveBallAnalyzer:
             )
             self._force_local_ai_return_none_on_miss = True
             self._force_local_ai_max_score_candidates = 384
+            self._force_local_ai_allow_history_gap = True
+            self._force_local_ai_continuity_guard = True
             selected = self._force_local_ai_frame(frame, previous_position)
             state['history'] = list(getattr(self, '_force_local_ai_history', []) or [])
         finally:
@@ -1379,6 +1383,8 @@ class InteractiveBallAnalyzer:
             self._force_local_ai_min_score = saved_min_score
             self._force_local_ai_return_none_on_miss = saved_return_none
             self._force_local_ai_max_score_candidates = saved_max_scored
+            self._force_local_ai_allow_history_gap = saved_allow_gap
+            self._force_local_ai_continuity_guard = saved_continuity_guard
 
         if selected is None:
             state['miss_count'] = int(state.get('miss_count', 0)) + 1
@@ -1442,7 +1448,24 @@ class InteractiveBallAnalyzer:
 
         history = list(getattr(self, "_force_local_ai_history", []) or [])
         if history and int(history[-1].get("frame", -1000000)) != current - 1:
-            history = []
+            if bool(getattr(self, "_force_local_ai_allow_history_gap", False)) and previous_position is not None:
+                # The previous frame was handled by the normal tracker.  Use that
+                # trusted result to bridge AI history so prediction survives misses.
+                bridge_frame = current - 1
+                bridge_pos = tuple(previous_position)
+                history.append({
+                    "frame": bridge_frame,
+                    "pos": bridge_pos,
+                    "score": 1.0,
+                    "normal_bridge": True,
+                })
+                history = history[-4:]
+                print(
+                    f"[CONTACT_AI_HISTORY_BRIDGE] f{current}: "
+                    f"using normal f{bridge_frame} pos={bridge_pos}"
+                )
+            else:
+                history = []
 
         anchor = tuple(history[-1]["pos"]) if history else (
             tuple(previous_position) if previous_position is not None else None
@@ -1508,7 +1531,22 @@ class InteractiveBallAnalyzer:
         if predicted is not None:
             tolerance = max(120.0, min(300.0, previous_speed * 1.8 + 60.0))
 
+        continuity_cap = None
+        if predicted is None and bool(getattr(self, "_force_local_ai_continuity_guard", False)):
+            prior_motion = dict(getattr(self, "last_motion", {}) or {})
+            tracker_speed = float(prior_motion.get("distance", 0.0) or 0.0)
+            recent = [
+                float(v) for v in list(getattr(self, "ball_velocity_history", []) or [])[-5:]
+                if v is not None
+            ]
+            recent_median = float(np.median(recent)) if recent else tracker_speed
+            continuity_cap = min(
+                float(radius),
+                max(180.0, tracker_speed * 3.0 + 60.0, recent_median * 3.5 + 40.0),
+            )
+
         eligible = []
+        continuity_rejected = 0
         for candidate in scored:
             score = float(candidate.get("ai_score", 0.0) or 0.0)
             if score < min_score:
@@ -1516,6 +1554,17 @@ class InteractiveBallAnalyzer:
             point = (int(candidate["x"]), int(candidate["y"]))
             if self._player_point_zone(point) is not None:
                 continue
+
+            anchor_dist = math.hypot(point[0] - anchor[0], point[1] - anchor[1])
+            if continuity_cap is not None:
+                # No established AI trajectory yet: stay local to the trusted
+                # ball.  Large first-step jumps require near-certain AI confidence.
+                if anchor_dist > float(continuity_cap):
+                    continuity_rejected += 1
+                    continue
+                if anchor_dist > 140.0 and score < 0.995:
+                    continuity_rejected += 1
+                    continue
 
             pred_dist = None
             cosine = None
@@ -1565,7 +1614,8 @@ class InteractiveBallAnalyzer:
                 print(
                     f"[FORCE_LOCAL_AI_MISS] f{current}: no clear candidate >= {min_score:.3f}; "
                     f"anchor={anchor} predicted={predicted} candidates={len(candidates)} "
-                    f"clear={len(clear_candidates)} scored={len(scored)}"
+                    f"clear={len(clear_candidates)} scored={len(scored)} "
+                    f"continuity_rejected={continuity_rejected}"
                 )
                 return None
             self.ball_center = tuple(anchor)
