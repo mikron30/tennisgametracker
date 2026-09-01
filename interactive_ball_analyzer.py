@@ -290,6 +290,10 @@ class InteractiveBallAnalyzer:
         self.local_ai_recovery = None
         self._debug_local_ai_range = debug_local_ai_range
         self._debug_local_ai_radius = max(20.0, float(debug_local_ai_radius))
+        self._force_local_ai_range = None
+        self._force_local_ai_radius = 450.0
+        self._force_local_ai_min_score = 0.985
+        self._force_local_ai_history = []
         self._local_ai_frame_buffer = frame_buffer(12)
         self._local_ai_recovery_count = 0
         self._local_ai_all_body_rejections = 0
@@ -1169,6 +1173,213 @@ class InteractiveBallAnalyzer:
         if preferred.get('source') != 'local_ai_tight_roi':
             return None
         return self._commit_night_visible_ball_recovery(preferred, frame)
+
+    def _force_local_ai_frame(self, frame, previous_position):
+        """TEST ONLY: bypass HSV and let Local AI own an exact frame range.
+
+        The previous AI-selected point becomes the next search anchor. Player,
+        head, shoe, and racket regions are excluded before scoring. Once two AI
+        points exist, high-confidence candidates must also fit the extrapolated
+        AI trajectory. Outside --force-local-ai-range this method returns None
+        and the normal tracker is unchanged.
+        """
+        frame_range = getattr(self, "_force_local_ai_range", None)
+        recovery = getattr(self, "local_ai_recovery", None)
+        if frame_range is None or frame is None or recovery is None:
+            return None
+
+        start_frame, end_frame = frame_range
+        current = int(self.frame_count)
+        if not (int(start_frame) <= current <= int(end_frame)):
+            if current > int(end_frame):
+                self._force_local_ai_history = []
+            return None
+
+        from ball_ai_recovery_probe import collect_candidates
+
+        history = list(getattr(self, "_force_local_ai_history", []) or [])
+        if history and int(history[-1].get("frame", -1000000)) != current - 1:
+            history = []
+
+        anchor = tuple(history[-1]["pos"]) if history else (
+            tuple(previous_position) if previous_position is not None else None
+        )
+        if anchor is None:
+            print(f"[FORCE_LOCAL_AI_HOLD] f{current}: no anchor available")
+            return previous_position
+
+        radius = max(40.0, float(getattr(self, "_force_local_ai_radius", 450.0)))
+        min_score = float(getattr(self, "_force_local_ai_min_score", 0.985))
+
+        config = dict(recovery._config)
+        config["force_low_sat"] = {
+            "h_min": 80, "h_max": 135,
+            "s_min": 10, "s_max": 60,
+            "v_min": 110, "v_max": 255,
+        }
+        modes = (
+            "regular_court", "alt1", "alt2", "alt3", "s_30", "h_10",
+            "force_low_sat",
+        )
+
+        predicted = None
+        previous_speed = 0.0
+        previous_vector = None
+        if len(history) >= 2:
+            p0 = tuple(history[-2]["pos"])
+            p1 = tuple(history[-1]["pos"])
+            vx = float(p1[0] - p0[0])
+            vy = float(p1[1] - p0[1])
+            previous_speed = math.hypot(vx, vy)
+            if previous_speed >= 3.0:
+                previous_vector = (vx, vy)
+                predicted = (int(round(p1[0] + vx)), int(round(p1[1] + vy)))
+
+        candidates = collect_candidates(
+            frame, config, modes=modes,
+            min_area=3.0, max_area=1200.0,
+            around=anchor, radius=radius,
+            dedup_distance=4.0,
+        )
+
+        clear_candidates = []
+        for candidate in candidates:
+            point = (int(candidate["x"]), int(candidate["y"]))
+            if self._player_point_zone(point) is None:
+                clear_candidates.append(candidate)
+
+        sort_anchor = predicted if predicted is not None else anchor
+        clear_candidates.sort(
+            key=lambda item: math.hypot(
+                float(item["x"]) - float(sort_anchor[0]),
+                float(item["y"]) - float(sort_anchor[1]),
+            )
+        )
+        subset = clear_candidates[:128]
+        scored = recovery._score(frame, current, subset) if subset else []
+
+        tolerance = None
+        if predicted is not None:
+            tolerance = max(120.0, min(300.0, previous_speed * 1.8 + 60.0))
+
+        eligible = []
+        for candidate in scored:
+            score = float(candidate.get("ai_score", 0.0) or 0.0)
+            if score < min_score:
+                continue
+            point = (int(candidate["x"]), int(candidate["y"]))
+            if self._player_point_zone(point) is not None:
+                continue
+
+            pred_dist = None
+            cosine = None
+            if predicted is not None:
+                pred_dist = math.hypot(point[0] - predicted[0], point[1] - predicted[1])
+                if pred_dist > float(tolerance):
+                    continue
+                if previous_vector is not None:
+                    sx = float(point[0] - anchor[0])
+                    sy = float(point[1] - anchor[1])
+                    step = math.hypot(sx, sy)
+                    if step >= 3.0 and previous_speed >= 3.0:
+                        cosine = (
+                            previous_vector[0] * sx + previous_vector[1] * sy
+                        ) / (previous_speed * step)
+                        if cosine < -0.20:
+                            continue
+
+            eligible.append({
+                "candidate": candidate,
+                "point": point,
+                "score": score,
+                "pred_dist": pred_dist,
+                "cosine": cosine,
+            })
+
+        if predicted is None:
+            eligible.sort(
+                key=lambda item: (
+                    -item["score"],
+                    math.hypot(item["point"][0] - anchor[0], item["point"][1] - anchor[1]),
+                )
+            )
+        else:
+            eligible.sort(key=lambda item: (float(item["pred_dist"]), -item["score"]))
+
+        for rank, item in enumerate(eligible[:5], 1):
+            pd = "n/a" if item["pred_dist"] is None else f"{item['pred_dist']:.1f}"
+            cs = "n/a" if item["cosine"] is None else f"{item['cosine']:.3f}"
+            print(
+                f"[FORCE_LOCAL_AI_CAND] f{current} #{rank} pos={item['point']} "
+                f"ai={item['score']:.6f} pred_dist={pd} cos={cs}"
+            )
+
+        if not eligible:
+            self.ball_center = tuple(anchor)
+            self.stuck_frame_count = max(1, int(getattr(self, "stuck_frame_count", 0)) + 1)
+            print(
+                f"[FORCE_LOCAL_AI_HOLD] f{current}: no clear candidate >= {min_score:.3f}; "
+                f"anchor={anchor} predicted={predicted} candidates={len(candidates)} "
+                f"clear={len(clear_candidates)} scored={len(scored)}"
+            )
+            return tuple(anchor)
+
+        selected = eligible[0]
+        candidate = selected["candidate"]
+        point = selected["point"]
+        area = float(candidate.get("area", 0.0) or 0.0)
+
+        dx = int(point[0] - anchor[0])
+        dy = int(point[1] - anchor[1])
+        distance = math.hypot(dx, dy)
+        direction_deg = math.degrees(math.atan2(dy, dx)) if distance > 0.0 else None
+
+        self.ball_center = point
+        self.ball_size = area
+        height, width = frame.shape[:2]
+        px = max(0, min(width - 1, point[0]))
+        py = max(0, min(height - 1, point[1]))
+        hsv_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        self.ball_hsv = hsv_frame[py, px]
+
+        self.prev_motion = self.last_motion
+        self.last_motion = {
+            "distance": float(distance), "dx": dx, "dy": dy,
+            "direction_deg": direction_deg,
+        }
+        if distance >= 3.0:
+            self.last_nonzero_motion = dict(self.last_motion)
+        if direction_deg is not None:
+            self.last_direction = direction_deg
+        self.last_delta = (dx, dy)
+        self.stuck_frame_count = 0
+        self.ball_stopped = False
+        self.last_seen_frame = current
+
+        self.ball_velocity_history.append(float(distance))
+        if len(self.ball_velocity_history) > 10:
+            self.ball_velocity_history = self.ball_velocity_history[-10:]
+        self.motion_history.append({
+            "frame": current,
+            "distance": float(distance),
+            "direction_deg": direction_deg,
+            "pos": tuple(point),
+            "prev_pos": tuple(anchor),
+            "forced_local_ai": True,
+        })
+        if len(self.motion_history) > 200:
+            self.motion_history = self.motion_history[-200:]
+        self._prev_frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+        history.append({"frame": current, "pos": tuple(point), "score": selected["score"]})
+        self._force_local_ai_history = history[-4:]
+
+        print(
+            f"[FORCE_LOCAL_AI] f{current}: selected={point} ai={selected['score']:.6f} "
+            f"area={area:.1f}px anchor={anchor} predicted={predicted} "
+            f"normal_hsv_bypassed=True"
+        )
+        return tuple(point)
 
     def _debug_local_ai_shadow_frame(self, frame, previous_position, normal_position):
         """Inspect raw Local-AI ranking and optional HSV sweeps without changing tracking."""
@@ -24787,17 +24998,23 @@ class InteractiveBallAnalyzer:
                     self._local_ai_tight_roi_previous_gray = (
                         pre_track_snapshot.get('_prev_frame_gray')
                     )
-                    tracked_position = self.track_ball_in_frame(frame)
+                    forced_local_ai = False
+                    tracked_position = self._force_local_ai_frame(frame, prev_ball_center)
+                    if tracked_position is not None:
+                        forced_local_ai = True
+                    else:
+                        tracked_position = self.track_ball_in_frame(frame)
                     if self.local_ai_recovery is not None and self._local_ai_frame_buffer:
                         self._local_ai_frame_buffer[-1]["normal_position"] = (
                             tuple(tracked_position) if tracked_position is not None else None
                         )
                     self._debug_local_ai_shadow_frame(frame, prev_ball_center, tracked_position)
-                    tracked_position = self._try_local_ai_recovery(
-                        prev_ball_center, tracked_position, prev_stuck,
-                        pre_track_snapshot=pre_track_snapshot,
-                        frame=frame,
-                    )
+                    if not forced_local_ai:
+                        tracked_position = self._try_local_ai_recovery(
+                            prev_ball_center, tracked_position, prev_stuck,
+                            pre_track_snapshot=pre_track_snapshot,
+                            frame=frame,
+                        )
                     self._local_ai_tight_roi_previous_gray = None
                     # Reject any position that jumps impossibly far in one frame (false positive).
                     # When the tracker is in re-acquisition mode (stuck >= 5 before the call), allow
@@ -26189,6 +26406,12 @@ if __name__ == "__main__":
                         help="Raw Local-AI rank debug for an inclusive frame range; does not change tracking")
     parser.add_argument("--debug-local-ai-radius", type=float, default=140.0,
                         help="ROI radius for --debug-local-ai-range (default 140 px)")
+    parser.add_argument("--force-local-ai-range", type=_parse_frame_range, metavar="START:END", default=None,
+                        help="TEST ONLY: bypass HSV and let Local AI own an inclusive frame range")
+    parser.add_argument("--force-local-ai-radius", type=float, default=450.0,
+                        help="Search radius for --force-local-ai-range (default 450 px)")
+    parser.add_argument("--force-local-ai-min-score", type=float, default=0.985,
+                        help="Minimum Local-AI score in forced range (default 0.985)")
     parser.add_argument("--debug-local-ai-top-n", type=int, default=10,
                         help="Print/save Top-N raw Local-AI candidates in debug range (default 10)")
     parser.add_argument("--debug-hsv-sweep", action="store_true",
@@ -26290,6 +26513,15 @@ if __name__ == "__main__":
                 analyzer.pause_at_frame = args.pause_at_frame if sequence_index == 0 else None
                 analyzer._debug_local_ai_top_n = args.debug_local_ai_top_n
                 analyzer._debug_hsv_sweep = args.debug_hsv_sweep
+                analyzer._force_local_ai_range = args.force_local_ai_range
+                analyzer._force_local_ai_radius = max(40.0, float(args.force_local_ai_radius))
+                analyzer._force_local_ai_min_score = max(0.0, min(1.0, float(args.force_local_ai_min_score)))
+                if args.force_local_ai_range is not None:
+                    print(
+                        f"[FORCE_LOCAL_AI_MODE] range={args.force_local_ai_range[0]}:"
+                        f"{args.force_local_ai_range[1]} radius={analyzer._force_local_ai_radius:.0f}px "
+                        f"min_score={analyzer._force_local_ai_min_score:.3f}"
+                    )
                 result = analyzer.process_video(auto_play=args.auto_play, max_frames=max_frames_for_run)
                 if args.audit_points:
                     if args.no_point_history or not analyzer.point_history_file:
