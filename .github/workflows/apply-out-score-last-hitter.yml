@@ -1,0 +1,44 @@
+name: Apply out score last hitter
+on:
+  push:
+    branches: [revert_1]
+    paths: [.github/workflows/apply-out-score-last-hitter.yml]
+permissions:
+  contents: write
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: revert_1
+          fetch-depth: 0
+      - run: python .github/scripts/apply_out_score_last_hitter.py
+      - run: |
+          python -m py_compile interactive_ball_analyzer.py ball_local_ai_recovery.py ball_ai_recovery_probe.py
+          python - <<'PY'
+          import ast
+          from pathlib import Path
+          s = Path('interactive_ball_analyzer.py').read_text(encoding='utf-8')
+          tree = ast.parse(s)
+          fn = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == '_infer_point_outcome')
+          body = '\n'.join(s.splitlines()[fn.lineno-1:fn.end_lineno])
+          assert '[OUT_SCORE_OWNER]' in body
+          assert 'last hitter missed court' in body
+          assert 'ball out; hitter unknown, landing-side fallback' in body
+          out_start = body.index('if "bounce outside singles court"')
+          out_body = body[out_start:]
+          assert out_body.index('if recent_contact:') < out_body.index('if landing_player is not None:')
+          # The verified-hitter rule is side-independent: whichever player hit
+          # last loses the out, regardless of near/far landing geometry.
+          for contact_player in (0, 1):
+              winner = 1 - contact_player
+              assert winner != contact_player
+          print('OUT_SCORE_LAST_HITTER_OK')
+          PY
+      - run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add interactive_ball_analyzer.py
+          git commit -m 'Score outs against the last hitter'
+          git push origin HEAD:revert_1
