@@ -1,0 +1,34 @@
+name: Inspect force local AI hook
+
+on:
+  push:
+    branches: [revert_1]
+    paths:
+      - .github/workflows/inspect-force-local-ai.yml
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: revert_1
+      - name: Inspect debug hook and parser
+        shell: bash
+        run: |
+          echo '=== hook occurrences ==='
+          grep -n "_debug_local_ai_shadow_frame" interactive_ball_analyzer.py || true
+          echo '=== debug args ==='
+          grep -n -A18 -B8 "debug-local-ai-range" interactive_ball_analyzer.py || true
+          echo '=== method ==='
+          line=$(grep -n "def _debug_local_ai_shadow_frame" interactive_ball_analyzer.py | head -1 | cut -d: -f1)
+          if [ -n "$line" ]; then
+            start=$((line-15)); end=$((line+220)); sed -n "${start},${end}p" interactive_ball_analyzer.py
+          fi
+          echo '=== call sites ==='
+          for line in $(grep -n "_debug_local_ai_shadow_frame(" interactive_ball_analyzer.py | cut -d: -f1); do
+            start=$((line-25)); end=$((line+30)); echo "--- around $line ---"; sed -n "${start},${end}p" interactive_ball_analyzer.py
+          done
