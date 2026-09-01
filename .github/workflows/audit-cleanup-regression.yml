@@ -1,0 +1,42 @@
+name: Audit cleanup regression
+on:
+  push:
+    branches: [revert_1]
+    paths: [.github/workflows/audit-cleanup-regression.yml]
+permissions:
+  contents: read
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: revert_1
+          fetch-depth: 0
+      - name: Compare methods before and after cleanup
+        run: |
+          git show 9aa99a875260c0101aebdafccc83c522bef91d2e:interactive_ball_analyzer.py > /tmp/old.py
+          python - <<'PY'
+          import ast
+          from pathlib import Path
+          old=Path('/tmp/old.py').read_text(encoding='utf-8')
+          cur=Path('interactive_ball_analyzer.py').read_text(encoding='utf-8')
+          def funcs(text):
+              tree=ast.parse(text)
+              out={}
+              for node in ast.walk(tree):
+                  if isinstance(node,(ast.FunctionDef,ast.AsyncFunctionDef)):
+                      out[node.name]=(node.lineno,node.end_lineno)
+              return out
+          o=funcs(old); c=funcs(cur)
+          missing=sorted(set(o)-set(c), key=lambda n:o[n][0])
+          added=sorted(set(c)-set(o), key=lambda n:c[n][0])
+          print('OLD_LINES',len(old.splitlines()))
+          print('CUR_LINES',len(cur.splitlines()))
+          print('MISSING_COUNT',len(missing))
+          for n in missing:
+              print(f'MISSING {n} old_lines={o[n][0]}-{o[n][1]}')
+          print('ADDED_COUNT',len(added))
+          for n in added:
+              print(f'ADDED {n} cur_lines={c[n][0]}-{c[n][1]}')
+          PY
