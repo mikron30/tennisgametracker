@@ -1,0 +1,27 @@
+name: Inspect contact continuity
+on:
+  push:
+    branches: [revert_1]
+    paths: [.github/workflows/inspect-contact-continuity.yml]
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: revert_1
+      - run: |
+          python - <<'PY'
+          import ast
+          from pathlib import Path
+          p=Path('interactive_ball_analyzer.py')
+          s=p.read_text(encoding='utf-8')
+          lines=s.splitlines()
+          t=ast.parse(s)
+          for n in ast.walk(t):
+              if isinstance(n, ast.FunctionDef) and n.name in {'_force_local_ai_frame','_run_contact_local_ai_frame'}:
+                  print(f'===== {n.name} {n.lineno}-{n.end_lineno} =====')
+                  print('\n'.join(f'{i}: {lines[i-1]}' for i in range(n.lineno,n.end_lineno+1)))
+          PY
