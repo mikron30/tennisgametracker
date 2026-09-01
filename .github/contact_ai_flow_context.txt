@@ -1,0 +1,2013 @@
+
+========================================================================================
+NEEDLE: forced_local_ai = False
+========================================================================================
+--- source lines 24931-25150 ---
+024931:                         elif recent_contact_timeout_hold:
+024932:                             print(
+024933:                                 f"Frame {self.frame_count}: [POST-CONTACT TIMEOUT HOLD] "
+024934:                                 f"deferring point timeout {contact_age}f after racket contact "
+024935:                                 f"at f{last_contact_frame}"
+024936:                             )
+024937:                         elif stale_player_timeout_hold:
+024938:                             print(
+024939:                                 f"Frame {self.frame_count}: [STALE-PLAYER TIMEOUT HOLD] "
+024940:                                 f"deferring unresolved timeout at {self.ball_center} "
+024941:                                 f"zone={timeout_marker_zone} stuck={self.stuck_frame_count}"
+024942:                             )
+024943:                         elif recent_bounce_hold:
+024944:                             last_bounce_frame = getattr(self, '_recent_return_bounce_recover_frame', self.frame_count)
+024945:                             frames_since_bounce = max(0, self.frame_count - last_bounce_frame)
+024946:                             print(
+024947:                                 f"Frame {self.frame_count}: delaying point timeout after recent bounce recover "
+024948:                                 f"({frames_since_bounce}f ago)"
+024949:                             )
+024950:                         elif recent_return_hold:
+024951:                             last_return_frame = getattr(self, '_recent_offscreen_return_frame', self.frame_count)
+024952:                             frames_since_return = max(0, self.frame_count - last_return_frame)
+024953:                             print(
+024954:                                 f"Frame {self.frame_count}: delaying point timeout after recent offscreen return "
+024955:                                 f"re-entry ({frames_since_return}f ago)"
+024956:                             )
+024957:                         else:
+024958:                             print(
+024959:                                 f"Frame {self.frame_count}: delaying point timeout while ball is still actively tracked "
+024960:                                 f"(seen {frames_since_seen}f ago, motion={last_motion_distance:.1f}px)"
+024961:                             )
+024962:                     else:
+024963:                         if self._ignore_unresolved_timeout_if_game_decider(
+024964:                             "POINT_TIMEOUT", end_position=self.ball_center, frame=frame
+024965:                         ):
+024966:                             print(
+024967:                                 f"[POINT_IGNORED] f{self.frame_count}: reason=POINT_TIMEOUT "
+024968:                                 f"duration={dur}f would decide game without a located ball"
+024969:                             )
+024970:                         else:
+024971:                             timeout_reason = "POINT_TIMEOUT"
+024972:                             if self._in_court_timeout_landing_outcome(self.ball_center, frame) is not None:
+024973:                                 timeout_reason = "Ball stopped on player side"
+024974:                             # A duration timeout is only a fallback inference.  The
+024975:                             # terminal verifier can still see a compact moving ball
+024976:                             # in the just-decoded frame pair; continue the rally
+024977:                             # rather than scoring a false timeout in that case.
+024978:                             if self._resume_from_terminal_motion_candidate(
+024979:                                 timeout_reason, self.ball_center, frame=frame
+024980:                             ):
+024981:                                 continue
+024982:                             print(
+024983:                                 f"[POINT_END] f{self.frame_count}: reason={timeout_reason} "
+024984:                                 f"duration={dur}f — returning to serve detection"
+024985:                             )
+024986:                             self._record_point_result(timeout_reason, end_position=self.ball_center, frame=frame)
+024987:                         game_state = "WAITING_FOR_SERVE"
+024988:                         reset_tracking_state(hold_end_marker=True)
+024989: 
+024990:                 # Track ball through the point
+024991:                 tracked_position = None
+024992:                 if self.tracking and self.hsv_lower is not None and self.ball_center is not None:
+024993:                     prev_ball_center = self.ball_center
+024994:                     prev_stuck = self.stuck_frame_count
+024995:                     prev_top_return_wait = self._top_return_wait_active()
+024996:                     prev_back_return_wait = self._back_return_wait_active()
+024997:                     pre_track_snapshot = self._snapshot_tracking_state_for_provisional_guard()
+024998:                     self._local_ai_tight_roi_previous_gray = (
+024999:                         pre_track_snapshot.get('_prev_frame_gray')
+025000:                     )
+025001:                     forced_local_ai = False
+025002:                     tracked_position = self._force_local_ai_frame(frame, prev_ball_center)
+025003:                     if tracked_position is not None:
+025004:                         forced_local_ai = True
+025005:                     else:
+025006:                         tracked_position = self.track_ball_in_frame(frame)
+025007:                     if self.local_ai_recovery is not None and self._local_ai_frame_buffer:
+025008:                         self._local_ai_frame_buffer[-1]["normal_position"] = (
+025009:                             tuple(tracked_position) if tracked_position is not None else None
+025010:                         )
+025011:                     self._debug_local_ai_shadow_frame(frame, prev_ball_center, tracked_position)
+025012:                     if not forced_local_ai:
+025013:                         tracked_position = self._try_local_ai_recovery(
+025014:                             prev_ball_center, tracked_position, prev_stuck,
+025015:                             pre_track_snapshot=pre_track_snapshot,
+025016:                             frame=frame,
+025017:                         )
+025018:                     self._local_ai_tight_roi_previous_gray = None
+025019:                     # Reject any position that jumps impossibly far in one frame (false positive).
+025020:                     # When the tracker is in re-acquisition mode (stuck >= 5 before the call), allow
+025021:                     # a larger jump because the ball may have traveled far while lost.
+025022:                     if tracked_position and prev_ball_center:
+025023:                         jump = math.hypot(tracked_position[0] - prev_ball_center[0],
+025024:                                           tracked_position[1] - prev_ball_center[1])
+025025:                         motion_reacq_this_frame = (
+025026:                             getattr(self, '_last_motion_reacq_frame', -1000000) == self.frame_count and
+025027:                             getattr(self, '_last_motion_reacq_pos', None) == tracked_position
+025028:                         )
+025029:                         trusted_rally_launch = (
+025030:                             getattr(self, '_trusted_rally_launch_frame', -1000000) == self.frame_count and
+025031:                             getattr(self, '_trusted_rally_launch_pos', None) == tracked_position
+025032:                         )
+025033:                         # Allow a larger jump when re-acquiring after being stuck for 5+ frames:
+025034:                         # a racket hit can send the ball 800+ px in one frame, so we use 1500px
+025035:                         # to let motion-based re-acquisition recover across the full court.
+025036:                         max_jump = 1500 if (
+025037:                             prev_stuck >= 5 or prev_top_return_wait or prev_back_return_wait or
+025038:                             motion_reacq_this_frame or trusted_rally_launch
+025039:                         ) else 400
+025040:                         if jump > max_jump:
+025041:                             print(f"[JUMP_REJECTED] f{self.frame_count}: jumped {jump:.0f}px from {prev_ball_center} to {tracked_position} (limit={max_jump}px, prev_stuck={prev_stuck}), keeping previous")
+025042:                             self.ball_center = prev_ball_center
+025043:                             self.stuck_frame_count = max(self.stuck_frame_count, prev_stuck + 1)
+025044:                             tracked_position = prev_ball_center
+025045: 
+025046:                     # Validate only the position that survived the physical
+025047:                     # jump gate above.  Previously the provisional serve
+025048:                     # state consumed a 425px false contour at f7921 before
+025049:                     # that contour was rejected below.  Its bogus vector then
+025050:                     # hid the real upward reversal at f7922.
+025051:                     # Once a far toss is independently marked as caught, it
+025052:                     # becomes a *history* question only.  Do not continue to
+025053:                     # mutate the live provisional flags: the previous attempt
+025054:                     # cleared those flags at f7922 and changed the otherwise
+025055:                     # stable HSV path of the following real rally.
+025056:                     tainted_far_toss_active = (
+025057:                         isinstance(
+025058:                             getattr(self, '_tainted_provisional_serve_start', None),
+025059:                             dict,
+025060:                         ) and
+025061:                         getattr(self, '_provisional_serve_start_kind', None) ==
+025062:                         'far-top-post-hit'
+025063:                     )
+025064:                     provisional_kind_before_validation = getattr(
+025065:                         self, '_provisional_serve_start_kind', None
+025066:                     )
+025067:                     provisional_reject_reason = (
+025068:                         None if tainted_far_toss_active else
+025069:                         self._validate_provisional_serve_start(
+025070:                             prev_ball_center, tracked_position
+025071:                         )
+025072:                     )
+025073:                     # A pending far-toss token is solely a fallback for a
+025074:                     # *rejected* practice toss.  Once this tentative flight
+025075:                     # has earned three coherent netward steps, it is a real
+025076:                     # serve (for example f8527 -> f8530) and the token must
+025077:                     # not survive its fault/end state.  Leaving it alive
+025078:                     # caused the local model to re-use that old start at
+025079:                     # f8619 and inject a second, false point.
+025080:                     if provisional_reject_reason is not None:
+025081:                         provisional_kind = getattr(self, '_provisional_serve_start_kind', None)
+025082:                         rejected_start = self._current_history_serve_start_frame()
+025083:                         if provisional_kind == 'far-top-post-hit':
+025084:                             # This is a caught far-side toss.  Do *not* reset
+025085:                             # to WAITING_FOR_SERVE: that was the rejected
+025086:                             # approach and it changed later, already-verified
+025087:                             # points.  Keep the normal HSV flow alive and ask
+025088:                             # local AI to prove a later outgoing path in
+025089:                             # shadow mode.  Only proven evidence may alter the
+025090:                             # final history/serve-fault interpretation.
+025091:                             self._tainted_provisional_serve_start = {
+025092:                                 'start_frame': rejected_start,
+025093:                                 'detected_frame': int(self.frame_count),
+025094:                                 'anchor': tuple(prev_ball_center),
+025095:                                 'reason': provisional_reject_reason,
+025096:                             }
+025097:                             print(
+025098:                                 f"[SERVE_START_TAINTED] f{self.frame_count}: "
+025099:                                 f"keeping tracker/provisional state for start f{rejected_start}; "
+025100:                                 f"{provisional_reject_reason}"
+025101:                             )
+025102:                         else:
+025103:                             print(
+025104:                                 f"[SERVE_START_REJECTED] f{self.frame_count}: "
+025105:                                 f"discarding provisional start f{rejected_start}; "
+025106:                                 f"{provisional_reject_reason}"
+025107:                             )
+025108:                             self._point_history_current = None
+025109:                             self._provisional_serve_start_kind = None
+025110:                             self._serve_start_requires_confirmation = False
+025111:                             game_state = "WAITING_FOR_SERVE"
+025112:                             clear_waiting_serve_history()
+025113:                             reset_tracking_state()
+025114:                             continue
+025115:                     # Shadow verification is intentionally side-effect free
+025116:                     # for ball position/game state.  It only supplies a
+025117:                     # later verified launch frame for history/fault scoring.
+025118:                     reconcile_tainted_far_serve_start()
+025119:                     if getattr(self, "_discard_provisional_serve_from_ai", False):
+025120:                         self._discard_provisional_serve_from_ai = False
+025121:                         self._ignore_unconfirmed_serve_start_result(
+025122:                             "local AI rejected repeated all-player-body recovery path"
+025123:                         )
+025124:                         print(
+025125:                             f"[SERVE_START_IGNORED] f{self.frame_count}: "
+025126:                             "discarding false provisional serve after repeated local-AI body paths"
+025127:                         )
+025128:                         game_state = "WAITING_FOR_SERVE"
+025129:                         clear_waiting_serve_history()
+025130:                         reset_tracking_state()
+025131:                         continue
+025132:                 if tracked_position:
+025133:                     vel = self.last_motion['distance'] if self.last_motion else 0
+025134:                     size_text = f"{self.ball_size:.1f}px" if self.ball_size is not None else "unknown"
+025135:                     vel_hist_tail = [round(v, 1) for v in getattr(self, 'ball_velocity_history', [])[-5:]]
+025136:                     print(f"Frame {self.frame_count}: Ball tracked at {tracked_position} - Size: {size_text}")
+025137:                     print(f"[TRACK] f{self.frame_count}: pos={tracked_position} vel={vel:.1f}px stuck={self.stuck_frame_count} vel_hist={vel_hist_tail}")
+025138:                     if self._point_history_current is not None:
+025139:                         self._point_history_current.setdefault('tracking_trace', []).append({
+025140:                             'frame': int(self.frame_count),
+025141:                             'pos': [int(tracked_position[0]), int(tracked_position[1])],
+025142:                             'size': float(self.ball_size) if self.ball_size is not None else None,
+025143:                             'stuck': int(self.stuck_frame_count),
+025144:                         })
+025145:                     if self.ball_dataset_exporter is not None:
+025146:                         self.ball_dataset_exporter.write_frame(
+025147:                             frame,
+025148:                             source_frame=self.frame_count,
+025149:                             ball_center=tracked_position,
+025150:                             ball_area=self.ball_size,
+
+========================================================================================
+NEEDLE: def _prefer_night_tight_local_ai_candidate
+========================================================================================
+--- source lines 5575-5794 ---
+005575:                 upward_progress <= max(650.0, frame_height * 0.30) and
+005576:                 abs(cx - self.ball_center[0]) <= max(450.0, frame_width * 0.12) and
+005577:                 max(contour_width, contour_height) <=
+005578:                 max(3.0, min(contour_width, contour_height) * 2.6)
+005579:             )
+005580:             if player_zone in (
+005581:                     'player_head_hat', 'player_body', 'player_shoes', 'racket_fragment'):
+005582:                 # The recovery window deliberately accepts a larger ball, so
+005583:                 # compensate by refusing player pixels unless their local
+005584:                 # frame difference is unequivocally dynamic.  The exception
+005585:                 # is a compact blob launching sharply upward from a known
+005586:                 # near-player contact; frame differencing can read zero here
+005587:                 # because the preceding motion pass refreshes its reference.
+005588:                 if ((motion_mean < 16.0 or motion_max < 70.0) and
+005589:                         not near_player_launch):
+005590:                     continue
+005591:             if motion_max < 35.0 and motion_mean < 6.0 and area < 95.0:
+005592:                 continue
+005593:             if (self.ball_center is not None and motion_max < 12.0 and motion_mean < 3.5 and
+005594:                     not near_player_launch):
+005595:                 prev_dist = math.hypot(cx - self.ball_center[0], cy - self.ball_center[1])
+005596:                 last_dist = (
+005597:                     float(self.last_motion.get('distance', 0.0) or 0.0)
+005598:                     if self.last_motion is not None else 0.0
+005599:                 )
+005600:                 predicted_dist = None
+005601:                 if self.last_motion is not None:
+005602:                     predicted_x = self.ball_center[0] + float(self.last_motion.get('dx', 0.0) or 0.0)
+005603:                     predicted_y = self.ball_center[1] + float(self.last_motion.get('dy', 0.0) or 0.0)
+005604:                     predicted_dist = math.hypot(cx - predicted_x, cy - predicted_y)
+005605:                 if (
+005606:                         prev_dist > max(120.0, last_dist * 4.0) and
+005607:                         (predicted_dist is None or predicted_dist > max(90.0, last_dist * 3.0))):
+005608:                     continue
+005609: 
+005610:             frame0_hotspot = self._find_frame0_background_hotspot((cx, cy))
+005611:             if (frame0_hotspot is not None and motion_mean < 12.0 and motion_max < 55.0 and
+005612:                     not near_player_launch):
+005613:                 continue
+005614: 
+005615:             local_hsv = hsv_frame[cy, cx]
+005616:             court_center_x = frame_width * 0.43
+005617:             court_center_y = frame_height * 0.34
+005618:             score = (
+005619:                 abs(cx - court_center_x) * 0.018 +
+005620:                 abs(cy - court_center_y) * 0.030 +
+005621:                 abs(area - 135.0) * 0.12 -
+005622:                 min(90.0, motion_max * 0.24) -
+005623:                 min(55.0, motion_mean * 0.9)
+005624:             )
+005625:             if near_player_launch:
+005626:                 # At a near-player return, distinguish the outgoing ball from
+005627:                 # the residual contact smear by how far it has launched away
+005628:                 # from the racket.  This makes the real f103 ball at y~1053
+005629:                 # beat the nearer smear at y~1229.
+005630:                 score -= min(120.0, upward_progress * 0.35)
+005631:             candidates.append((score, -area, {
+005632:                 'pos': (cx, cy),
+005633:                 'area': area,
+005634:                 'hsv': local_hsv,
+005635:                 'motion_mean': motion_mean,
+005636:                 'motion_max': motion_max,
+005637:             }))
+005638: 
+005639:         if not candidates:
+005640:             return None
+005641: 
+005642:         _, _, chosen = min(candidates, key=lambda item: (item[0], item[1]))
+005643:         return chosen
+005644: 
+005645:     def _prefer_night_tight_local_ai_candidate(
+005646:             self, frame, frame_gray, proposed_candidate, previous_gray=None):
+005647:         """Prefer a model-ranked ball in a bounded causal ROI near contact.
+005648: 
+005649:         This is deliberately candidate arbitration, not broad recovery.  It
+005650:         handles both a sharp weak-motion player-region turn and a fast ball
+005651:         that stalls at a racket before launching.  Coherent normal candidates
+005652:         pass through cheaply; suspicious proposals are ranked only inside the
+005653:         small causal/predicted corridor.
+005654:         """
+005655:         recovery = getattr(self, 'local_ai_recovery', None)
+005656:         ranker = getattr(recovery, 'rank_local_roi_candidate', None)
+005657:         previous = getattr(self, 'ball_center', None)
+005658:         if (
+005659:                 recovery is None or not callable(ranker) or frame is None or
+005660:                 frame_gray is None or proposed_candidate is None or
+005661:                 previous is None):
+005662:             return proposed_candidate
+005663: 
+005664:         frame_index = int(self.frame_count)
+005665:         follow = getattr(self, '_local_ai_tight_roi_follow', None)
+005666:         if isinstance(follow, dict) and frame_index > int(follow.get('deadline', -1)):
+005667:             self._local_ai_tight_roi_follow = None
+005668:             follow = None
+005669:         follow_active = (
+005670:             isinstance(follow, dict) and
+005671:             int(follow.get('last_frame', -1)) < frame_index <=
+005672:             int(follow.get('deadline', -1))
+005673:         )
+005674: 
+005675:         prior_motion = dict(getattr(self, 'last_motion', None) or {})
+005676:         prior_dx = float(prior_motion.get('dx', 0.0) or 0.0)
+005677:         prior_dy = float(prior_motion.get('dy', 0.0) or 0.0)
+005678:         prior_speed = float(
+005679:             prior_motion.get('distance', math.hypot(prior_dx, prior_dy)) or 0.0
+005680:         )
+005681:         proposed_pos = tuple(proposed_candidate.get('pos') or previous)
+005682:         proposed_dx = float(proposed_pos[0]) - float(previous[0])
+005683:         proposed_dy = float(proposed_pos[1]) - float(previous[1])
+005684:         proposed_speed = math.hypot(proposed_dx, proposed_dy)
+005685:         proposed_mean = float(proposed_candidate.get('motion_mean', 0.0) or 0.0)
+005686:         proposed_max = float(proposed_candidate.get('motion_max', 0.0) or 0.0)
+005687:         initial_mode = 'tight_turn'
+005688:         roi_radius = 25.0
+005689:         prediction_limit = 25.0
+005690:         fast_follow = False
+005691: 
+005692:         if follow_active:
+005693:             origin = tuple(follow['last_pos'])
+005694:             follow_mode = str(follow.get('mode', 'tight_turn'))
+005695:             fast_follow = follow_mode == 'fast_contact'
+005696:             elapsed = max(1, frame_index - int(follow['last_frame']))
+005697:             if fast_follow:
+005698:                 ai_accept_count = int(follow.get('ai_accept_count', 1))
+005699:                 velocity = tuple(follow.get('velocity', (0.0, 0.0)))
+005700:                 if ai_accept_count <= 1:
+005701:                     # The first post-stall direction is unknown.  Stay tightly
+005702:                     # around contact for one frame before extrapolating.
+005703:                     anchor = origin
+005704:                     roi_radius = 32.0
+005705:                 else:
+005706:                     anchor = (
+005707:                         int(round(float(origin[0]) + float(velocity[0]) * elapsed)),
+005708:                         int(round(float(origin[1]) + float(velocity[1]) * elapsed)),
+005709:                     )
+005710:                     # The first measured launch step is shorter than the next
+005711:                     # acceleration frame; bridge that one step, then tighten.
+005712:                     roi_radius = 75.0 if ai_accept_count == 2 else 35.0
+005713:                 prediction_limit = roi_radius
+005714:             else:
+005715:                 anchor = origin
+005716:             proposal_from_anchor = math.hypot(
+005717:                 float(proposed_pos[0]) - float(origin[0]),
+005718:                 float(proposed_pos[1]) - float(origin[1]),
+005719:             )
+005720:             proposal_from_prediction = math.hypot(
+005721:                 float(proposed_pos[0]) - float(anchor[0]),
+005722:                 float(proposed_pos[1]) - float(anchor[1]),
+005723:             )
+005724:             # Once the normal tracker again supplies a strongly moving point
+005725:             # within the 25 px contact corridor, it is already the safe local
+005726:             # answer.  Keep advancing the lock without paying for another
+005727:             # model process.  A large jump (the original f4127/f4131 failure)
+005728:             # still invokes the tight ranker below.
+005729:             coherent_normal = (
+005730:                 not proposed_candidate.get('tight_roi_force_rank', False) and
+005731:                 proposal_from_prediction <= (25.0 if fast_follow else 35.0) and
+005732:                 proposed_mean >= 10.0 and proposed_max >= 50.0
+005733:             )
+005734:             if coherent_normal:
+005735:                 step_dx = (
+005736:                     float(proposed_pos[0]) - float(origin[0])
+005737:                 ) / elapsed
+005738:                 step_dy = (
+005739:                     float(proposed_pos[1]) - float(origin[1])
+005740:                 ) / elapsed
+005741:                 step_speed = math.hypot(step_dx, step_dy)
+005742:                 coherent_history = list(
+005743:                     follow.get(
+005744:                         'velocity_history',
+005745:                         getattr(self, 'ball_velocity_history', []),
+005746:                     )
+005747:                 )[-4:] + [step_speed]
+005748:                 follow['last_pos'] = tuple(proposed_pos)
+005749:                 follow['last_frame'] = frame_index
+005750:                 follow['velocity'] = (step_dx, step_dy)
+005751:                 follow['velocity_history'] = coherent_history
+005752:                 if fast_follow:
+005753:                     # Preserve the launch lock through the short high-speed
+005754:                     # flight.  It is cheap while normal tracking is coherent,
+005755:                     # and protects the later far-player/top-edge crossing.
+005756:                     follow['outside_count'] = 0
+005757:                     self._local_ai_tight_roi_follow = follow
+005758:                 else:
+005759:                     active_zones = ('player_body', 'racket_fragment')
+005760:                     outside_player = (
+005761:                         self._player_point_zone(origin) not in active_zones and
+005762:                         self._player_point_zone(proposed_pos) not in active_zones
+005763:                     )
+005764:                     follow['outside_count'] = (
+005765:                         int(follow.get('outside_count', 0)) + 1
+005766:                         if outside_player else 0
+005767:                     )
+005768:                     if int(follow['outside_count']) >= 2:
+005769:                         self._local_ai_tight_roi_follow = None
+005770:                         print(
+005771:                             f"[LOCAL_AI_TIGHT_ROI_HANDOFF] f{frame_index}: "
+005772:                             f"normal tracker exited player ROI at {proposed_pos}"
+005773:                         )
+005774:                     else:
+005775:                         self._local_ai_tight_roi_follow = follow
+005776:                 self._local_ai_tight_roi_accept_frame = frame_index
+005777:                 return proposed_candidate
+005778:             trigger = (
+005779:                 f"{follow_mode}-lock:"
+005780:                 f"{frame_index - int(follow.get('start_frame', frame_index))}f/"
+005781:                 f"normal={proposal_from_prediction:.0f}px"
+005782:             )
+005783:         else:
+005784:             height, _ = frame.shape[:2]
+005785:             prior_size = float(getattr(self, 'ball_size', 0.0) or 0.0)
+005786:             proposed_area = float(proposed_candidate.get('area', 0.0) or 0.0)
+005787:             contact_band = (
+005788:                 int(height * 0.28) <= int(previous[1]) <= int(height * 0.52)
+005789:             )
+005790:             contact_proximity = any(
+005791:                 self._point_in_player_contact_corridor(point)
+005792:                 for point in (previous, proposed_pos)
+005793:             )
+005794:             contact_stall = (
+
+========================================================================================
+NEEDLE: def _commit_night_visible_ball_recovery
+========================================================================================
+--- source lines 6487-6706 ---
+006487:                 # static regular-HSV court artifacts cannot use this escape.
+006488:                 line_overlap_continuation = (
+006489:                     source in ('h_10', 's_30') and
+006490:                     area <= 80.0 and
+006491:                     prediction_error <= min(60.0, max_prediction_error * 0.60)
+006492:                 )
+006493:                 # The ball is often momentarily measured against its own
+006494:                 # previous blurred image immediately after the lower-player
+006495:                 # contact, so frame difference can be near zero even though
+006496:                 # the regular mask has the real, sizeable outgoing blob.  In
+006497:                 # the first night rally these are a compact sequence:
+006498:                 # f179 (692,1173), f180 (759,1043), f181 (827,925), and
+006499:                 # f182 (891,819).  The former line-overlap escape admitted a
+006500:                 # tiny alternate-HSV contour instead and the tracker lagged
+006501:                 # behind the visible ball.  Admit the large *regular* blob
+006502:                 # only when it is very close to the physical post-contact
+006503:                 # prediction; the four-frame grace window and shape/player
+006504:                 # gates above keep this from becoming a general static-artifact
+006505:                 # exception.
+006506:                 tight_regular_contact_continuation = (
+006507:                     source == 'regular' and
+006508:                     area >= 100.0 and
+006509:                     prediction_error <= max_prediction_error
+006510:                 )
+006511:                 if (
+006512:                         motion is not None and motion_mean < 4.0 and
+006513:                         motion_max < 22.0 and not (
+006514:                             line_overlap_continuation or
+006515:                             tight_regular_contact_continuation
+006516:                         )
+006517:                 ):
+006518:                     continue
+006519:                 # The first decoded frame after a racket hit can be delayed
+006520:                 # relative to the last compact launch blob, so a sizeable
+006521:                 # regular candidate may be 80-110 px past a simple
+006522:                 # constant-velocity prediction.  Its size/shape is stronger
+006523:                 # evidence than a tiny line fragment which happens to be
+006524:                 # nearer to that stale prediction.  Apply this preference
+006525:                 # only to the explicit four-frame post-contact continuation.
+006526:                 continuation_score = prediction_error + (
+006527:                     0.0 if source == 'regular' else 7.0
+006528:                 )
+006529:                 if tight_regular_contact_continuation:
+006530:                     continuation_score -= min(90.0, area * 0.20)
+006531:                 candidates.append((
+006532:                     continuation_score,
+006533:                     -motion_max,
+006534:                     -area,
+006535:                     {
+006536:                         'pos': (cx, cy), 'area': area, 'hsv': hsv_frame[cy, cx],
+006537:                         'motion_mean': motion_mean, 'motion_max': motion_max,
+006538:                         'source': source,
+006539:                         'recovery_label': 'NIGHT LOWER CONTACT CONTINUATION',
+006540:                     },
+006541:                 ))
+006542:         if not candidates:
+006543:             print(
+006544:                 f"Frame {self.frame_count}: [LOWER-HIT OUTBOUND MISS] "
+006545:                 f"expected=({expected[0]:.0f},{expected[1]:.0f}) "
+006546:                 f"nearby={' | '.join(nearby_debug[:8]) or 'none'}"
+006547:             )
+006548:             return None
+006549:         # This helper returns before the normal grace-window decrement below.
+006550:         # Consume one frame here so a good contact continuation cannot extend
+006551:         # the special relaxed rules indefinitely into unrelated court blobs.
+006552:         self._rally_contact_grace_frames = max(
+006553:             0, int(getattr(self, '_rally_contact_grace_frames', 0)) - 1
+006554:         )
+006555:         return min(candidates, key=lambda item: item[:3])[3]
+006556: 
+006557:     def _commit_night_visible_ball_recovery(self, candidate, frame):
+006558:         # Some visible-ball recovery paths (notably player-reacquisition) jump
+006559:         # directly here and bypass the startup candidate arbiter.  Reuse the
+006560:         # same pre-commit tight-ROI guard so an active near-player lock can
+006561:         # reject that jump before it mutates motion/contact state.
+006562:         if (
+006563:                 frame is not None and
+006564:                 candidate.get('source') != 'local_ai_tight_roi' and
+006565:                 int(getattr(self, '_local_ai_tight_roi_attempt_frame', -1000000)) !=
+006566:                 int(self.frame_count)):
+006567:             commit_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+006568:             candidate = self._prefer_night_tight_local_ai_candidate(
+006569:                 frame, commit_gray, candidate
+006570:             )
+006571:         prev_pos = self.ball_center
+006572:         new_pos = candidate['pos']
+006573:         self.ball_center = new_pos
+006574:         self.ball_hsv = candidate['hsv']
+006575:         self.ball_size = candidate['area']
+006576:         self._update_recovered_motion(prev_pos, new_pos)
+006577:         motion_override = candidate.get('local_ai_motion_override')
+006578:         if isinstance(motion_override, dict):
+006579:             self.last_motion = dict(motion_override)
+006580:             self.last_delta = (
+006581:                 float(motion_override.get('dx', 0.0) or 0.0),
+006582:                 float(motion_override.get('dy', 0.0) or 0.0),
+006583:             )
+006584:             self.last_direction = float(
+006585:                 motion_override.get('direction_deg', 0.0) or 0.0
+006586:             )
+006587:             velocity_history = candidate.get('local_ai_velocity_history')
+006588:             if isinstance(velocity_history, list):
+006589:                 self.ball_velocity_history = list(velocity_history)[-5:]
+006590:             if float(motion_override.get('distance', 0.0) or 0.0) > 0.0:
+006591:                 self.last_nonzero_motion = dict(motion_override)
+006592:         self.stuck_frame_count = 0
+006593:         # Short grace period for a player/racket pixel held during occlusion.
+006594:         self._player_occlusion_hold_frames = 0
+006595:         self.direction_change_streak = 0
+006596:         self._post_reacq_frames = max(getattr(self, '_post_reacq_frames', 0), 3)
+006597:         self._last_motion_reacq_frame = self.frame_count
+006598:         self.last_seen_frame = self.frame_count
+006599:         self._last_tracked_candidate_frame = self.frame_count
+006600:         self._last_tracked_candidate_motion_frame = self.frame_count
+006601:         self._last_tracked_candidate_motion_mean = float(candidate.get('motion_mean', 0.0) or 0.0)
+006602:         self._last_tracked_candidate_motion_max = float(candidate.get('motion_max', 0.0) or 0.0)
+006603:         if candidate.get('source') == 'local_ai_tight_roi':
+006604:             self._local_ai_recovery_count = int(
+006605:                 getattr(self, '_local_ai_recovery_count', 0)
+006606:             ) + 1
+006607:             # Suppress broad local-AI replay and endpoint inference only for
+006608:             # this already-verified frame.  The dedicated one-frame ROI state
+006609:             # independently handles the adjacent confirmation frame.
+006610:             self._local_ai_follow_until_frame = max(
+006611:                 int(getattr(self, '_local_ai_follow_until_frame', -1)),
+006612:                 int(self.frame_count),
+006613:             )
+006614:             self._pending_rally_end_reason = None
+006615:             self._pending_rally_end_frame = -1
+006616:         self._activate_regular_hsv()
+006617:         if candidate.get('lower_contact_approach', False):
+006618:             # Keep a tightly bounded launch prediction for the frame after
+006619:             # the incoming ball overlaps the player's racket.
+006620:             launch_context = self._get_lower_contact_launch_context(frame.shape)
+006621:             if launch_context is not None:
+006622:                 self._pending_lower_contact_launch_context = launch_context
+006623:                 self._pending_lower_contact_launch_until_frame = self.frame_count + 3
+006624:         elif candidate.get('recovery_label') == 'NIGHT LOWER CONTACT LAUNCH':
+006625:             # The launch is now verified; allow its fast upward continuation
+006626:             # through the normal tracker without retaining the contact window.
+006627:             self._pending_lower_contact_launch_context = None
+006628:             self._pending_lower_contact_launch_until_frame = -1000000
+006629:             self._rally_contact_grace_frames = max(
+006630:                 getattr(self, '_rally_contact_grace_frames', 0), 4
+006631:             )
+006632:             self._rally_contact_origin = prev_pos
+006633:             self._rally_contact_expected = new_pos
+006634:         if frame is not None:
+006635:             self._prev_frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+006636:         recovery_label = candidate.get('recovery_label', 'NIGHT VISIBLE BALL RECOVER')
+006637:         print(
+006638:             f"Frame {self.frame_count}: [{recovery_label}] Ball at {new_pos} "
+006639:             f"area={candidate['area']:.1f}px motion="
+006640:             f"{candidate.get('motion_mean', 0.0):.1f}/{candidate.get('motion_max', 0.0):.1f}"
+006641:         )
+006642:         return self.ball_center
+006643: 
+006644:     def _player_reacq_static_candidate(self, candidate, predicted_point=None):
+006645:         """Return True for a static blob that is unsafe just after player reacq.
+006646: 
+006647:         A real ball immediately following an occlusion should have either local
+006648:         frame motion or a position consistent with the predicted flight path.
+006649:         Static yellow/green patches (often racket or court artifacts) should not
+006650:         be allowed to become the new ball center merely because their area looks
+006651:         like the ball.
+006652:         """
+006653:         if self.frame_count > int(getattr(self, '_player_reacq_protect_until_frame', -1)):
+006654:             return False
+006655:         if not candidate:
+006656:             return False
+006657:         motion_mean = float(candidate.get('motion_mean', 0.0) or 0.0)
+006658:         motion_max = float(candidate.get('motion_max', 0.0) or 0.0)
+006659:         if motion_mean >= 6.0 or motion_max >= 25.0:
+006660:             return False
+006661:         pos = candidate.get('pos')
+006662:         if pos is None or self.ball_center is None:
+006663:             return False
+006664:         prev_distance = math.hypot(pos[0] - self.ball_center[0], pos[1] - self.ball_center[1])
+006665:         predicted_distance = (
+006666:             math.hypot(pos[0] - predicted_point[0], pos[1] - predicted_point[1])
+006667:             if predicted_point is not None else prev_distance
+006668:         )
+006669:         # Keep a static candidate only when it is essentially on the predicted
+006670:         # path; a distant static blob is an artifact even if its area is large.
+006671:         return prev_distance > 100.0 and predicted_distance > 90.0
+006672: 
+006673:     def _night_stuck_player_artifact_candidate(
+006674:             self, position, motion_mean, motion_max, distance):
+006675:         """Reject a static player/body contour during a stuck re-acquisition.
+006676: 
+006677:         Candidate scoring already penalizes player regions, but if every real
+006678:         ball contour is temporarily occluded the penalized body contour can
+006679:         still be the only candidate and therefore win.  A genuine ball that
+006680:         reappears after contact has local frame motion; the f97 neck/body
+006681:         takeover has none and is more than 500 px from the last ball.
+006682:         """
+006683:         if not self._is_night_session_config() or position is None:
+006684:             return False
+006685:         zone = self._player_point_zone(position)
+006686:         if zone not in (
+006687:                 'player_head_hat', 'player_body', 'player_shoes', 'racket_fragment'):
+006688:             return False
+006689:         return (
+006690:             float(distance or 0.0) > 120.0 and
+006691:             float(motion_mean or 0.0) < 6.0 and
+006692:             float(motion_max or 0.0) < 25.0
+006693:         )
+006694: 
+006695:     def _collect_override_candidate_metrics(self, pos, area, prev_pos, predicted_point, frame_gray):
+006696:         motion_metrics = self._candidate_motion_metrics(frame_gray, pos[0], pos[1])
+006697:         motion_mean = motion_metrics['mean'] if motion_metrics is not None else 0.0
+006698:         motion_max = motion_metrics['max'] if motion_metrics is not None else 0.0
+006699:         prev_distance = math.hypot(pos[0] - prev_pos[0], pos[1] - prev_pos[1]) if prev_pos is not None else 0.0
+006700:         predicted_distance = (
+006701:             math.hypot(pos[0] - predicted_point[0], pos[1] - predicted_point[1])
+006702:             if predicted_point is not None else None
+006703:         )
+006704:         frame0_hotspot = self._find_frame0_background_hotspot(pos)
+006705:         static_hotspot = (
+006706:             (area <= 3 and motion_mean < 1.0 and motion_max <= 5.0) or
+
+========================================================================================
+NEEDLE: _prefer_night_tight_local_ai_candidate(
+========================================================================================
+--- source lines 1100-1319 ---
+001100:         )
+001101:         if displacement <= 10.0:
+001102:             # A three-sample rule in practice: the candidate was already
+001103:             # measured as static against the prior frame, and it now survives
+001104:             # at the same position in the following frame.  Restrict the
+001105:             # ignore to a few frames so a later live ball remains eligible.
+001106:             self._learn_ignored_tracking_position(
+001107:                 pending["pos"], radius=18, ttl=4,
+001108:                 reason="provisional three-frame static artifact",
+001109:             )
+001110:             self._last_static_guard_position = tuple(pending["pos"])
+001111:             print(
+001112:                 f"[PROVISIONAL_STATIC_GUARD] f{self.frame_count}: "
+001113:                 f"rejected persistent blob {pending['pos']} "
+001114:                 f"delta={displacement:.1f}px"
+001115:             )
+001116:             return True
+001117:         else:
+001118:             print(
+001119:                 f"[PROVISIONAL_STATIC_GUARD] f{self.frame_count}: "
+001120:                 f"candidate moved {displacement:.1f}px; no ignore"
+001121:             )
+001122:         return False
+001123: 
+001124:     def _try_active_tight_local_ai_hold(
+001125:             self, frame, tracked_position, previous_gray=None):
+001126:         """Advance an active contact ROI when normal tracking only holds.
+001127: 
+001128:         Player-occlusion branches can return the previous marker without
+001129:         reaching any candidate-commit hook.  During the bounded tight-ROI
+001130:         contact lock, rank that small area directly instead of waiting five
+001131:         frames for a broad full-frame reacquisition.
+001132:         """
+001133:         follow = getattr(self, '_local_ai_tight_roi_follow', None)
+001134:         if (
+001135:                 not isinstance(follow, dict) or frame is None or
+001136:                 int(self.frame_count) > int(follow.get('deadline', -1)) or
+001137:                 int(self.frame_count) <= int(follow.get('last_frame', -1)) or
+001138:                 int(getattr(self, 'stuck_frame_count', 0)) < 3):
+001139:             return None
+001140: 
+001141:         held_pos = tracked_position or self.ball_center or follow.get('last_pos')
+001142:         if held_pos is None:
+001143:             return None
+001144:         held_pos = (int(held_pos[0]), int(held_pos[1]))
+001145:         frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+001146:         held_motion = self._candidate_motion_metrics(
+001147:             frame_gray, held_pos[0], held_pos[1], previous_gray=previous_gray
+001148:         )
+001149:         held_mean = (
+001150:             float(held_motion.get('mean', 0.0) or 0.0)
+001151:             if held_motion else 0.0
+001152:         )
+001153:         held_max = (
+001154:             float(held_motion.get('max', 0.0) or 0.0)
+001155:             if held_motion else 0.0
+001156:         )
+001157:         height, width = frame.shape[:2]
+001158:         px = max(0, min(width - 1, held_pos[0]))
+001159:         py = max(0, min(height - 1, held_pos[1]))
+001160:         proposal = {
+001161:             'pos': held_pos,
+001162:             'area': float(getattr(self, 'ball_size', 0.0) or 0.0),
+001163:             'hsv': cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)[py, px],
+001164:             'motion_mean': held_mean,
+001165:             'motion_max': held_max,
+001166:             'source': 'tight_roi_held_marker',
+001167:             'recovery_label': 'LOCAL AI TIGHT ROI HOLD',
+001168:             'tight_roi_force_rank': True,
+001169:         }
+001170:         preferred = self._prefer_night_tight_local_ai_candidate(
+001171:             frame, frame_gray, proposal, previous_gray=previous_gray
+001172:         )
+001173:         if preferred.get('source') != 'local_ai_tight_roi':
+001174:             return None
+001175:         return self._commit_night_visible_ball_recovery(preferred, frame)
+001176: 
+001177:     def _force_local_ai_frame(self, frame, previous_position):
+001178:         """TEST ONLY: bypass HSV and let Local AI own an exact frame range.
+001179: 
+001180:         The previous AI-selected point becomes the next search anchor. Player,
+001181:         head, shoe, and racket regions are excluded before scoring. Once two AI
+001182:         points exist, high-confidence candidates must also fit the extrapolated
+001183:         AI trajectory. Outside --force-local-ai-range this method returns None
+001184:         and the normal tracker is unchanged.
+001185:         """
+001186:         frame_range = getattr(self, "_force_local_ai_range", None)
+001187:         recovery = getattr(self, "local_ai_recovery", None)
+001188:         if frame_range is None or frame is None or recovery is None:
+001189:             return None
+001190: 
+001191:         start_frame, end_frame = frame_range
+001192:         current = int(self.frame_count)
+001193:         if not (int(start_frame) <= current <= int(end_frame)):
+001194:             if current > int(end_frame):
+001195:                 self._force_local_ai_history = []
+001196:             return None
+001197: 
+001198:         from ball_ai_recovery_probe import collect_candidates
+001199: 
+001200:         history = list(getattr(self, "_force_local_ai_history", []) or [])
+001201:         if history and int(history[-1].get("frame", -1000000)) != current - 1:
+001202:             history = []
+001203: 
+001204:         anchor = tuple(history[-1]["pos"]) if history else (
+001205:             tuple(previous_position) if previous_position is not None else None
+001206:         )
+001207:         if anchor is None:
+001208:             print(f"[FORCE_LOCAL_AI_HOLD] f{current}: no anchor available")
+001209:             return previous_position
+001210: 
+001211:         radius = max(40.0, float(getattr(self, "_force_local_ai_radius", 450.0)))
+001212:         min_score = float(getattr(self, "_force_local_ai_min_score", 0.985))
+001213: 
+001214:         config = dict(recovery._config)
+001215:         config["force_low_sat"] = {
+001216:             "h_min": 80, "h_max": 135,
+001217:             "s_min": 10, "s_max": 60,
+001218:             "v_min": 110, "v_max": 255,
+001219:         }
+001220:         modes = (
+001221:             "regular_court", "alt1", "alt2", "alt3", "s_30", "h_10",
+001222:             "force_low_sat",
+001223:         )
+001224: 
+001225:         predicted = None
+001226:         previous_speed = 0.0
+001227:         previous_vector = None
+001228:         if len(history) >= 2:
+001229:             p0 = tuple(history[-2]["pos"])
+001230:             p1 = tuple(history[-1]["pos"])
+001231:             vx = float(p1[0] - p0[0])
+001232:             vy = float(p1[1] - p0[1])
+001233:             previous_speed = math.hypot(vx, vy)
+001234:             if previous_speed >= 3.0:
+001235:                 previous_vector = (vx, vy)
+001236:                 predicted = (int(round(p1[0] + vx)), int(round(p1[1] + vy)))
+001237: 
+001238:         candidates = collect_candidates(
+001239:             frame, config, modes=modes,
+001240:             min_area=3.0, max_area=1200.0,
+001241:             around=anchor, radius=radius,
+001242:             dedup_distance=4.0,
+001243:         )
+001244: 
+001245:         clear_candidates = []
+001246:         for candidate in candidates:
+001247:             point = (int(candidate["x"]), int(candidate["y"]))
+001248:             if self._player_point_zone(point) is None:
+001249:                 clear_candidates.append(candidate)
+001250: 
+001251:         sort_anchor = predicted if predicted is not None else anchor
+001252:         clear_candidates.sort(
+001253:             key=lambda item: math.hypot(
+001254:                 float(item["x"]) - float(sort_anchor[0]),
+001255:                 float(item["y"]) - float(sort_anchor[1]),
+001256:             )
+001257:         )
+001258:         subset = clear_candidates[:128]
+001259:         scored = recovery._score(frame, current, subset) if subset else []
+001260: 
+001261:         tolerance = None
+001262:         if predicted is not None:
+001263:             tolerance = max(120.0, min(300.0, previous_speed * 1.8 + 60.0))
+001264: 
+001265:         eligible = []
+001266:         for candidate in scored:
+001267:             score = float(candidate.get("ai_score", 0.0) or 0.0)
+001268:             if score < min_score:
+001269:                 continue
+001270:             point = (int(candidate["x"]), int(candidate["y"]))
+001271:             if self._player_point_zone(point) is not None:
+001272:                 continue
+001273: 
+001274:             pred_dist = None
+001275:             cosine = None
+001276:             if predicted is not None:
+001277:                 pred_dist = math.hypot(point[0] - predicted[0], point[1] - predicted[1])
+001278:                 if pred_dist > float(tolerance):
+001279:                     continue
+001280:                 if previous_vector is not None:
+001281:                     sx = float(point[0] - anchor[0])
+001282:                     sy = float(point[1] - anchor[1])
+001283:                     step = math.hypot(sx, sy)
+001284:                     if step >= 3.0 and previous_speed >= 3.0:
+001285:                         cosine = (
+001286:                             previous_vector[0] * sx + previous_vector[1] * sy
+001287:                         ) / (previous_speed * step)
+001288:                         if cosine < -0.20:
+001289:                             continue
+001290: 
+001291:             eligible.append({
+001292:                 "candidate": candidate,
+001293:                 "point": point,
+001294:                 "score": score,
+001295:                 "pred_dist": pred_dist,
+001296:                 "cosine": cosine,
+001297:             })
+001298: 
+001299:         if predicted is None:
+001300:             eligible.sort(
+001301:                 key=lambda item: (
+001302:                     -item["score"],
+001303:                     math.hypot(item["point"][0] - anchor[0], item["point"][1] - anchor[1]),
+001304:                 )
+001305:             )
+001306:         else:
+001307:             eligible.sort(key=lambda item: (float(item["pred_dist"]), -item["score"]))
+001308: 
+001309:         for rank, item in enumerate(eligible[:5], 1):
+001310:             pd = "n/a" if item["pred_dist"] is None else f"{item['pred_dist']:.1f}"
+001311:             cs = "n/a" if item["cosine"] is None else f"{item['cosine']:.3f}"
+001312:             print(
+001313:                 f"[FORCE_LOCAL_AI_CAND] f{current} #{rank} pos={item['point']} "
+001314:                 f"ai={item['score']:.6f} pred_dist={pd} cos={cs}"
+001315:             )
+001316: 
+001317:         if not eligible:
+001318:             self.ball_center = tuple(anchor)
+001319:             self.stuck_frame_count = max(1, int(getattr(self, "stuck_frame_count", 0)) + 1)
+--- source lines 5575-5794 ---
+005575:                 upward_progress <= max(650.0, frame_height * 0.30) and
+005576:                 abs(cx - self.ball_center[0]) <= max(450.0, frame_width * 0.12) and
+005577:                 max(contour_width, contour_height) <=
+005578:                 max(3.0, min(contour_width, contour_height) * 2.6)
+005579:             )
+005580:             if player_zone in (
+005581:                     'player_head_hat', 'player_body', 'player_shoes', 'racket_fragment'):
+005582:                 # The recovery window deliberately accepts a larger ball, so
+005583:                 # compensate by refusing player pixels unless their local
+005584:                 # frame difference is unequivocally dynamic.  The exception
+005585:                 # is a compact blob launching sharply upward from a known
+005586:                 # near-player contact; frame differencing can read zero here
+005587:                 # because the preceding motion pass refreshes its reference.
+005588:                 if ((motion_mean < 16.0 or motion_max < 70.0) and
+005589:                         not near_player_launch):
+005590:                     continue
+005591:             if motion_max < 35.0 and motion_mean < 6.0 and area < 95.0:
+005592:                 continue
+005593:             if (self.ball_center is not None and motion_max < 12.0 and motion_mean < 3.5 and
+005594:                     not near_player_launch):
+005595:                 prev_dist = math.hypot(cx - self.ball_center[0], cy - self.ball_center[1])
+005596:                 last_dist = (
+005597:                     float(self.last_motion.get('distance', 0.0) or 0.0)
+005598:                     if self.last_motion is not None else 0.0
+005599:                 )
+005600:                 predicted_dist = None
+005601:                 if self.last_motion is not None:
+005602:                     predicted_x = self.ball_center[0] + float(self.last_motion.get('dx', 0.0) or 0.0)
+005603:                     predicted_y = self.ball_center[1] + float(self.last_motion.get('dy', 0.0) or 0.0)
+005604:                     predicted_dist = math.hypot(cx - predicted_x, cy - predicted_y)
+005605:                 if (
+005606:                         prev_dist > max(120.0, last_dist * 4.0) and
+005607:                         (predicted_dist is None or predicted_dist > max(90.0, last_dist * 3.0))):
+005608:                     continue
+005609: 
+005610:             frame0_hotspot = self._find_frame0_background_hotspot((cx, cy))
+005611:             if (frame0_hotspot is not None and motion_mean < 12.0 and motion_max < 55.0 and
+005612:                     not near_player_launch):
+005613:                 continue
+005614: 
+005615:             local_hsv = hsv_frame[cy, cx]
+005616:             court_center_x = frame_width * 0.43
+005617:             court_center_y = frame_height * 0.34
+005618:             score = (
+005619:                 abs(cx - court_center_x) * 0.018 +
+005620:                 abs(cy - court_center_y) * 0.030 +
+005621:                 abs(area - 135.0) * 0.12 -
+005622:                 min(90.0, motion_max * 0.24) -
+005623:                 min(55.0, motion_mean * 0.9)
+005624:             )
+005625:             if near_player_launch:
+005626:                 # At a near-player return, distinguish the outgoing ball from
+005627:                 # the residual contact smear by how far it has launched away
+005628:                 # from the racket.  This makes the real f103 ball at y~1053
+005629:                 # beat the nearer smear at y~1229.
+005630:                 score -= min(120.0, upward_progress * 0.35)
+005631:             candidates.append((score, -area, {
+005632:                 'pos': (cx, cy),
+005633:                 'area': area,
+005634:                 'hsv': local_hsv,
+005635:                 'motion_mean': motion_mean,
+005636:                 'motion_max': motion_max,
+005637:             }))
+005638: 
+005639:         if not candidates:
+005640:             return None
+005641: 
+005642:         _, _, chosen = min(candidates, key=lambda item: (item[0], item[1]))
+005643:         return chosen
+005644: 
+005645:     def _prefer_night_tight_local_ai_candidate(
+005646:             self, frame, frame_gray, proposed_candidate, previous_gray=None):
+005647:         """Prefer a model-ranked ball in a bounded causal ROI near contact.
+005648: 
+005649:         This is deliberately candidate arbitration, not broad recovery.  It
+005650:         handles both a sharp weak-motion player-region turn and a fast ball
+005651:         that stalls at a racket before launching.  Coherent normal candidates
+005652:         pass through cheaply; suspicious proposals are ranked only inside the
+005653:         small causal/predicted corridor.
+005654:         """
+005655:         recovery = getattr(self, 'local_ai_recovery', None)
+005656:         ranker = getattr(recovery, 'rank_local_roi_candidate', None)
+005657:         previous = getattr(self, 'ball_center', None)
+005658:         if (
+005659:                 recovery is None or not callable(ranker) or frame is None or
+005660:                 frame_gray is None or proposed_candidate is None or
+005661:                 previous is None):
+005662:             return proposed_candidate
+005663: 
+005664:         frame_index = int(self.frame_count)
+005665:         follow = getattr(self, '_local_ai_tight_roi_follow', None)
+005666:         if isinstance(follow, dict) and frame_index > int(follow.get('deadline', -1)):
+005667:             self._local_ai_tight_roi_follow = None
+005668:             follow = None
+005669:         follow_active = (
+005670:             isinstance(follow, dict) and
+005671:             int(follow.get('last_frame', -1)) < frame_index <=
+005672:             int(follow.get('deadline', -1))
+005673:         )
+005674: 
+005675:         prior_motion = dict(getattr(self, 'last_motion', None) or {})
+005676:         prior_dx = float(prior_motion.get('dx', 0.0) or 0.0)
+005677:         prior_dy = float(prior_motion.get('dy', 0.0) or 0.0)
+005678:         prior_speed = float(
+005679:             prior_motion.get('distance', math.hypot(prior_dx, prior_dy)) or 0.0
+005680:         )
+005681:         proposed_pos = tuple(proposed_candidate.get('pos') or previous)
+005682:         proposed_dx = float(proposed_pos[0]) - float(previous[0])
+005683:         proposed_dy = float(proposed_pos[1]) - float(previous[1])
+005684:         proposed_speed = math.hypot(proposed_dx, proposed_dy)
+005685:         proposed_mean = float(proposed_candidate.get('motion_mean', 0.0) or 0.0)
+005686:         proposed_max = float(proposed_candidate.get('motion_max', 0.0) or 0.0)
+005687:         initial_mode = 'tight_turn'
+005688:         roi_radius = 25.0
+005689:         prediction_limit = 25.0
+005690:         fast_follow = False
+005691: 
+005692:         if follow_active:
+005693:             origin = tuple(follow['last_pos'])
+005694:             follow_mode = str(follow.get('mode', 'tight_turn'))
+005695:             fast_follow = follow_mode == 'fast_contact'
+005696:             elapsed = max(1, frame_index - int(follow['last_frame']))
+005697:             if fast_follow:
+005698:                 ai_accept_count = int(follow.get('ai_accept_count', 1))
+005699:                 velocity = tuple(follow.get('velocity', (0.0, 0.0)))
+005700:                 if ai_accept_count <= 1:
+005701:                     # The first post-stall direction is unknown.  Stay tightly
+005702:                     # around contact for one frame before extrapolating.
+005703:                     anchor = origin
+005704:                     roi_radius = 32.0
+005705:                 else:
+005706:                     anchor = (
+005707:                         int(round(float(origin[0]) + float(velocity[0]) * elapsed)),
+005708:                         int(round(float(origin[1]) + float(velocity[1]) * elapsed)),
+005709:                     )
+005710:                     # The first measured launch step is shorter than the next
+005711:                     # acceleration frame; bridge that one step, then tighten.
+005712:                     roi_radius = 75.0 if ai_accept_count == 2 else 35.0
+005713:                 prediction_limit = roi_radius
+005714:             else:
+005715:                 anchor = origin
+005716:             proposal_from_anchor = math.hypot(
+005717:                 float(proposed_pos[0]) - float(origin[0]),
+005718:                 float(proposed_pos[1]) - float(origin[1]),
+005719:             )
+005720:             proposal_from_prediction = math.hypot(
+005721:                 float(proposed_pos[0]) - float(anchor[0]),
+005722:                 float(proposed_pos[1]) - float(anchor[1]),
+005723:             )
+005724:             # Once the normal tracker again supplies a strongly moving point
+005725:             # within the 25 px contact corridor, it is already the safe local
+005726:             # answer.  Keep advancing the lock without paying for another
+005727:             # model process.  A large jump (the original f4127/f4131 failure)
+005728:             # still invokes the tight ranker below.
+005729:             coherent_normal = (
+005730:                 not proposed_candidate.get('tight_roi_force_rank', False) and
+005731:                 proposal_from_prediction <= (25.0 if fast_follow else 35.0) and
+005732:                 proposed_mean >= 10.0 and proposed_max >= 50.0
+005733:             )
+005734:             if coherent_normal:
+005735:                 step_dx = (
+005736:                     float(proposed_pos[0]) - float(origin[0])
+005737:                 ) / elapsed
+005738:                 step_dy = (
+005739:                     float(proposed_pos[1]) - float(origin[1])
+005740:                 ) / elapsed
+005741:                 step_speed = math.hypot(step_dx, step_dy)
+005742:                 coherent_history = list(
+005743:                     follow.get(
+005744:                         'velocity_history',
+005745:                         getattr(self, 'ball_velocity_history', []),
+005746:                     )
+005747:                 )[-4:] + [step_speed]
+005748:                 follow['last_pos'] = tuple(proposed_pos)
+005749:                 follow['last_frame'] = frame_index
+005750:                 follow['velocity'] = (step_dx, step_dy)
+005751:                 follow['velocity_history'] = coherent_history
+005752:                 if fast_follow:
+005753:                     # Preserve the launch lock through the short high-speed
+005754:                     # flight.  It is cheap while normal tracking is coherent,
+005755:                     # and protects the later far-player/top-edge crossing.
+005756:                     follow['outside_count'] = 0
+005757:                     self._local_ai_tight_roi_follow = follow
+005758:                 else:
+005759:                     active_zones = ('player_body', 'racket_fragment')
+005760:                     outside_player = (
+005761:                         self._player_point_zone(origin) not in active_zones and
+005762:                         self._player_point_zone(proposed_pos) not in active_zones
+005763:                     )
+005764:                     follow['outside_count'] = (
+005765:                         int(follow.get('outside_count', 0)) + 1
+005766:                         if outside_player else 0
+005767:                     )
+005768:                     if int(follow['outside_count']) >= 2:
+005769:                         self._local_ai_tight_roi_follow = None
+005770:                         print(
+005771:                             f"[LOCAL_AI_TIGHT_ROI_HANDOFF] f{frame_index}: "
+005772:                             f"normal tracker exited player ROI at {proposed_pos}"
+005773:                         )
+005774:                     else:
+005775:                         self._local_ai_tight_roi_follow = follow
+005776:                 self._local_ai_tight_roi_accept_frame = frame_index
+005777:                 return proposed_candidate
+005778:             trigger = (
+005779:                 f"{follow_mode}-lock:"
+005780:                 f"{frame_index - int(follow.get('start_frame', frame_index))}f/"
+005781:                 f"normal={proposal_from_prediction:.0f}px"
+005782:             )
+005783:         else:
+005784:             height, _ = frame.shape[:2]
+005785:             prior_size = float(getattr(self, 'ball_size', 0.0) or 0.0)
+005786:             proposed_area = float(proposed_candidate.get('area', 0.0) or 0.0)
+005787:             contact_band = (
+005788:                 int(height * 0.28) <= int(previous[1]) <= int(height * 0.52)
+005789:             )
+005790:             contact_proximity = any(
+005791:                 self._point_in_player_contact_corridor(point)
+005792:                 for point in (previous, proposed_pos)
+005793:             )
+005794:             contact_stall = (
+--- source lines 6261-6480 ---
+006261:                 # even when its HSV area is only a few pixels.
+006262:                 weak_static_motion = (
+006263:                     motion is not None and motion_mean < 5.0 and motion_max < 25.0
+006264:                 )
+006265:                 if weak_static_motion and (
+006266:                         # During an established serve flight a real ball must
+006267:                         # produce local frame-to-frame change.  Previously a
+006268:                         # nearby regular-mask court highlight was allowed to
+006269:                         # survive solely because it was within 65 px, which
+006270:                         # could hand the post-contact flight to a static blob.
+006271:                         upward_flight_continuation or
+006272:                         lower_contact_flight or
+006273:                         source != 'regular' or
+006274:                         distance > 65.0
+006275:                 ):
+006276:                     continue
+006277:                 size_ratio = abs(area - previous_size) / max(previous_size, 1.0)
+006278:                 source_penalty = 0.0 if source == 'regular' else 8.0
+006279:                 score = distance + min(120.0, size_ratio * 55.0) + source_penalty
+006280:                 if lower_player_contact_approach:
+006281:                     # Make the physically predicted contact contour win over
+006282:                     # a similarly coloured racket/body fragment.
+006283:                     score -= min(55.0, max(0.0, 58.0 - contact_prediction_error))
+006284:                 candidates.append((score, -area, {
+006285:                     'pos': (cx, cy),
+006286:                     'area': area,
+006287:                     'hsv': hsv_frame[cy, cx],
+006288:                     'motion_mean': motion_mean,
+006289:                     'motion_max': motion_max,
+006290:                     'source': source,
+006291:                     'lower_contact_approach': lower_player_contact_approach,
+006292:                     'recovery_label': (
+006293:                         'NIGHT LOWER CONTACT APPROACH'
+006294:                         if lower_player_contact_approach else
+006295:                         'NIGHT STARTUP REGULAR RECOVER'
+006296:                     ),
+006297:                 }))
+006298:         if not candidates:
+006299:             return None
+006300:         # A player/racket mask can produce a second candidate only a few
+006301:         # pixels from the ball (notably during the serve follow-through).  The
+006302:         # regular court mask is the calibrated ball mask; the relaxed masks
+006303:         # are useful only when the regular mask has no viable contour.  Prefer
+006304:         # a regular candidate in the local continuity window instead of
+006305:         # letting a larger yellow racket/body patch win on area alone.
+006306:         local_cap = max(70.0, min(130.0, last_distance * 1.5 + 45.0))
+006307:         if upward_flight_continuation:
+006308:             # Permit the one remaining long perspective step in a verified
+006309:             # upper-flight.  The forward-progress gate above still rejects
+006310:             # static blobs that happen to be closer to the prior position.
+006311:             local_cap = max(local_cap, min(165.0, last_distance * 1.85 + 45.0))
+006312:         local_candidates = [item for item in candidates if item[2]['pos'] and
+006313:                             math.hypot(item[2]['pos'][0] - previous[0], item[2]['pos'][1] - previous[1]) <= local_cap]
+006314:         if local_candidates:
+006315:             regular_local = [
+006316:                 item for item in local_candidates
+006317:                 if item[2].get('source') == 'regular'
+006318:             ]
+006319:             if regular_local:
+006320:                 local_candidates = regular_local
+006321:             _, _, chosen = min(
+006322:                 local_candidates,
+006323:                 key=lambda item: (
+006324:                     item[0],
+006325:                     -item[2]['motion_mean'],
+006326:                     -item[2]['area'],
+006327:                 ),
+006328:             )
+006329:         else:
+006330:             _, _, chosen = min(candidates, key=lambda item: (item[0], item[1]))
+006331:         return self._prefer_night_tight_local_ai_candidate(
+006332:             frame, frame_gray, chosen
+006333:         )
+006334: 
+006335:     def _find_night_lower_contact_launch_candidate(
+006336:             self, frame, frame_gray, lower_contact_launch_context
+006337:     ):
+006338:         """Find the first upward ball after a verified lower-player contact.
+006339: 
+006340:         This is deliberately a short-lived, trajectory-only recovery.  It
+006341:         runs after the incoming ball has been accepted in the racket/player
+006342:         overlap and before the broad HSV scorer can replace the real launch
+006343:         with a nearby shoe or shirt contour.
+006344:         """
+006345:         if (
+006346:                 not self._is_night_session_config() or frame is None or
+006347:                 lower_contact_launch_context is None or self.ball_center is None
+006348:         ):
+006349:             return None
+006350: 
+006351:         hsv_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+006352:         specs = []
+006353:         if self.hsv_regular is not None:
+006354:             specs.append(('regular', self.hsv_regular['lower'], self.hsv_regular['upper']))
+006355:         if self.h10_hsv_lower is not None and self.h10_hsv_upper is not None:
+006356:             specs.append(('h_10', self.h10_hsv_lower, self.h10_hsv_upper))
+006357:         if self.s30_hsv_lower is not None and self.s30_hsv_upper is not None:
+006358:             specs.append(('s_30', self.s30_hsv_lower, self.s30_hsv_upper))
+006359:         if not specs:
+006360:             return None
+006361: 
+006362:         candidates = []
+006363:         kernel = np.ones((2, 2), np.uint8)
+006364:         for source, lower, upper in specs:
+006365:             mask = cv2.inRange(hsv_frame, lower, upper)
+006366:             mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+006367:             mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+006368:             contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+006369:             for contour in contours:
+006370:                 area = float(cv2.contourArea(contour))
+006371:                 if area < 8.0 or area > 1800.0:
+006372:                     continue
+006373:                 moments = cv2.moments(contour)
+006374:                 if moments['m00'] == 0:
+006375:                     continue
+006376:                 cx = int(moments['m10'] / moments['m00'])
+006377:                 cy = int(moments['m01'] / moments['m00'])
+006378:                 _, _, width, height = cv2.boundingRect(contour)
+006379:                 if (
+006380:                         height >= max(36, width * 3.0) or
+006381:                         width >= max(36, height * 3.0)
+006382:                 ):
+006383:                     continue
+006384:                 if not self._lower_contact_launch_candidate_ok(
+006385:                         (cx, cy), area, lower_contact_launch_context, frame.shape
+006386:                 ):
+006387:                     continue
+006388:                 motion = self._candidate_motion_metrics(frame_gray, cx, cy)
+006389:                 motion_mean = float(motion.get('mean', 0.0) or 0.0) if motion else 0.0
+006390:                 motion_max = float(motion.get('max', 0.0) or 0.0) if motion else 0.0
+006391:                 expected_x, expected_y = lower_contact_launch_context['expected']
+006392:                 expected_distance = math.hypot(cx - expected_x, cy - expected_y)
+006393:                 candidates.append((
+006394:                     expected_distance + (0.0 if source == 'regular' else 8.0),
+006395:                     -motion_max,
+006396:                     -area,
+006397:                     {
+006398:                         'pos': (cx, cy),
+006399:                         'area': area,
+006400:                         'hsv': hsv_frame[cy, cx],
+006401:                         'motion_mean': motion_mean,
+006402:                         'motion_max': motion_max,
+006403:                         'source': source,
+006404:                         'recovery_label': 'NIGHT LOWER CONTACT LAUNCH',
+006405:                     },
+006406:                 ))
+006407:         if not candidates:
+006408:             return None
+006409:         return min(candidates, key=lambda item: item[:3])[3]
+006410: 
+006411:     def _find_night_contact_outbound_continuation(self, frame, frame_gray):
+006412:         """Follow the first upward frames after a verified lower-player hit."""
+006413:         if (
+006414:                 not self._is_night_session_config() or frame is None or
+006415:                 self.ball_center is None or self.last_motion is None or
+006416:                 int(getattr(self, '_rally_contact_grace_frames', 0)) <= 0
+006417:         ):
+006418:             return None
+006419: 
+006420:         dx = float(self.last_motion.get('dx', 0.0) or 0.0)
+006421:         dy = float(self.last_motion.get('dy', 0.0) or 0.0)
+006422:         speed = float(self.last_motion.get('distance', 0.0) or 0.0)
+006423:         if dy >= -max(45.0, frame.shape[0] * 0.020) or speed < 60.0:
+006424:             return None
+006425:         expected = (self.ball_center[0] + dx, self.ball_center[1] + dy)
+006426:         max_prediction_error = max(110.0, min(180.0, speed * 0.95))
+006427:         hsv_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+006428:         specs = []
+006429:         if self.hsv_regular is not None:
+006430:             specs.append(('regular', self.hsv_regular['lower'], self.hsv_regular['upper']))
+006431:         if self.h10_hsv_lower is not None and self.h10_hsv_upper is not None:
+006432:             specs.append(('h_10', self.h10_hsv_lower, self.h10_hsv_upper))
+006433:         if self.s30_hsv_lower is not None and self.s30_hsv_upper is not None:
+006434:             specs.append(('s_30', self.s30_hsv_lower, self.s30_hsv_upper))
+006435: 
+006436:         kernel = np.ones((2, 2), np.uint8)
+006437:         candidates = []
+006438:         nearby_debug = []
+006439:         for source, lower, upper in specs:
+006440:             mask = cv2.inRange(hsv_frame, lower, upper)
+006441:             mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+006442:             mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+006443:             contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+006444:             for contour in contours:
+006445:                 area = float(cv2.contourArea(contour))
+006446:                 if area < 8.0 or area > 1800.0:
+006447:                     continue
+006448:                 moments = cv2.moments(contour)
+006449:                 if moments['m00'] == 0:
+006450:                     continue
+006451:                 cx = int(moments['m10'] / moments['m00'])
+006452:                 cy = int(moments['m01'] / moments['m00'])
+006453:                 _, _, width, height = cv2.boundingRect(contour)
+006454:                 if (
+006455:                         height >= max(36, width * 3.0) or
+006456:                         width >= max(36, height * 3.0) or
+006457:                         cy >= self.ball_center[1] - 20
+006458:                 ):
+006459:                     continue
+006460:                 prediction_error = math.hypot(cx - expected[0], cy - expected[1])
+006461:                 if prediction_error > max_prediction_error:
+006462:                     continue
+006463:                 player_zone = self._player_point_zone((cx, cy))
+006464:                 nearby_debug.append(
+006465:                     f"{source}@({cx},{cy}) a={area:.1f} err={prediction_error:.1f} "
+006466:                     f"zone={player_zone or 'none'}"
+006467:                 )
+006468:                 # The first upward frame is still inside the lower player's
+006469:                 # conservative bbox.  Keep it only when the calibrated
+006470:                 # regular mask is tightly on the post-contact prediction;
+006471:                 # all other player-zone fragments remain excluded.
+006472:                 if player_zone is not None and not (
+006473:                         source == 'regular' and
+006474:                         prediction_error <= min(65.0, max_prediction_error * 0.55) and
+006475:                         area >= 40.0
+006476:                 ):
+006477:                     continue
+006478:                 motion = self._candidate_motion_metrics(frame_gray, cx, cy)
+006479:                 motion_mean = float(motion.get('mean', 0.0) or 0.0) if motion else 0.0
+006480:                 motion_max = float(motion.get('max', 0.0) or 0.0) if motion else 0.0
+--- source lines 6498-6717 ---
+006498:                 # f179 (692,1173), f180 (759,1043), f181 (827,925), and
+006499:                 # f182 (891,819).  The former line-overlap escape admitted a
+006500:                 # tiny alternate-HSV contour instead and the tracker lagged
+006501:                 # behind the visible ball.  Admit the large *regular* blob
+006502:                 # only when it is very close to the physical post-contact
+006503:                 # prediction; the four-frame grace window and shape/player
+006504:                 # gates above keep this from becoming a general static-artifact
+006505:                 # exception.
+006506:                 tight_regular_contact_continuation = (
+006507:                     source == 'regular' and
+006508:                     area >= 100.0 and
+006509:                     prediction_error <= max_prediction_error
+006510:                 )
+006511:                 if (
+006512:                         motion is not None and motion_mean < 4.0 and
+006513:                         motion_max < 22.0 and not (
+006514:                             line_overlap_continuation or
+006515:                             tight_regular_contact_continuation
+006516:                         )
+006517:                 ):
+006518:                     continue
+006519:                 # The first decoded frame after a racket hit can be delayed
+006520:                 # relative to the last compact launch blob, so a sizeable
+006521:                 # regular candidate may be 80-110 px past a simple
+006522:                 # constant-velocity prediction.  Its size/shape is stronger
+006523:                 # evidence than a tiny line fragment which happens to be
+006524:                 # nearer to that stale prediction.  Apply this preference
+006525:                 # only to the explicit four-frame post-contact continuation.
+006526:                 continuation_score = prediction_error + (
+006527:                     0.0 if source == 'regular' else 7.0
+006528:                 )
+006529:                 if tight_regular_contact_continuation:
+006530:                     continuation_score -= min(90.0, area * 0.20)
+006531:                 candidates.append((
+006532:                     continuation_score,
+006533:                     -motion_max,
+006534:                     -area,
+006535:                     {
+006536:                         'pos': (cx, cy), 'area': area, 'hsv': hsv_frame[cy, cx],
+006537:                         'motion_mean': motion_mean, 'motion_max': motion_max,
+006538:                         'source': source,
+006539:                         'recovery_label': 'NIGHT LOWER CONTACT CONTINUATION',
+006540:                     },
+006541:                 ))
+006542:         if not candidates:
+006543:             print(
+006544:                 f"Frame {self.frame_count}: [LOWER-HIT OUTBOUND MISS] "
+006545:                 f"expected=({expected[0]:.0f},{expected[1]:.0f}) "
+006546:                 f"nearby={' | '.join(nearby_debug[:8]) or 'none'}"
+006547:             )
+006548:             return None
+006549:         # This helper returns before the normal grace-window decrement below.
+006550:         # Consume one frame here so a good contact continuation cannot extend
+006551:         # the special relaxed rules indefinitely into unrelated court blobs.
+006552:         self._rally_contact_grace_frames = max(
+006553:             0, int(getattr(self, '_rally_contact_grace_frames', 0)) - 1
+006554:         )
+006555:         return min(candidates, key=lambda item: item[:3])[3]
+006556: 
+006557:     def _commit_night_visible_ball_recovery(self, candidate, frame):
+006558:         # Some visible-ball recovery paths (notably player-reacquisition) jump
+006559:         # directly here and bypass the startup candidate arbiter.  Reuse the
+006560:         # same pre-commit tight-ROI guard so an active near-player lock can
+006561:         # reject that jump before it mutates motion/contact state.
+006562:         if (
+006563:                 frame is not None and
+006564:                 candidate.get('source') != 'local_ai_tight_roi' and
+006565:                 int(getattr(self, '_local_ai_tight_roi_attempt_frame', -1000000)) !=
+006566:                 int(self.frame_count)):
+006567:             commit_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+006568:             candidate = self._prefer_night_tight_local_ai_candidate(
+006569:                 frame, commit_gray, candidate
+006570:             )
+006571:         prev_pos = self.ball_center
+006572:         new_pos = candidate['pos']
+006573:         self.ball_center = new_pos
+006574:         self.ball_hsv = candidate['hsv']
+006575:         self.ball_size = candidate['area']
+006576:         self._update_recovered_motion(prev_pos, new_pos)
+006577:         motion_override = candidate.get('local_ai_motion_override')
+006578:         if isinstance(motion_override, dict):
+006579:             self.last_motion = dict(motion_override)
+006580:             self.last_delta = (
+006581:                 float(motion_override.get('dx', 0.0) or 0.0),
+006582:                 float(motion_override.get('dy', 0.0) or 0.0),
+006583:             )
+006584:             self.last_direction = float(
+006585:                 motion_override.get('direction_deg', 0.0) or 0.0
+006586:             )
+006587:             velocity_history = candidate.get('local_ai_velocity_history')
+006588:             if isinstance(velocity_history, list):
+006589:                 self.ball_velocity_history = list(velocity_history)[-5:]
+006590:             if float(motion_override.get('distance', 0.0) or 0.0) > 0.0:
+006591:                 self.last_nonzero_motion = dict(motion_override)
+006592:         self.stuck_frame_count = 0
+006593:         # Short grace period for a player/racket pixel held during occlusion.
+006594:         self._player_occlusion_hold_frames = 0
+006595:         self.direction_change_streak = 0
+006596:         self._post_reacq_frames = max(getattr(self, '_post_reacq_frames', 0), 3)
+006597:         self._last_motion_reacq_frame = self.frame_count
+006598:         self.last_seen_frame = self.frame_count
+006599:         self._last_tracked_candidate_frame = self.frame_count
+006600:         self._last_tracked_candidate_motion_frame = self.frame_count
+006601:         self._last_tracked_candidate_motion_mean = float(candidate.get('motion_mean', 0.0) or 0.0)
+006602:         self._last_tracked_candidate_motion_max = float(candidate.get('motion_max', 0.0) or 0.0)
+006603:         if candidate.get('source') == 'local_ai_tight_roi':
+006604:             self._local_ai_recovery_count = int(
+006605:                 getattr(self, '_local_ai_recovery_count', 0)
+006606:             ) + 1
+006607:             # Suppress broad local-AI replay and endpoint inference only for
+006608:             # this already-verified frame.  The dedicated one-frame ROI state
+006609:             # independently handles the adjacent confirmation frame.
+006610:             self._local_ai_follow_until_frame = max(
+006611:                 int(getattr(self, '_local_ai_follow_until_frame', -1)),
+006612:                 int(self.frame_count),
+006613:             )
+006614:             self._pending_rally_end_reason = None
+006615:             self._pending_rally_end_frame = -1
+006616:         self._activate_regular_hsv()
+006617:         if candidate.get('lower_contact_approach', False):
+006618:             # Keep a tightly bounded launch prediction for the frame after
+006619:             # the incoming ball overlaps the player's racket.
+006620:             launch_context = self._get_lower_contact_launch_context(frame.shape)
+006621:             if launch_context is not None:
+006622:                 self._pending_lower_contact_launch_context = launch_context
+006623:                 self._pending_lower_contact_launch_until_frame = self.frame_count + 3
+006624:         elif candidate.get('recovery_label') == 'NIGHT LOWER CONTACT LAUNCH':
+006625:             # The launch is now verified; allow its fast upward continuation
+006626:             # through the normal tracker without retaining the contact window.
+006627:             self._pending_lower_contact_launch_context = None
+006628:             self._pending_lower_contact_launch_until_frame = -1000000
+006629:             self._rally_contact_grace_frames = max(
+006630:                 getattr(self, '_rally_contact_grace_frames', 0), 4
+006631:             )
+006632:             self._rally_contact_origin = prev_pos
+006633:             self._rally_contact_expected = new_pos
+006634:         if frame is not None:
+006635:             self._prev_frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+006636:         recovery_label = candidate.get('recovery_label', 'NIGHT VISIBLE BALL RECOVER')
+006637:         print(
+006638:             f"Frame {self.frame_count}: [{recovery_label}] Ball at {new_pos} "
+006639:             f"area={candidate['area']:.1f}px motion="
+006640:             f"{candidate.get('motion_mean', 0.0):.1f}/{candidate.get('motion_max', 0.0):.1f}"
+006641:         )
+006642:         return self.ball_center
+006643: 
+006644:     def _player_reacq_static_candidate(self, candidate, predicted_point=None):
+006645:         """Return True for a static blob that is unsafe just after player reacq.
+006646: 
+006647:         A real ball immediately following an occlusion should have either local
+006648:         frame motion or a position consistent with the predicted flight path.
+006649:         Static yellow/green patches (often racket or court artifacts) should not
+006650:         be allowed to become the new ball center merely because their area looks
+006651:         like the ball.
+006652:         """
+006653:         if self.frame_count > int(getattr(self, '_player_reacq_protect_until_frame', -1)):
+006654:             return False
+006655:         if not candidate:
+006656:             return False
+006657:         motion_mean = float(candidate.get('motion_mean', 0.0) or 0.0)
+006658:         motion_max = float(candidate.get('motion_max', 0.0) or 0.0)
+006659:         if motion_mean >= 6.0 or motion_max >= 25.0:
+006660:             return False
+006661:         pos = candidate.get('pos')
+006662:         if pos is None or self.ball_center is None:
+006663:             return False
+006664:         prev_distance = math.hypot(pos[0] - self.ball_center[0], pos[1] - self.ball_center[1])
+006665:         predicted_distance = (
+006666:             math.hypot(pos[0] - predicted_point[0], pos[1] - predicted_point[1])
+006667:             if predicted_point is not None else prev_distance
+006668:         )
+006669:         # Keep a static candidate only when it is essentially on the predicted
+006670:         # path; a distant static blob is an artifact even if its area is large.
+006671:         return prev_distance > 100.0 and predicted_distance > 90.0
+006672: 
+006673:     def _night_stuck_player_artifact_candidate(
+006674:             self, position, motion_mean, motion_max, distance):
+006675:         """Reject a static player/body contour during a stuck re-acquisition.
+006676: 
+006677:         Candidate scoring already penalizes player regions, but if every real
+006678:         ball contour is temporarily occluded the penalized body contour can
+006679:         still be the only candidate and therefore win.  A genuine ball that
+006680:         reappears after contact has local frame motion; the f97 neck/body
+006681:         takeover has none and is more than 500 px from the last ball.
+006682:         """
+006683:         if not self._is_night_session_config() or position is None:
+006684:             return False
+006685:         zone = self._player_point_zone(position)
+006686:         if zone not in (
+006687:                 'player_head_hat', 'player_body', 'player_shoes', 'racket_fragment'):
+006688:             return False
+006689:         return (
+006690:             float(distance or 0.0) > 120.0 and
+006691:             float(motion_mean or 0.0) < 6.0 and
+006692:             float(motion_max or 0.0) < 25.0
+006693:         )
+006694: 
+006695:     def _collect_override_candidate_metrics(self, pos, area, prev_pos, predicted_point, frame_gray):
+006696:         motion_metrics = self._candidate_motion_metrics(frame_gray, pos[0], pos[1])
+006697:         motion_mean = motion_metrics['mean'] if motion_metrics is not None else 0.0
+006698:         motion_max = motion_metrics['max'] if motion_metrics is not None else 0.0
+006699:         prev_distance = math.hypot(pos[0] - prev_pos[0], pos[1] - prev_pos[1]) if prev_pos is not None else 0.0
+006700:         predicted_distance = (
+006701:             math.hypot(pos[0] - predicted_point[0], pos[1] - predicted_point[1])
+006702:             if predicted_point is not None else None
+006703:         )
+006704:         frame0_hotspot = self._find_frame0_background_hotspot(pos)
+006705:         static_hotspot = (
+006706:             (area <= 3 and motion_mean < 1.0 and motion_max <= 5.0) or
+006707:             (pos[1] < 100 and motion_mean < 2.5 and motion_max < 10.0)
+006708:         )
+006709:         frame0_background = (
+006710:             frame0_hotspot is not None and
+006711:             (motion_metrics is None or (motion_mean < 8.0 and motion_max < 35.0))
+006712:         )
+006713:         return {
+006714:             'motion_mean': motion_mean,
+006715:             'motion_max': motion_max,
+006716:             'prev_distance': prev_distance,
+006717:             'predicted_distance': predicted_distance,
+
+========================================================================================
+NEEDLE: def _snapshot
+========================================================================================
+--- source lines 921-1140 ---
+000921:                 tracked_position is None or
+000922:                 (handoff_step is not None and handoff_step <= 2.5) or
+000923:                 int(getattr(self, "stuck_frame_count", 0) or 0) > int(previous_stuck or 0)
+000924:             )
+000925:             if handoff_held and previous_position is not None:
+000926:                 print(
+000927:                     f"[LOCAL_AI_HANDOFF_STALL] f{self.frame_count}: "
+000928:                     f"prev={previous_position} tracked={tracked_position} "
+000929:                     f"step={handoff_step if handoff_step is not None else 'missing'} "
+000930:                     f"stuck={int(getattr(self, 'stuck_frame_count', 0) or 0)}"
+000931:                 )
+000932:                 return "player-region:handoff-stall"
+000933:             return None
+000934:         if not self.local_ai_recovery.ready(self.frame_count):
+000935:             return None
+000936:         # A rise/fall sequence at the far baseline is only a *candidate*
+000937:         # serve.  Before we accept or reject it, ask the local model to replay
+000938:         # the nearby raw frames if HSV selects a large discontinuity.  This
+000939:         # prevents one shirt/racket contour from deciding whether a practice
+000940:         # toss (f7917) or the following real serve is a point.
+000941:         if (
+000942:                 getattr(self, "_provisional_serve_start_kind", None) is not None and
+000943:                 previous_position is not None and tracked_position is not None):
+000944:             provisional_jump = math.hypot(
+000945:                 float(tracked_position[0]) - float(previous_position[0]),
+000946:                 float(tracked_position[1]) - float(previous_position[1]),
+000947:             )
+000948:             if provisional_jump >= 55.0:
+000949:                 return f"provisional-serve-jump:{provisional_jump:.0f}px"
+000950:         if tracked_position is not None:
+000951:             if previous_position is not None:
+000952:                 jump = math.hypot(
+000953:                     float(tracked_position[0]) - float(previous_position[0]),
+000954:                     float(tracked_position[1]) - float(previous_position[1]),
+000955:                 )
+000956:                 # General form of the provisional-serve protection.  A ball
+000957:                 # cannot both jump to a new location and have an unchanged
+000958:                 # image patch there.  Ask local AI first; if it cannot form a
+000959:                 # path, the next-frame persistence guard decides whether the
+000960:                 # blob is a static artifact.  Keep this below 600px so it
+000961:                 # covers the common false court/net points without changing
+000962:                 # the deliberately separate extreme-jump recovery path.
+000963:                 static_metrics_current_frame = (
+000964:                     int(getattr(self, "_last_tracked_candidate_motion_frame", -1)) ==
+000965:                     int(self.frame_count)
+000966:                 )
+000967:                 if (
+000968:                         55.0 <= jump <= 600.0 and static_metrics_current_frame and
+000969:                         float(getattr(self, "_last_tracked_candidate_motion_mean", 0.0) or 0.0) < 5.0 and
+000970:                         float(getattr(self, "_last_tracked_candidate_motion_max", 0.0) or 0.0) < 25.0):
+000971:                     return f"static-candidate-jump:{jump:.0f}px"
+000972:             zone = self._player_point_zone(tracked_position)
+000973:             # Shoes and small head fragments appear often during ordinary
+000974:             # play.  They are already penalized by the normal tracker; do not
+000975:             # pay the recovery cost unless the failure is a body/racket
+000976:             # takeover, where a ball can genuinely disappear behind a player.
+000977:             if zone in ("player_body", "racket_fragment"):
+000978:                 return f"player-region:{zone}"
+000979:             if previous_position is not None:
+000980:                 if jump > 600.0:
+000981:                     return f"untrusted-jump:{jump:.0f}px"
+000982:         if tracked_position is None and int(previous_stuck) >= 3:
+000983:             return "missing-after-stuck"
+000984:         if (
+000985:             tracked_position is not None and previous_position is not None and
+000986:             tuple(tracked_position) == tuple(previous_position) and int(previous_stuck) >= 3
+000987:         ):
+000988:             return "held-position"
+000989:         return None
+000990: 
+000991:     def _snapshot_tracking_state_for_provisional_guard(self):
+000992:         """Save only live tracking fields that a rejected contour can poison."""
+000993:         def clone(value):
+000994:             if isinstance(value, np.ndarray):
+000995:                 return value.copy()
+000996:             if isinstance(value, dict):
+000997:                 return dict(value)
+000998:             if isinstance(value, list):
+000999:                 return list(value)
+001000:             return value
+001001: 
+001002:         fields = (
+001003:             "ball_center", "ball_size", "ball_hsv", "last_motion", "prev_motion",
+001004:             "last_nonzero_motion", "last_delta", "last_direction",
+001005:             "ball_velocity_history", "last_seen_frame", "stuck_frame_count",
+001006:             "near_edge", "focus_loss_active", "focus_loss_frame",
+001007:             "_focus_loss_guard_until_frame", "_recent_max_ball_size",
+001008:             "_prev_frame_gray", "_last_tracked_candidate_motion_frame",
+001009:             "_last_tracked_candidate_motion_mean", "_last_tracked_candidate_motion_max",
+001010:         )
+001011:         return {
+001012:             field: clone(getattr(self, field))
+001013:             for field in fields
+001014:             if hasattr(self, field)
+001015:         }
+001016: 
+001017:     def _restore_tracking_state_for_provisional_guard(self, snapshot):
+001018:         if not snapshot:
+001019:             return
+001020:         for field, value in snapshot.items():
+001021:             setattr(self, field, value)
+001022: 
+001023:     def _static_blob_near(self, image, position, radius=14):
+001024:         """Find a compact HSV blob near ``position`` in one raw frame.
+001025: 
+001026:         It is deliberately a local confirmation tool, not a second tracker:
+001027:         this only decides whether a rejected *provisional serve* blob stayed
+001028:         in the same screen location for an adjacent frame.
+001029:         """
+001030:         if image is None or position is None:
+001031:             return None
+001032:         try:
+001033:             hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+001034:         except cv2.error:
+001035:             return None
+001036: 
+001037:         x, y = int(position[0]), int(position[1])
+001038:         height, width = hsv.shape[:2]
+001039:         x1, y1 = max(0, x - radius), max(0, y - radius)
+001040:         x2, y2 = min(width, x + radius + 1), min(height, y + radius + 1)
+001041:         if x2 <= x1 or y2 <= y1:
+001042:             return None
+001043: 
+001044:         specs = []
+001045:         if self.hsv_lower is not None and self.hsv_upper is not None:
+001046:             specs.append((self.hsv_lower, self.hsv_upper))
+001047:         regular = getattr(self, "hsv_regular", None)
+001048:         if regular is not None:
+001049:             specs.append((regular["lower"], regular["upper"]))
+001050: 
+001051:         best = None
+001052:         for lower, upper in specs:
+001053:             mask = cv2.inRange(hsv[y1:y2, x1:x2], lower, upper)
+001054:             contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+001055:             for contour in contours:
+001056:                 area = float(cv2.contourArea(contour))
+001057:                 if area < 0.5 or area > 80.0:
+001058:                     continue
+001059:                 moments = cv2.moments(contour)
+001060:                 if moments["m00"] == 0:
+001061:                     continue
+001062:                 cx = x1 + float(moments["m10"] / moments["m00"])
+001063:                 cy = y1 + float(moments["m01"] / moments["m00"])
+001064:                 distance = math.hypot(cx - x, cy - y)
+001065:                 if distance > radius:
+001066:                     continue
+001067:                 candidate = {"pos": (cx, cy), "area": area, "distance": distance}
+001068:                 if best is None or candidate["distance"] < best["distance"]:
+001069:                     best = candidate
+001070:         return best
+001071: 
+001072:     def _finalize_pending_provisional_static_candidate(self):
+001073:         """Use the next raw frame to confirm/reject a provisional static blob."""
+001074:         pending = getattr(self, "_pending_provisional_static_candidate", None)
+001075:         if not pending:
+001076:             return False
+001077:         pending_frame = int(pending.get("frame", -1))
+001078:         if self.frame_count <= pending_frame:
+001079:             return False
+001080:         # The guard is one-frame only.  An interrupted/seeked decode must not
+001081:         # turn this into a global false-point rule.
+001082:         self._pending_provisional_static_candidate = None
+001083:         if self.frame_count != pending_frame + 1:
+001084:             return False
+001085: 
+001086:         raw_frames = list(getattr(self, "_local_ai_frame_buffer", []))
+001087:         current = raw_frames[-1].get("image") if raw_frames else None
+001088:         now_blob = self._static_blob_near(current, pending["pos"])
+001089:         if now_blob is None:
+001090:             print(
+001091:                 f"[PROVISIONAL_STATIC_GUARD] f{self.frame_count}: "
+001092:                 f"candidate {pending['pos']} did not persist; no ignore"
+001093:             )
+001094:             return False
+001095: 
+001096:         prior_blob = pending.get("blob")
+001097:         prior_pos = prior_blob.get("pos") if prior_blob else pending["pos"]
+001098:         displacement = math.hypot(
+001099:             now_blob["pos"][0] - prior_pos[0], now_blob["pos"][1] - prior_pos[1]
+001100:         )
+001101:         if displacement <= 10.0:
+001102:             # A three-sample rule in practice: the candidate was already
+001103:             # measured as static against the prior frame, and it now survives
+001104:             # at the same position in the following frame.  Restrict the
+001105:             # ignore to a few frames so a later live ball remains eligible.
+001106:             self._learn_ignored_tracking_position(
+001107:                 pending["pos"], radius=18, ttl=4,
+001108:                 reason="provisional three-frame static artifact",
+001109:             )
+001110:             self._last_static_guard_position = tuple(pending["pos"])
+001111:             print(
+001112:                 f"[PROVISIONAL_STATIC_GUARD] f{self.frame_count}: "
+001113:                 f"rejected persistent blob {pending['pos']} "
+001114:                 f"delta={displacement:.1f}px"
+001115:             )
+001116:             return True
+001117:         else:
+001118:             print(
+001119:                 f"[PROVISIONAL_STATIC_GUARD] f{self.frame_count}: "
+001120:                 f"candidate moved {displacement:.1f}px; no ignore"
+001121:             )
+001122:         return False
+001123: 
+001124:     def _try_active_tight_local_ai_hold(
+001125:             self, frame, tracked_position, previous_gray=None):
+001126:         """Advance an active contact ROI when normal tracking only holds.
+001127: 
+001128:         Player-occlusion branches can return the previous marker without
+001129:         reaching any candidate-commit hook.  During the bounded tight-ROI
+001130:         contact lock, rank that small area directly instead of waiting five
+001131:         frames for a broad full-frame reacquisition.
+001132:         """
+001133:         follow = getattr(self, '_local_ai_tight_roi_follow', None)
+001134:         if (
+001135:                 not isinstance(follow, dict) or frame is None or
+001136:                 int(self.frame_count) > int(follow.get('deadline', -1)) or
+001137:                 int(self.frame_count) <= int(follow.get('last_frame', -1)) or
+001138:                 int(getattr(self, 'stuck_frame_count', 0)) < 3):
+001139:             return None
+001140: 
+
+========================================================================================
+NEEDLE: pre_track_snapshot =
+========================================================================================
+--- source lines 24927-25146 ---
+024927:                             stale_player_timeout_hold or
+024928:                             (timeout_hold and dur <= hard_timeout)):
+024929:                         if top_timeout_hold or back_timeout_hold:
+024930:                             print(f"Frame {self.frame_count}: delaying point timeout while waiting for offscreen return")
+024931:                         elif recent_contact_timeout_hold:
+024932:                             print(
+024933:                                 f"Frame {self.frame_count}: [POST-CONTACT TIMEOUT HOLD] "
+024934:                                 f"deferring point timeout {contact_age}f after racket contact "
+024935:                                 f"at f{last_contact_frame}"
+024936:                             )
+024937:                         elif stale_player_timeout_hold:
+024938:                             print(
+024939:                                 f"Frame {self.frame_count}: [STALE-PLAYER TIMEOUT HOLD] "
+024940:                                 f"deferring unresolved timeout at {self.ball_center} "
+024941:                                 f"zone={timeout_marker_zone} stuck={self.stuck_frame_count}"
+024942:                             )
+024943:                         elif recent_bounce_hold:
+024944:                             last_bounce_frame = getattr(self, '_recent_return_bounce_recover_frame', self.frame_count)
+024945:                             frames_since_bounce = max(0, self.frame_count - last_bounce_frame)
+024946:                             print(
+024947:                                 f"Frame {self.frame_count}: delaying point timeout after recent bounce recover "
+024948:                                 f"({frames_since_bounce}f ago)"
+024949:                             )
+024950:                         elif recent_return_hold:
+024951:                             last_return_frame = getattr(self, '_recent_offscreen_return_frame', self.frame_count)
+024952:                             frames_since_return = max(0, self.frame_count - last_return_frame)
+024953:                             print(
+024954:                                 f"Frame {self.frame_count}: delaying point timeout after recent offscreen return "
+024955:                                 f"re-entry ({frames_since_return}f ago)"
+024956:                             )
+024957:                         else:
+024958:                             print(
+024959:                                 f"Frame {self.frame_count}: delaying point timeout while ball is still actively tracked "
+024960:                                 f"(seen {frames_since_seen}f ago, motion={last_motion_distance:.1f}px)"
+024961:                             )
+024962:                     else:
+024963:                         if self._ignore_unresolved_timeout_if_game_decider(
+024964:                             "POINT_TIMEOUT", end_position=self.ball_center, frame=frame
+024965:                         ):
+024966:                             print(
+024967:                                 f"[POINT_IGNORED] f{self.frame_count}: reason=POINT_TIMEOUT "
+024968:                                 f"duration={dur}f would decide game without a located ball"
+024969:                             )
+024970:                         else:
+024971:                             timeout_reason = "POINT_TIMEOUT"
+024972:                             if self._in_court_timeout_landing_outcome(self.ball_center, frame) is not None:
+024973:                                 timeout_reason = "Ball stopped on player side"
+024974:                             # A duration timeout is only a fallback inference.  The
+024975:                             # terminal verifier can still see a compact moving ball
+024976:                             # in the just-decoded frame pair; continue the rally
+024977:                             # rather than scoring a false timeout in that case.
+024978:                             if self._resume_from_terminal_motion_candidate(
+024979:                                 timeout_reason, self.ball_center, frame=frame
+024980:                             ):
+024981:                                 continue
+024982:                             print(
+024983:                                 f"[POINT_END] f{self.frame_count}: reason={timeout_reason} "
+024984:                                 f"duration={dur}f — returning to serve detection"
+024985:                             )
+024986:                             self._record_point_result(timeout_reason, end_position=self.ball_center, frame=frame)
+024987:                         game_state = "WAITING_FOR_SERVE"
+024988:                         reset_tracking_state(hold_end_marker=True)
+024989: 
+024990:                 # Track ball through the point
+024991:                 tracked_position = None
+024992:                 if self.tracking and self.hsv_lower is not None and self.ball_center is not None:
+024993:                     prev_ball_center = self.ball_center
+024994:                     prev_stuck = self.stuck_frame_count
+024995:                     prev_top_return_wait = self._top_return_wait_active()
+024996:                     prev_back_return_wait = self._back_return_wait_active()
+024997:                     pre_track_snapshot = self._snapshot_tracking_state_for_provisional_guard()
+024998:                     self._local_ai_tight_roi_previous_gray = (
+024999:                         pre_track_snapshot.get('_prev_frame_gray')
+025000:                     )
+025001:                     forced_local_ai = False
+025002:                     tracked_position = self._force_local_ai_frame(frame, prev_ball_center)
+025003:                     if tracked_position is not None:
+025004:                         forced_local_ai = True
+025005:                     else:
+025006:                         tracked_position = self.track_ball_in_frame(frame)
+025007:                     if self.local_ai_recovery is not None and self._local_ai_frame_buffer:
+025008:                         self._local_ai_frame_buffer[-1]["normal_position"] = (
+025009:                             tuple(tracked_position) if tracked_position is not None else None
+025010:                         )
+025011:                     self._debug_local_ai_shadow_frame(frame, prev_ball_center, tracked_position)
+025012:                     if not forced_local_ai:
+025013:                         tracked_position = self._try_local_ai_recovery(
+025014:                             prev_ball_center, tracked_position, prev_stuck,
+025015:                             pre_track_snapshot=pre_track_snapshot,
+025016:                             frame=frame,
+025017:                         )
+025018:                     self._local_ai_tight_roi_previous_gray = None
+025019:                     # Reject any position that jumps impossibly far in one frame (false positive).
+025020:                     # When the tracker is in re-acquisition mode (stuck >= 5 before the call), allow
+025021:                     # a larger jump because the ball may have traveled far while lost.
+025022:                     if tracked_position and prev_ball_center:
+025023:                         jump = math.hypot(tracked_position[0] - prev_ball_center[0],
+025024:                                           tracked_position[1] - prev_ball_center[1])
+025025:                         motion_reacq_this_frame = (
+025026:                             getattr(self, '_last_motion_reacq_frame', -1000000) == self.frame_count and
+025027:                             getattr(self, '_last_motion_reacq_pos', None) == tracked_position
+025028:                         )
+025029:                         trusted_rally_launch = (
+025030:                             getattr(self, '_trusted_rally_launch_frame', -1000000) == self.frame_count and
+025031:                             getattr(self, '_trusted_rally_launch_pos', None) == tracked_position
+025032:                         )
+025033:                         # Allow a larger jump when re-acquiring after being stuck for 5+ frames:
+025034:                         # a racket hit can send the ball 800+ px in one frame, so we use 1500px
+025035:                         # to let motion-based re-acquisition recover across the full court.
+025036:                         max_jump = 1500 if (
+025037:                             prev_stuck >= 5 or prev_top_return_wait or prev_back_return_wait or
+025038:                             motion_reacq_this_frame or trusted_rally_launch
+025039:                         ) else 400
+025040:                         if jump > max_jump:
+025041:                             print(f"[JUMP_REJECTED] f{self.frame_count}: jumped {jump:.0f}px from {prev_ball_center} to {tracked_position} (limit={max_jump}px, prev_stuck={prev_stuck}), keeping previous")
+025042:                             self.ball_center = prev_ball_center
+025043:                             self.stuck_frame_count = max(self.stuck_frame_count, prev_stuck + 1)
+025044:                             tracked_position = prev_ball_center
+025045: 
+025046:                     # Validate only the position that survived the physical
+025047:                     # jump gate above.  Previously the provisional serve
+025048:                     # state consumed a 425px false contour at f7921 before
+025049:                     # that contour was rejected below.  Its bogus vector then
+025050:                     # hid the real upward reversal at f7922.
+025051:                     # Once a far toss is independently marked as caught, it
+025052:                     # becomes a *history* question only.  Do not continue to
+025053:                     # mutate the live provisional flags: the previous attempt
+025054:                     # cleared those flags at f7922 and changed the otherwise
+025055:                     # stable HSV path of the following real rally.
+025056:                     tainted_far_toss_active = (
+025057:                         isinstance(
+025058:                             getattr(self, '_tainted_provisional_serve_start', None),
+025059:                             dict,
+025060:                         ) and
+025061:                         getattr(self, '_provisional_serve_start_kind', None) ==
+025062:                         'far-top-post-hit'
+025063:                     )
+025064:                     provisional_kind_before_validation = getattr(
+025065:                         self, '_provisional_serve_start_kind', None
+025066:                     )
+025067:                     provisional_reject_reason = (
+025068:                         None if tainted_far_toss_active else
+025069:                         self._validate_provisional_serve_start(
+025070:                             prev_ball_center, tracked_position
+025071:                         )
+025072:                     )
+025073:                     # A pending far-toss token is solely a fallback for a
+025074:                     # *rejected* practice toss.  Once this tentative flight
+025075:                     # has earned three coherent netward steps, it is a real
+025076:                     # serve (for example f8527 -> f8530) and the token must
+025077:                     # not survive its fault/end state.  Leaving it alive
+025078:                     # caused the local model to re-use that old start at
+025079:                     # f8619 and inject a second, false point.
+025080:                     if provisional_reject_reason is not None:
+025081:                         provisional_kind = getattr(self, '_provisional_serve_start_kind', None)
+025082:                         rejected_start = self._current_history_serve_start_frame()
+025083:                         if provisional_kind == 'far-top-post-hit':
+025084:                             # This is a caught far-side toss.  Do *not* reset
+025085:                             # to WAITING_FOR_SERVE: that was the rejected
+025086:                             # approach and it changed later, already-verified
+025087:                             # points.  Keep the normal HSV flow alive and ask
+025088:                             # local AI to prove a later outgoing path in
+025089:                             # shadow mode.  Only proven evidence may alter the
+025090:                             # final history/serve-fault interpretation.
+025091:                             self._tainted_provisional_serve_start = {
+025092:                                 'start_frame': rejected_start,
+025093:                                 'detected_frame': int(self.frame_count),
+025094:                                 'anchor': tuple(prev_ball_center),
+025095:                                 'reason': provisional_reject_reason,
+025096:                             }
+025097:                             print(
+025098:                                 f"[SERVE_START_TAINTED] f{self.frame_count}: "
+025099:                                 f"keeping tracker/provisional state for start f{rejected_start}; "
+025100:                                 f"{provisional_reject_reason}"
+025101:                             )
+025102:                         else:
+025103:                             print(
+025104:                                 f"[SERVE_START_REJECTED] f{self.frame_count}: "
+025105:                                 f"discarding provisional start f{rejected_start}; "
+025106:                                 f"{provisional_reject_reason}"
+025107:                             )
+025108:                             self._point_history_current = None
+025109:                             self._provisional_serve_start_kind = None
+025110:                             self._serve_start_requires_confirmation = False
+025111:                             game_state = "WAITING_FOR_SERVE"
+025112:                             clear_waiting_serve_history()
+025113:                             reset_tracking_state()
+025114:                             continue
+025115:                     # Shadow verification is intentionally side-effect free
+025116:                     # for ball position/game state.  It only supplies a
+025117:                     # later verified launch frame for history/fault scoring.
+025118:                     reconcile_tainted_far_serve_start()
+025119:                     if getattr(self, "_discard_provisional_serve_from_ai", False):
+025120:                         self._discard_provisional_serve_from_ai = False
+025121:                         self._ignore_unconfirmed_serve_start_result(
+025122:                             "local AI rejected repeated all-player-body recovery path"
+025123:                         )
+025124:                         print(
+025125:                             f"[SERVE_START_IGNORED] f{self.frame_count}: "
+025126:                             "discarding false provisional serve after repeated local-AI body paths"
+025127:                         )
+025128:                         game_state = "WAITING_FOR_SERVE"
+025129:                         clear_waiting_serve_history()
+025130:                         reset_tracking_state()
+025131:                         continue
+025132:                 if tracked_position:
+025133:                     vel = self.last_motion['distance'] if self.last_motion else 0
+025134:                     size_text = f"{self.ball_size:.1f}px" if self.ball_size is not None else "unknown"
+025135:                     vel_hist_tail = [round(v, 1) for v in getattr(self, 'ball_velocity_history', [])[-5:]]
+025136:                     print(f"Frame {self.frame_count}: Ball tracked at {tracked_position} - Size: {size_text}")
+025137:                     print(f"[TRACK] f{self.frame_count}: pos={tracked_position} vel={vel:.1f}px stuck={self.stuck_frame_count} vel_hist={vel_hist_tail}")
+025138:                     if self._point_history_current is not None:
+025139:                         self._point_history_current.setdefault('tracking_trace', []).append({
+025140:                             'frame': int(self.frame_count),
+025141:                             'pos': [int(tracked_position[0]), int(tracked_position[1])],
+025142:                             'size': float(self.ball_size) if self.ball_size is not None else None,
+025143:                             'stuck': int(self.stuck_frame_count),
+025144:                         })
+025145:                     if self.ball_dataset_exporter is not None:
+025146:                         self.ball_dataset_exporter.write_frame(
