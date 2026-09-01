@@ -16,23 +16,13 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: revert_1
-      - name: Inspect debug hook and parser
+      - name: Inspect force integration helpers
         shell: bash
         run: |
-          echo '=== hook occurrences ==='
-          grep -n "_debug_local_ai_shadow_frame" interactive_ball_analyzer.py || true
-          echo '=== constructor signature ==='
-          grep -n -A45 "class InteractiveBallAnalyzer" interactive_ball_analyzer.py | head -55 || true
-          echo '=== debug args ==='
-          grep -n -A18 -B8 "debug-local-ai-range" interactive_ball_analyzer.py || true
-          echo '=== analyzer construction ==='
-          grep -n -A60 -B5 "InteractiveBallAnalyzer(" interactive_ball_analyzer.py | tail -75 || true
-          echo '=== method ==='
-          line=$(grep -n "def _debug_local_ai_shadow_frame" interactive_ball_analyzer.py | head -1 | cut -d: -f1)
-          if [ -n "$line" ]; then
-            start=$((line-15)); end=$((line+220)); sed -n "${start},${end}p" interactive_ball_analyzer.py
-          fi
-          echo '=== call sites ==='
-          for line in $(grep -n "_debug_local_ai_shadow_frame(" interactive_ball_analyzer.py | cut -d: -f1); do
-            start=$((line-25)); end=$((line+30)); echo "--- around $line ---"; sed -n "${start},${end}p" interactive_ball_analyzer.py
-          done
+          echo '=== motion metrics ==='
+          grep -n -A120 -B5 "def log_motion_metrics" interactive_ball_analyzer.py | head -140 || true
+          echo '=== snapshot/restore ==='
+          grep -n -A100 -B8 "def _snapshot_tracking_state_for_provisional_guard" interactive_ball_analyzer.py | head -130 || true
+          grep -n -A100 -B8 "def _restore_tracking_state_for_provisional_guard" interactive_ball_analyzer.py | head -130 || true
+          echo '=== tracking output/update near end track_ball ==='
+          grep -n "Ball tracked at" interactive_ball_analyzer.py | tail -10 || true
