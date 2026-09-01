@@ -51,3 +51,4 @@ jobs:
             raise SystemExit(2)
           print('FINAL_GENERIC_FRAME_SCAN_OK')
           PY
+          # rerun after removing the last source-video curation helper
