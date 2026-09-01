@@ -21,8 +21,12 @@ jobs:
         run: |
           echo '=== hook occurrences ==='
           grep -n "_debug_local_ai_shadow_frame" interactive_ball_analyzer.py || true
+          echo '=== constructor signature ==='
+          grep -n -A45 "class InteractiveBallAnalyzer" interactive_ball_analyzer.py | head -55 || true
           echo '=== debug args ==='
           grep -n -A18 -B8 "debug-local-ai-range" interactive_ball_analyzer.py || true
+          echo '=== analyzer construction ==='
+          grep -n -A60 -B5 "InteractiveBallAnalyzer(" interactive_ball_analyzer.py | tail -75 || true
           echo '=== method ==='
           line=$(grep -n "def _debug_local_ai_shadow_frame" interactive_ball_analyzer.py | head -1 | cut -d: -f1)
           if [ -n "$line" ]; then
