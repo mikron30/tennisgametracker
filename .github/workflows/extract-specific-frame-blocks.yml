@@ -1,0 +1,37 @@
+name: Extract specific-frame blocks
+
+on:
+  push:
+    branches: [revert_1]
+    paths: [.github/workflows/extract-specific-frame-blocks.yml]
+
+permissions:
+  contents: write
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: revert_1
+          fetch-depth: 1
+      - name: Extract windows
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          lines=Path('interactive_ball_analyzer.py').read_text(encoding='utf-8').splitlines()
+          ranges=[(8680,10320),(10640,10730),(16620,16670),(21640,21810),(22140,22420),(24680,25030),(25790,25840),(26610,26770)]
+          out=[]
+          for a,b in ranges:
+            out.append(f'\n===== SOURCE {a}-{b} =====')
+            for j in range(a,min(b,len(lines))+1): out.append(f'{j:06d}: {lines[j-1]}')
+          Path('.github/specific_frame_blocks.txt').write_text('\n'.join(out)+'\n',encoding='utf-8')
+          PY
+      - name: Commit extract
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .github/specific_frame_blocks.txt
+          git commit -m "Record specific-frame code blocks"
+          git push origin HEAD:revert_1
