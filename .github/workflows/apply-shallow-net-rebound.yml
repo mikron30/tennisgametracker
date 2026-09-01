@@ -1,0 +1,46 @@
+name: Apply shallow net rebound
+on:
+  push:
+    branches: [revert_1]
+    paths: [.github/workflows/apply-shallow-net-rebound.yml]
+permissions:
+  contents: write
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: revert_1
+          fetch-depth: 0
+      - run: python .github/scripts/apply_shallow_net_rebound.py
+      - run: |
+          python -m py_compile interactive_ball_analyzer.py ball_local_ai_recovery.py ball_ai_recovery_probe.py
+          python - <<'PY'
+          from pathlib import Path
+          s=Path('interactive_ball_analyzer.py').read_text(encoding='utf-8')
+          assert 'shallow_net_rebound = (' in s
+          assert 'mode={bounce_mode}' in s
+          assert 'prev_speed >= 5.0 and curr_speed >= 6.0' in s
+          assert 'angle_diff >= 80.0' in s
+          assert 'disable_specific_frame_logic' not in s
+          # Synthetic signature from a low-energy net-deflected bounce: this
+          # should pass the generic soft gate, while the old strong gate fails.
+          prev_speed, curr_speed = 6.3, 8.5
+          prev_dy, curr_dy, angle_diff = 6.0, -6.0, 116.6
+          net_depth, near_limit = 80.0, 183.6
+          strong = prev_speed >= 18.0 and curr_speed >= 10.0
+          shallow = (net_depth <= near_limit and prev_speed >= 5.0 and curr_speed >= 6.0 and
+                     prev_dy >= 4.0 and curr_dy <= -4.0 and angle_diff >= 80.0)
+          assert not strong and shallow
+          # Same turn far from the net must not use the soft path.
+          assert not (300.0 <= near_limit and prev_speed >= 5.0 and curr_speed >= 6.0 and
+                      prev_dy >= 4.0 and curr_dy <= -4.0 and angle_diff >= 80.0)
+          print('SHALLOW_NET_REBOUND_OK')
+          PY
+      - run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add interactive_ball_analyzer.py
+          git commit -m 'Detect shallow net rebounds on hitter side'
+          git push origin HEAD:revert_1
