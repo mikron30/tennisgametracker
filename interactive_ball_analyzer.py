@@ -21747,8 +21747,7 @@ class InteractiveBallAnalyzer:
         prev_dy = float(self.prev_motion.get('dy', 0.0) or 0.0)
         curr_speed = float(self.last_motion.get('distance', 0.0) or 0.0)
         prev_speed = float(self.prev_motion.get('distance', 0.0) or 0.0)
-        if prev_speed < 18.0 or curr_speed < 10.0:
-            return False, None
+        strong_bounce_motion = prev_speed >= 18.0 and curr_speed >= 10.0
 
         x, y = ball_position
         bounce_point = (int(round(x - curr_dx)), int(round(y - curr_dy)))
@@ -21781,8 +21780,26 @@ class InteractiveBallAnalyzer:
 
         vertical_reversal = prev_dy >= 18.0 and curr_dy <= -10.0
         sharp_turn = angle_diff >= 120.0 and prev_dy >= 12.0 and curr_dy <= -6.0
-        if not (vertical_reversal or sharp_turn):
+
+        # A ball that clips the net can lose most of its speed before bouncing
+        # back on the hitter side.  Keep this softer signature tightly scoped
+        # to the hitter-side strip immediately next to the net so ordinary
+        # low-speed direction changes elsewhere on court are unaffected.
+        if contact_side == "near":
+            net_rebound_depth = max(0.0, bounce_y - net_max)
+        else:
+            net_rebound_depth = max(0.0, net_min - bounce_y)
+        near_net_rebound = net_rebound_depth <= max(150.0, height * 0.085)
+        shallow_net_rebound = (
+            near_net_rebound and
+            prev_speed >= 5.0 and curr_speed >= 6.0 and
+            prev_dy >= 4.0 and curr_dy <= -4.0 and
+            angle_diff >= 80.0
+        )
+        strong_reversal = strong_bounce_motion and (vertical_reversal or sharp_turn)
+        if not (strong_reversal or shallow_net_rebound):
             return False, None
+        bounce_mode = "shallow-net-rebound" if shallow_net_rebound else "strong-reversal"
 
         outside, _, left_x, right_x = self._point_outside_singles_sidelines(bounce_point, frame)
         inside_width_known = left_x is not None and right_x is not None
@@ -21817,6 +21834,7 @@ class InteractiveBallAnalyzer:
         print(
             f"Frame {self.frame_count}: [SAME-SIDE PRE-NET BOUNCE] "
             f"bounce_point={bounce_point} contact={contact_point} side={contact_side} "
+            f"mode={bounce_mode} net_depth={net_rebound_depth:.1f}px "
             f"frames_since_contact={frames_since_contact} prev_motion=({prev_dx:.1f},{prev_dy:.1f}) "
             f"curr_motion=({curr_dx:.1f},{curr_dy:.1f}) angle_diff={angle_diff:.1f}"
             f"{crossing_text}"
