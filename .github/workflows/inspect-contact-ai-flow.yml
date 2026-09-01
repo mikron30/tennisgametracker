@@ -1,0 +1,51 @@
+name: Inspect contact AI flow
+
+on:
+  push:
+    branches: [revert_1]
+    paths: [.github/workflows/inspect-contact-ai-flow.yml]
+
+permissions:
+  contents: write
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: revert_1
+          fetch-depth: 1
+      - name: Extract exact flow snippets
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          src = Path('interactive_ball_analyzer.py').read_text(encoding='utf-8').splitlines()
+          needles = [
+              'forced_local_ai = False',
+              'def _prefer_night_tight_local_ai_candidate',
+              'def _commit_night_visible_ball_recovery',
+              '_prefer_night_tight_local_ai_candidate(',
+              'def _snapshot',
+              'pre_track_snapshot =',
+          ]
+          out=[]
+          for needle in needles:
+              out += ['', '='*88, 'NEEDLE: '+needle, '='*88]
+              matches=[i for i,l in enumerate(src) if needle in l]
+              if not matches:
+                  out.append('NO MATCH')
+                  continue
+              for i in matches:
+                  start=max(0,i-70); end=min(len(src),i+150)
+                  out.append(f'--- source lines {start+1}-{end} ---')
+                  out.extend(f'{j+1:06d}: {src[j]}' for j in range(start,end))
+          Path('.github/contact_ai_flow_context.txt').write_text('\n'.join(out)+'\n', encoding='utf-8')
+          PY
+      - name: Commit output
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .github/contact_ai_flow_context.txt
+          git commit -m "Extract contact AI flow context"
+          git push origin HEAD:revert_1
