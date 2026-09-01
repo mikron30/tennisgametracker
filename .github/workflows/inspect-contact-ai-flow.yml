@@ -16,32 +16,13 @@ jobs:
         with:
           ref: revert_1
           fetch-depth: 1
-      - name: Extract exact flow snippets
+      - name: Extract full contact arbiter
         run: |
           python - <<'PY'
           from pathlib import Path
           src = Path('interactive_ball_analyzer.py').read_text(encoding='utf-8').splitlines()
-          needles = [
-              'forced_local_ai = False',
-              'def _snapshot_tracking_state_for_provisional_guard',
-              'snapshot_tracking_state_for_provisional_guard',
-              'pre_track_snapshot=',
-              'def _try_local_ai_recovery',
-              'POST_SERVE_LAUNCH_ROLLBACK',
-              'def _prefer_night_tight_local_ai_candidate',
-              '_prefer_night_tight_local_ai_candidate(',
-          ]
-          out=[]
-          for needle in needles:
-              out += ['', '='*88, 'NEEDLE: '+needle, '='*88]
-              matches=[i for i,l in enumerate(src) if needle in l]
-              if not matches:
-                  out.append('NO MATCH')
-                  continue
-              for i in matches:
-                  start=max(0,i-90); end=min(len(src),i+190)
-                  out.append(f'--- source lines {start+1}-{end} ---')
-                  out.extend(f'{j+1:06d}: {src[j]}' for j in range(start,end))
+          start, end = 5635, 6040
+          out = [f'{j+1:06d}: {src[j]}' for j in range(start-1, min(end, len(src)))]
           Path('.github/contact_ai_flow_context.txt').write_text('\n'.join(out)+'\n', encoding='utf-8')
           PY
       - name: Commit output
@@ -49,5 +30,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add .github/contact_ai_flow_context.txt
-          git commit -m "Extract contact AI rollback context"
+          git commit -m "Extract full contact AI arbiter"
           git push origin HEAD:revert_1
