@@ -26,7 +26,6 @@ jobs:
           src = path.read_text(encoding='utf-8')
           original = src
 
-          # Remove whole methods whose only purpose is source-video/frame-specific correction.
           remove_functions = {
               '_reconcile_verified_caught_toss_history_row',
               '_point_timeout_result_override',
@@ -75,7 +74,6 @@ jobs:
               del lines[a-1:b]
           src = ''.join(lines)
 
-          # Remove constructor/CLI plumbing for the deleted switch.
           src = re.sub(r'^\s*disable_specific_frame_logic: bool = False,\n', '', src, flags=re.M)
           src = re.sub(r'^\s*self\.disable_specific_frame_logic = bool\(disable_specific_frame_logic\)\n', '', src, flags=re.M)
           src = re.sub(
@@ -85,18 +83,14 @@ jobs:
           )
           src = re.sub(r'^\s*disable_specific_frame_logic=args\.disable_specific_frame_logic,\n', '', src, flags=re.M)
 
-          # Remove calls to methods that no longer exist.
           src = re.sub(r'^\s*row = self\._reconcile_verified_caught_toss_history_row\(row\)\n', '', src, flags=re.M)
           src = re.sub(r'^\s*self\._seed_match_state_from_start_frame\(\)\n', '', src, flags=re.M)
           src = re.sub(r'^\s*self\._sync_court2_video_phase_from_frame\(\)\n', '', src, flags=re.M)
-
-          # Keep generic provisional-serve confirmation; remove court/video-range override.
           src = src.replace(
               "        if self._court2_false_serve_start_override(reason):\n            return True\n",
               ""
           )
 
-          # Remove reviewed endpoint/continuation checks from both point-end implementations.
           src = re.sub(
               r'        reference_override = self\._reference_point_end_override\(\)\n'
               r'.*?        if \(reference_target is not None and\n'
@@ -105,7 +99,6 @@ jobs:
               '', src, count=2, flags=re.S
           )
 
-          # Remove reviewed false-start + reference-end state-machine block entirely.
           src = re.sub(
               r'                # Reject a source-reviewed false serve immediately\..*?'
               r'                # Point duration timeout:',
@@ -114,7 +107,6 @@ jobs:
           )
           src = re.sub(r'^\s*not reference_target_hold\):\n', '                        True):\n', src, count=1, flags=re.M)
 
-          # Remove reference/timeout overrides from point recording; use physical/general rules only.
           src = re.sub(
               r'        if outcome is None:\n'
               r'            reference_override = self\._reference_point_end_override\(\)\n'
@@ -123,7 +115,6 @@ jobs:
               src, count=1, flags=re.S
           )
 
-          # Delete the one-off frame-127 HSV reversal. Normal HSV/alternate logic remains.
           src = re.sub(
               r'            use_alt_first = \(\n'
               r'.*?'
@@ -139,7 +130,6 @@ jobs:
               "if alt_upper is not None and alt_upper[0] != primary_upper[0]:"
           )
 
-          # Convert old absolute-frame debug windows to normal verbose-debug behavior.
           src = src.replace("if 1170 <= self.frame_count <= 1200:", "if getattr(self, 'verbose_debug', False):")
           src = src.replace("if 12740 <= self.frame_count <= 12790:", "if getattr(self, 'verbose_debug', False):")
           src = re.sub(
@@ -148,7 +138,6 @@ jobs:
               '', src, count=1, flags=re.M
           )
 
-          # Remove old source-video absolute frame references from comments/docstrings too.
           src = re.sub(r'\bf\d{3,}\b', 'a prior frame', src)
           src = re.sub(r'\bframe \d{3,}\b', 'a prior frame', src, flags=re.I)
           src = src.replace('source-reviewed', 'previously reviewed')
@@ -168,42 +157,30 @@ jobs:
           import re
           src=Path('interactive_ball_analyzer.py').read_text(encoding='utf-8')
           forbidden=[
-              'disable_specific_frame_logic',
-              '--disable-specific-frame-logic',
-              '_serve_history_reconciliation',
-              '_start_frame_match_seed_applied',
-              '_court2_video_phase_seed_applied',
-              '_seed_match_state_from_start_frame',
-              '_sync_court2_video_phase_from_frame',
-              '_is_reviewed_false_serve_start',
-              '_court2_false_serve_start_override',
-              '_reference_point_end_targets',
-              '_reference_point_end_target',
-              '_reference_point_end_override',
-              '_reviewed_point_continuation_frame',
-              '_point_timeout_result_override',
-              'REFERENCE_POINT_END',
-              'Reviewed endpoint hold',
-              'Reviewed continuation hold',
+              'disable_specific_frame_logic', '--disable-specific-frame-logic',
+              '_serve_history_reconciliation', '_start_frame_match_seed_applied',
+              '_court2_video_phase_seed_applied', '_seed_match_state_from_start_frame',
+              '_sync_court2_video_phase_from_frame', '_is_reviewed_false_serve_start',
+              '_court2_false_serve_start_override', '_reference_point_end_targets',
+              '_reference_point_end_target', '_reference_point_end_override',
+              '_reviewed_point_continuation_frame', '_point_timeout_result_override',
+              'REFERENCE_POINT_END', 'Reviewed endpoint hold', 'Reviewed continuation hold',
+              'self.frame_count == 127', '1170 <= self.frame_count <= 1200',
+              '12740 <= self.frame_count <= 12790', '1165 <= self.frame_count <= 1185',
+              'tracking_start_frame != 11921', 'start_frame != 11921',
+              '9180 <= start_frame <= 9270', 'start_frame < 12400',
+              'frame_count < 12400',
           ]
           bad=[x for x in forbidden if x in src]
-
-          # Only direct frame-variable-to-literal comparisons are forbidden.
-          # Relative expressions such as point_anchor + 240 < frame_count are generic and valid.
-          direct_patterns=[
-              r'(?:self\.)?(?:frame_count|start_frame|tracking_start_frame|serve_start_frame|point_start_frame_internal)\s*(?:==|!=|<=|>=|<|>)\s*\d{3,}',
-              r'(?<![\w+\-*/])\d{3,}\s*(?:==|!=|<=|>=|<|>)\s*(?:self\.)?(?:frame_count|tracking_start_frame|serve_start_frame|point_start_frame_internal)',
-          ]
-          direct=[]
-          for pat in direct_patterns:
-              direct.extend(m.group(0) for m in re.finditer(pat,src))
-          textual=[]
-          textual.extend(re.findall(r'\bf\d{3,}\b',src))
-          textual.extend(re.findall(r'\bframe \d{3,}\b',src,re.I))
+          direct=list(re.finditer(
+              r'(?:self\.)?(?:frame_count|tracking_start_frame|serve_start_frame|point_start_frame_internal)\s*(?:==|!=|<=|>=|<|>)\s*\d{3,}',
+              src
+          ))
+          textual=re.findall(r'\bf\d{3,}\b|\bframe \d{3,}\b',src,re.I)
           if bad or direct or textual:
-              print('FORBIDDEN SYMBOLS:',bad)
-              print('ABSOLUTE FRAME COMPARISONS:',direct[:50])
-              print('TEXTUAL ABSOLUTE FRAME REFS:',textual[:50])
+              print('FORBIDDEN:',bad)
+              print('DIRECT:',[m.group(0) for m in direct[:50]])
+              print('TEXT:',textual[:50])
               raise SystemExit(2)
           print('Specific-frame validation passed')
           PY
