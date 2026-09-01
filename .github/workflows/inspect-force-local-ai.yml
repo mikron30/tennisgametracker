@@ -23,7 +23,8 @@ jobs:
         run: |
           python .github/scripts/apply_force_local_ai_patch.py
           python -m py_compile interactive_ball_analyzer.py ball_local_ai_recovery.py ball_ai_recovery_probe.py
-          python interactive_ball_analyzer.py --help | grep force-local-ai
+          grep -q -- '--force-local-ai-range' interactive_ball_analyzer.py
+          grep -q -- '\[FORCE_LOCAL_AI\]' interactive_ball_analyzer.py
 
       - name: Commit tracker change
         run: |
