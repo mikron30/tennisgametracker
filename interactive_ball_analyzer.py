@@ -1189,15 +1189,23 @@ class InteractiveBallAnalyzer:
         zone selection or a sharp trajectory/size discontinuity inside the
         padded racket-contact corridor.
         """
+        current = int(self.frame_count)
         if (
                 getattr(self, 'local_ai_recovery', None) is None or
-                previous_position is None or tracked_position is None or
-                int(self.frame_count) <= int(getattr(
+                previous_position is None or
+                current <= int(getattr(
                     self, '_contact_local_ai_cooldown_until_frame', -1000000
                 ))):
             return None
 
         previous = (int(previous_position[0]), int(previous_position[1]))
+        watch_until = int(getattr(
+            self, '_contact_local_ai_watch_until_frame', -1000000
+        ))
+        if tracked_position is None:
+            if current <= watch_until:
+                return 'contact-loss-after-player-proximity'
+            return None
         tracked = (int(tracked_position[0]), int(tracked_position[1]))
         prior_motion = dict((snapshot or {}).get('last_motion') or {})
         prior_dx = float(prior_motion.get('dx', 0.0) or 0.0)
@@ -1229,7 +1237,11 @@ class InteractiveBallAnalyzer:
             self._point_in_player_contact_corridor(point)
             for point in (previous, tracked, predicted)
         )
-        if zone is None and not contact_near:
+        watch_active = current <= watch_until
+        if zone is not None or contact_near:
+            self._contact_local_ai_watch_until_frame = max(watch_until, current + 8)
+            watch_active = True
+        if zone is None and not contact_near and not watch_active:
             return None
 
         recent_speeds = [
@@ -1249,14 +1261,17 @@ class InteractiveBallAnalyzer:
         player_zones = (
             'player_head_hat', 'player_body', 'player_shoes', 'racket_fragment'
         )
-        if zone in player_zones and max(prior_speed, proposed_speed) >= 12.0:
+        if (
+                zone in player_zones and max(prior_speed, proposed_speed) >= 12.0 and
+                prediction_error >= 30.0 and
+                (angle_delta >= 30.0 or size_ratio >= 2.0)):
             return (
-                f'player-zone:{zone}/step={proposed_speed:.0f}px/'
-                f'angle={angle_delta:.0f}deg'
+                f'contact-player-artifact:{zone}/step={proposed_speed:.0f}px/'
+                f'angle={angle_delta:.0f}deg/pred={prediction_error:.0f}px'
             )
 
         if (
-                contact_near and proposed_speed >= jump_floor and
+                (contact_near or watch_active) and proposed_speed >= jump_floor and
                 (angle_delta >= 35.0 or prediction_error >= 50.0)):
             return (
                 f'contact-jump:{proposed_speed:.0f}px>={jump_floor:.0f}/'
@@ -1264,7 +1279,7 @@ class InteractiveBallAnalyzer:
             )
 
         if (
-                contact_near and prior_speed >= 18.0 and proposed_speed >= 18.0 and
+                (contact_near or watch_active) and prior_speed >= 18.0 and proposed_speed >= 18.0 and
                 angle_delta >= 70.0 and prediction_error >= 30.0):
             return (
                 f'contact-turn:{angle_delta:.0f}deg/'
@@ -1272,7 +1287,16 @@ class InteractiveBallAnalyzer:
             )
 
         if (
-                contact_near and proposed_speed >= 35.0 and size_ratio >= 2.6 and
+                (contact_near or watch_active) and prior_speed >= 18.0 and
+                proposed_speed <= max(6.0, prior_speed * 0.35) and
+                prediction_error >= 18.0):
+            return (
+                f'contact-stall:{prior_speed:.0f}->{proposed_speed:.0f}px/'
+                f'pred={prediction_error:.0f}px'
+            )
+
+        if (
+                (contact_near or watch_active) and proposed_speed >= 35.0 and size_ratio >= 2.6 and
                 prediction_error >= 35.0):
             return (
                 f'contact-size-jump:{size_ratio:.1f}x/'
@@ -1300,6 +1324,7 @@ class InteractiveBallAnalyzer:
                 'deadline': current + 22,
                 'history': [],
                 'outside_count': 0,
+                'miss_count': 0,
                 'reason': str(arm_reason),
             }
             self._contact_local_ai_state = state
@@ -1330,17 +1355,21 @@ class InteractiveBallAnalyzer:
         saved_history = list(getattr(self, '_force_local_ai_history', []) or [])
         saved_radius = float(getattr(self, '_force_local_ai_radius', 450.0))
         saved_min_score = float(getattr(self, '_force_local_ai_min_score', 0.985))
+        saved_return_none = bool(getattr(self, '_force_local_ai_return_none_on_miss', False))
+        saved_max_scored = int(getattr(self, '_force_local_ai_max_score_candidates', 128))
         try:
             self._force_local_ai_range = (
                 int(state['start_frame']), int(state['deadline'])
             )
             self._force_local_ai_history = list(state.get('history', []) or [])
-            self._force_local_ai_radius = float(
-                getattr(self, '_contact_local_ai_radius', 450.0)
-            )
+            miss_count = int(state.get('miss_count', 0))
+            base_radius = float(getattr(self, '_contact_local_ai_radius', 450.0))
+            self._force_local_ai_radius = min(900.0, base_radius + 90.0 * miss_count)
             self._force_local_ai_min_score = float(
                 getattr(self, '_contact_local_ai_min_score', 0.985)
             )
+            self._force_local_ai_return_none_on_miss = True
+            self._force_local_ai_max_score_candidates = 384
             selected = self._force_local_ai_frame(frame, previous_position)
             state['history'] = list(getattr(self, '_force_local_ai_history', []) or [])
         finally:
@@ -1348,10 +1377,19 @@ class InteractiveBallAnalyzer:
             self._force_local_ai_history = saved_history
             self._force_local_ai_radius = saved_radius
             self._force_local_ai_min_score = saved_min_score
+            self._force_local_ai_return_none_on_miss = saved_return_none
+            self._force_local_ai_max_score_candidates = saved_max_scored
 
         if selected is None:
+            state['miss_count'] = int(state.get('miss_count', 0)) + 1
+            self._contact_local_ai_state = state
+            print(
+                f"[CONTACT_LOCAL_AI_MISS] f{current}: normal tracker remains active; "
+                f"misses={state['miss_count']}"
+            )
             return None
 
+        state['miss_count'] = 0
         selected = (int(selected[0]), int(selected[1]))
         zone = self._player_point_zone(selected)
         inside_contact = self._point_in_player_contact_corridor(selected)
@@ -1460,7 +1498,10 @@ class InteractiveBallAnalyzer:
                 float(item["y"]) - float(sort_anchor[1]),
             )
         )
-        subset = clear_candidates[:128]
+        max_scored = max(32, min(512, int(getattr(
+            self, "_force_local_ai_max_score_candidates", 128
+        ))))
+        subset = clear_candidates[:max_scored]
         scored = recovery._score(frame, current, subset) if subset else []
 
         tolerance = None
@@ -1520,6 +1561,13 @@ class InteractiveBallAnalyzer:
             )
 
         if not eligible:
+            if bool(getattr(self, "_force_local_ai_return_none_on_miss", False)):
+                print(
+                    f"[FORCE_LOCAL_AI_MISS] f{current}: no clear candidate >= {min_score:.3f}; "
+                    f"anchor={anchor} predicted={predicted} candidates={len(candidates)} "
+                    f"clear={len(clear_candidates)} scored={len(scored)}"
+                )
+                return None
             self.ball_center = tuple(anchor)
             self.stuck_frame_count = max(1, int(getattr(self, "stuck_frame_count", 0)) + 1)
             print(
@@ -24890,6 +24938,7 @@ class InteractiveBallAnalyzer:
                                     tuple(tracked_position)
                                     if tracked_position is not None else None
                                 )
+                                post_track_snapshot = self._snapshot_tracking_state_for_provisional_guard()
                                 self._restore_tracking_state_for_provisional_guard(
                                     pre_track_snapshot
                                 )
@@ -24906,15 +24955,17 @@ class InteractiveBallAnalyzer:
                                         f"HSV={rejected_hsv} -> AI={tracked_position}"
                                     )
                                 else:
-                                    # A failed AI arm must not leave state partially
-                                    # rolled back.  Hold the last trusted ball and retry
-                                    # on the next frame rather than accepting player HSV.
-                                    self.ball_center = tuple(prev_ball_center)
-                                    self.stuck_frame_count = max(
-                                        1, int(prev_stuck) + 1
+                                    # AI is an assist: if it has no accepted candidate,
+                                    # keep the normal tracker result for this frame.
+                                    self._restore_tracking_state_for_provisional_guard(
+                                        post_track_snapshot
                                     )
-                                    tracked_position = tuple(prev_ball_center)
-                                    contact_local_ai = True
+                                    tracked_position = rejected_hsv
+                                    contact_local_ai = False
+                                    print(
+                                        f"[CONTACT_LOCAL_AI_FALLBACK] f{self.frame_count}: "
+                                        f"AI miss; keeping normal={tracked_position}"
+                                    )
                     if self.local_ai_recovery is not None and self._local_ai_frame_buffer:
                         self._local_ai_frame_buffer[-1]["normal_position"] = (
                             tuple(tracked_position) if tracked_position is not None else None
