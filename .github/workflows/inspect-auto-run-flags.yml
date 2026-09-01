@@ -16,30 +16,22 @@ jobs:
         with:
           ref: revert_1
           fetch-depth: 1
-      - name: Extract flag and report behavior
+      - name: Extract concise flag and report behavior
         run: |
           python - <<'PY'
           from pathlib import Path
           src = Path('interactive_ball_analyzer.py').read_text(encoding='utf-8').splitlines()
-          needles = [
-              'auto_run', 'auto-run', 'auto_play', 'auto-play',
-              'point_history', 'POINT_HISTORY', 'POINT_AUDIT',
-              'cv2.imshow', 'cv2.waitKey', 'waitKey(',
-              'pause', 'paused', 'display'
-          ]
-          out=[]
-          seen=set()
+          needles = ['auto_run','auto-run','auto_play','auto-play','point_history','POINT_HISTORY','POINT_AUDIT','waitKey(','imshow(']
+          out=[]; seen=set()
           for needle in needles:
               matches=[i for i,l in enumerate(src) if needle in l]
-              if not matches:
-                  continue
-              out += ['', '='*90, 'NEEDLE: '+needle, '='*90]
+              if not matches: continue
+              out.append(f'## {needle}')
               for i in matches:
-                  start=max(0,i-35); end=min(len(src),i+70)
+                  start=max(0,i-4); end=min(len(src),i+5)
                   key=(start,end)
                   if key in seen: continue
                   seen.add(key)
-                  out.append(f'--- lines {start+1}-{end} ---')
                   out.extend(f'{j+1:06d}: {src[j]}' for j in range(start,end))
           Path('.github/auto_run_flag_context.txt').write_text('\n'.join(out)+'\n', encoding='utf-8')
           PY
@@ -48,5 +40,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add .github/auto_run_flag_context.txt
-          git commit -m "Extract auto-run flag context"
+          git commit -m "Extract concise auto-run flag context"
           git push origin HEAD:revert_1
