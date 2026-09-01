@@ -1,0 +1,32 @@
+name: Apply automatic contact Local AI
+
+on:
+  push:
+    branches: [revert_1]
+    paths: [.github/workflows/apply-auto-contact-local-ai.yml]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: revert_1
+          fetch-depth: 1
+      - name: Apply and validate patch
+        run: |
+          python .github/scripts/apply_auto_contact_local_ai.py
+          python -m py_compile interactive_ball_analyzer.py ball_local_ai_recovery.py ball_ai_recovery_probe.py player_racket_tracker.py
+          grep -q '\[CONTACT_LOCAL_AI_ARM\]' interactive_ball_analyzer.py
+          grep -q '\[CONTACT_LOCAL_AI_REPLACE\]' interactive_ball_analyzer.py
+          grep -q '\[CONTACT_LOCAL_AI_HANDOFF\]' interactive_ball_analyzer.py
+      - name: Commit tracker change
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add interactive_ball_analyzer.py
+          git commit -m "Auto-activate Local AI around racket contact"
+          git push origin HEAD:revert_1
