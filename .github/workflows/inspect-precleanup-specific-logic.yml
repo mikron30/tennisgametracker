@@ -1,0 +1,44 @@
+name: Inspect precleanup specific logic
+on:
+  push:
+    branches: [revert_1]
+    paths: [.github/workflows/inspect-precleanup-specific-logic.yml]
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: revert_1
+          fetch-depth: 0
+      - name: Print specific methods and references
+        run: |
+          git show b4880387e6769ba33b3919b86901fced76662dd0:interactive_ball_analyzer.py > /tmp/pre.py
+          python - <<'PY'
+          import ast
+          from pathlib import Path
+          text=Path('/tmp/pre.py').read_text(encoding='utf-8')
+          lines=text.splitlines()
+          names={
+            '_reconcile_verified_caught_toss_history_row','_point_timeout_result_override',
+            '_reference_point_end_targets','_reference_point_end_target',
+            '_reviewed_point_continuation_frame','_reference_point_end_override',
+            '_is_reviewed_false_serve_start','_seed_match_state_from_start_frame',
+            '_sync_court2_video_phase_from_frame','_court2_false_serve_start_override'
+          }
+          tree=ast.parse(text)
+          for node in ast.walk(tree):
+            if isinstance(node,ast.FunctionDef) and node.name in names:
+              print(f'\n===== {node.name} {node.lineno}-{node.end_lineno} =====')
+              print('\n'.join(lines[node.lineno-1:node.end_lineno]))
+          print('\n===== disable_specific_frame_logic refs =====')
+          for i,l in enumerate(lines,1):
+            if 'disable_specific_frame_logic' in l or '--disable-specific-frame-logic' in l:
+              print(f'{i}: {l}')
+          print('\n===== known absolute frame refs =====')
+          for i,l in enumerate(lines,1):
+            if any(x in l for x in ['self.frame_count == 127','1170 <= self.frame_count <= 1200','12740 <= self.frame_count <= 12790','1165 <= self.frame_count <= 1185']):
+              print(f'{i}: {l}')
+          PY
