@@ -1,0 +1,33 @@
+name: Apply contact continuity guard
+on:
+  push:
+    branches: [revert_1]
+    paths: [.github/workflows/apply-contact-continuity-guard.yml]
+permissions:
+  contents: write
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: revert_1
+          fetch-depth: 0
+      - run: python .github/scripts/apply_contact_continuity_guard.py
+      - run: |
+          python -m py_compile interactive_ball_analyzer.py ball_local_ai_recovery.py ball_ai_recovery_probe.py
+          python - <<'PY'
+          from pathlib import Path
+          s=Path('interactive_ball_analyzer.py').read_text(encoding='utf-8')
+          assert '[CONTACT_AI_HISTORY_BRIDGE]' in s
+          assert '_force_local_ai_continuity_guard' in s
+          assert 'continuity_rejected=' in s
+          assert 'disable_specific_frame_logic' not in s
+          print('CONTACT_CONTINUITY_GUARD_OK')
+          PY
+      - run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add interactive_ball_analyzer.py
+          git commit -m 'Keep contact AI on a physically continuous path'
+          git push origin HEAD:revert_1
