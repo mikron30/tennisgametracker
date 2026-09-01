@@ -2,7 +2,9 @@ name: Apply out score last hitter
 on:
   push:
     branches: [revert_1]
-    paths: [.github/workflows/apply-out-score-last-hitter.yml]
+    paths:
+      - .github/workflows/apply-out-score-last-hitter.yml
+      - .github/scripts/apply_out_score_last_hitter.py
 permissions:
   contents: write
 jobs:
@@ -26,11 +28,10 @@ jobs:
           assert '[OUT_SCORE_OWNER]' in body
           assert 'last hitter missed court' in body
           assert 'ball out; hitter unknown, landing-side fallback' in body
-          out_start = body.index('if "bounce outside singles court"')
-          out_body = body[out_start:]
-          assert out_body.index('if recent_contact:') < out_body.index('if landing_player is not None:')
-          # The verified-hitter rule is side-independent: whichever player hit
-          # last loses the out, regardless of near/far landing geometry.
+          owner_idx = body.index('[OUT_SCORE_OWNER]')
+          fallback_idx = body.index('ball out; hitter unknown, landing-side fallback')
+          assert owner_idx < fallback_idx
+          # Verified hitter ownership is independent of near/far landing side.
           for contact_player in (0, 1):
               winner = 1 - contact_player
               assert winner != contact_player
