@@ -1,0 +1,29 @@
+name: Inspect net bounce logic
+on:
+  push:
+    branches: [revert_1]
+    paths: [.github/workflows/inspect-net-bounce.yml]
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: revert_1
+      - run: |
+          python - <<'PY'
+          import ast
+          from pathlib import Path
+          s=Path('interactive_ball_analyzer.py').read_text(encoding='utf-8')
+          lines=s.splitlines()
+          tree=ast.parse(s)
+          needles=('SAME-SIDE PRE-NET BOUNCE','POST-CONTACT TIMEOUT HOLD')
+          for n in ast.walk(tree):
+              if isinstance(n, ast.FunctionDef):
+                  body='\n'.join(lines[n.lineno-1:n.end_lineno])
+                  if any(x in body for x in needles):
+                      print(f'===== {n.name} {n.lineno}-{n.end_lineno} =====')
+                      print('\n'.join(f'{i}: {lines[i-1]}' for i in range(n.lineno,n.end_lineno+1)))
+          PY
