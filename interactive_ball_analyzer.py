@@ -9891,15 +9891,44 @@ class InteractiveBallAnalyzer:
                     "unreturned",
                     landing_player,
                 )
-            if landing_player is not None:
-                return self._point_outcome(landing_player, "ball out on player court; opponent fault", "out_error", 1 - landing_player)
+            # For an OUT, the landing side tells us where the miss landed; it
+            # does not tell us who made the error. A recent verified racket
+            # contact is direct ownership evidence, so the last hitter loses.
+            if recent_contact:
+                winner_idx = 1 - contact_player
+                landing_text = (
+                    self.player_names[landing_player]
+                    if landing_player in (0, 1) else "unknown"
+                )
+                print(
+                    f"[OUT_SCORE_OWNER] f{self.frame_count}: "
+                    f"last_hitter={self.player_names[contact_player]} "
+                    f"contact=f{contact_frame} landing_side={landing_text} "
+                    f"-> winner={self.player_names[winner_idx]}"
+                )
+                return self._point_outcome(
+                    winner_idx,
+                    "last hitter missed court",
+                    "out_error",
+                    contact_player,
+                )
             if (
                 self.point_start_frame_internal is not None and
                 (self.frame_count - self.point_start_frame_internal) <= 45
             ):
-                return self._point_outcome(receiver_idx, "early serve/rally out by server", "out_error", server_idx)
-            if recent_contact:
-                return self._point_outcome(1 - contact_player, "last hitter missed court", "out_error", contact_player)
+                return self._point_outcome(
+                    receiver_idx,
+                    "early serve/rally out by server",
+                    "out_error",
+                    server_idx,
+                )
+            if landing_player is not None:
+                return self._point_outcome(
+                    landing_player,
+                    "ball out; hitter unknown, landing-side fallback",
+                    "out_error",
+                    1 - landing_player,
+                )
 
         if "upper fence" in reason_lower and "fell down" in reason_lower:
             if recent_contact:
