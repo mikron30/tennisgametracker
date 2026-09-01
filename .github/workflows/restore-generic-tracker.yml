@@ -1,0 +1,141 @@
+name: Restore generic tracker safely
+on:
+  push:
+    branches: [revert_1]
+    paths: [.github/workflows/restore-generic-tracker.yml]
+permissions:
+  contents: write
+jobs:
+  restore:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: revert_1
+          fetch-depth: 0
+      - name: Restore pre-cleanup tracker and remove only absolute-frame exceptions
+        run: |
+          git show b4880387e6769ba33b3919b86901fced76662dd0:interactive_ball_analyzer.py > interactive_ball_analyzer.py
+          cp interactive_ball_analyzer.py /tmp/precleanup.py
+          python - <<'PY'
+          from pathlib import Path
+          import ast, re
+
+          path=Path('interactive_ball_analyzer.py')
+          src=path.read_text(encoding='utf-8')
+
+          # Replace only methods whose entire purpose is a reviewed/video-specific
+          # absolute-frame override. Keep the methods as neutral no-ops so existing
+          # general call sites remain structurally unchanged.
+          stubs={
+            '_point_timeout_result_override': "    def _point_timeout_result_override(self, reason, end_position=None):\n        return None\n",
+            '_reference_point_end_targets': "    def _reference_point_end_targets(self):\n        return ()\n",
+            '_reference_point_end_target': "    def _reference_point_end_target(self):\n        return None\n",
+            '_reviewed_point_continuation_frame': "    def _reviewed_point_continuation_frame(self):\n        return None\n",
+            '_reference_point_end_override': "    def _reference_point_end_override(self):\n        return None\n",
+            '_is_reviewed_false_serve_start': "    def _is_reviewed_false_serve_start(self):\n        return False\n",
+            '_seed_match_state_from_start_frame': "    def _seed_match_state_from_start_frame(self):\n        return\n",
+            '_sync_court2_video_phase_from_frame': "    def _sync_court2_video_phase_from_frame(self):\n        return\n",
+            '_court2_false_serve_start_override': "    def _court2_false_serve_start_override(self, reason):\n        return False\n",
+          }
+          tree=ast.parse(src)
+          spans=[]
+          for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name in stubs:
+              spans.append((node.lineno,node.end_lineno,node.name))
+          found={name for _,_,name in spans}
+          if found != set(stubs):
+            raise SystemExit(f'Missing expected methods before patch: {sorted(set(stubs)-found)}')
+          lines=src.splitlines(keepends=True)
+          for a,b,name in sorted(spans, reverse=True):
+            lines[a-1:b]=[stubs[name]]
+          src=''.join(lines)
+
+          # The caught-toss reconciliation is event/trajectory driven and generic;
+          # keep it, but remove the old specific-frame feature switch around it.
+          old="        if self.disable_specific_frame_logic:\n            return row\n"
+          if src.count(old) != 1:
+            raise SystemExit(f'Expected one reconciliation flag guard, got {src.count(old)}')
+          src=src.replace(old,'',1)
+
+          # Remove the obsolete constructor switch completely.
+          src,n=re.subn(r'^\s*disable_specific_frame_logic: bool = False,\n','',src,count=1,flags=re.M)
+          if n != 1: raise SystemExit('constructor flag parameter not found exactly once')
+          src,n=re.subn(r'^\s*self\.disable_specific_frame_logic = bool\(disable_specific_frame_logic\)\n','',src,count=1,flags=re.M)
+          if n != 1: raise SystemExit('constructor flag assignment not found exactly once')
+
+          # Remove the old exact-frame HSV special case. All frames now use normal selection.
+          old=("            use_alt_first = (\n"
+               "                not self.disable_specific_frame_logic and self.frame_count == 127\n"
+               "            )\n")
+          if src.count(old) != 1: raise SystemExit('frame-127 block not found exactly once')
+          src=src.replace(old,"            use_alt_first = False\n",1)
+
+          # Turn old absolute-frame debug-only windows into the normal debug switch.
+          src=src.replace("if 1170 <= self.frame_count <= 1200:", "if getattr(self, 'verbose_debug', False):")
+          src=src.replace("if 12740 <= self.frame_count <= 12790:", "if getattr(self, 'verbose_debug', False):")
+          src,n=re.subn(
+            r'^\s*elif 1165 <= self\.frame_count <= 1185:\n\s*print\(f"\[STATE_STUCK\][^\n]*\)\n',
+            '',src,count=1,flags=re.M
+          )
+          if n != 1: raise SystemExit('STATE_STUCK absolute debug branch not found exactly once')
+
+          # Remove the CLI switch and constructor forwarding completely.
+          src,n=re.subn(
+            r'^\s*parser\.add_argument\("--disable-specific-frame-logic", action="store_true",\n'
+            r'^\s*help="Disable reviewed and exact-frame tracking exceptions"\)\n',
+            '',src,count=1,flags=re.M
+          )
+          if n != 1: raise SystemExit('CLI flag block not found exactly once')
+          src,n=re.subn(r'^\s*disable_specific_frame_logic=args\.disable_specific_frame_logic,\n','',src,count=1,flags=re.M)
+          if n != 1: raise SystemExit('CLI constructor forwarding not found exactly once')
+
+          # Remove literal source-video frame IDs from comments/debug prose as well.
+          src=re.sub(r'\bf\d{3,}\b','a prior frame',src)
+          src=re.sub(r'\bframe \d{3,}\b','a prior frame',src,flags=re.I)
+
+          path.write_text(src,encoding='utf-8')
+          PY
+
+      - name: Validate full tracker survived and no absolute-frame exceptions remain
+        run: |
+          python -m py_compile interactive_ball_analyzer.py ball_local_ai_recovery.py ball_ai_recovery_probe.py
+          python - <<'PY'
+          import ast,re
+          from pathlib import Path
+          old=Path('/tmp/precleanup.py').read_text(encoding='utf-8')
+          cur=Path('interactive_ball_analyzer.py').read_text(encoding='utf-8')
+          def names(text):
+            return {n.name for n in ast.walk(ast.parse(text)) if isinstance(n,(ast.FunctionDef,ast.AsyncFunctionDef))}
+          missing=names(old)-names(cur)
+          if missing:
+            raise SystemExit(f'Generic-method regression: missing {sorted(missing)}')
+          required={'load_hsv_config','track_ball_in_frame','detect_serve_position','_classify_ground_bounce','_reacquire_ball_by_motion'}
+          absent=required-names(cur)
+          if absent:
+            raise SystemExit(f'Critical methods missing: {sorted(absent)}')
+          forbidden=[
+            'disable_specific_frame_logic','--disable-specific-frame-logic',
+            '11921','12400','9180 <= start_frame <= 9270',
+            "self.frame_count == 127",'1170 <= self.frame_count <= 1200',
+            '12740 <= self.frame_count <= 12790','1165 <= self.frame_count <= 1185',
+            "'start_frame': 6020","'start_frame': 5540","reviewed_starts = (22, 696",
+          ]
+          bad=[x for x in forbidden if x in cur]
+          if bad:
+            raise SystemExit(f'Forbidden absolute-frame logic remains: {bad}')
+          textual=re.findall(r'\bf\d{3,}\b|\bframe \d{3,}\b',cur,re.I)
+          if textual:
+            raise SystemExit(f'Literal frame references remain: {textual[:20]}')
+          print('RESTORE_GENERIC_TRACKER_OK')
+          print('LINES',len(cur.splitlines()))
+          print('FUNCTIONS',len(names(cur)))
+          PY
+
+      - name: Commit repaired tracker
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add interactive_ball_analyzer.py
+          git commit -m "Restore generic tracker after frame cleanup"
+          git push origin HEAD:revert_1
