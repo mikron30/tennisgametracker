@@ -1,0 +1,21 @@
+name: Inspect analyzer playback loop
+
+on:
+  push:
+    branches: [revert_1]
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Show playback-related code
+        shell: bash
+        run: |
+          echo '=== playback symbols ==='
+          grep -n -E 'waitKey|SPACE|auto_play|auto-play|paused|playing|imshow|display_frame|key ==' interactive_ball_analyzer.py || true
+          echo '=== parser tail ==='
+          grep -n -A80 -B10 -- '--auto-play' interactive_ball_analyzer.py || true
