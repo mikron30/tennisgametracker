@@ -782,6 +782,87 @@ class InteractiveBallAnalyzer:
 
         return None
 
+    def _prefer_serve_flight_trajectory_candidate(self, candidate_meta, predicted_point):
+        """Keep an accepted first serve locked to its image trajectory.
+
+        This guard is active only after the serve has already been accepted and
+        before its first bounce. Candidate choice intentionally uses only
+        position/movement geometry -- never contour area or ball size.
+        """
+        if not getattr(self, '_awaiting_serve_bounce', False):
+            return None
+        if self.ball_center is None or predicted_point is None or not candidate_meta:
+            return None
+
+        motion = self.last_motion or getattr(self, 'last_nonzero_motion', None)
+        if not motion:
+            return None
+
+        ref_dx = float(motion.get('dx', 0.0) or 0.0)
+        ref_dy = float(motion.get('dy', 0.0) or 0.0)
+        ref_dist = float(motion.get('distance', 0.0) or 0.0)
+        if ref_dist < 18.0:
+            return None
+
+        predicted_cap = max(55.0, min(230.0, ref_dist * 1.25 + 35.0))
+        step_cap = max(100.0, min(460.0, ref_dist * 2.10 + 55.0))
+        trajectory_candidates = []
+
+        for entry in candidate_meta:
+            px, py = entry['pos']
+            move_dx = float(px - self.ball_center[0])
+            move_dy = float(py - self.ball_center[1])
+            move_dist = math.hypot(move_dx, move_dy)
+            pred_dist = math.hypot(
+                float(px - predicted_point[0]),
+                float(py - predicted_point[1]),
+            )
+
+            if move_dist > step_cap or pred_dist > predicted_cap:
+                continue
+
+            alignment = 1.0
+            if move_dist >= 6.0:
+                alignment = (
+                    ref_dx * move_dx + ref_dy * move_dy
+                ) / max(1.0, ref_dist * move_dist)
+                if alignment < -0.20:
+                    continue
+
+            # A natural serve arc can reverse vertically near its apex, so only
+            # reject large abrupt axis reversals while the previous component
+            # is still substantial.
+            if abs(ref_dx) >= 12.0 and move_dx * ref_dx < 0.0:
+                if abs(move_dx) > max(38.0, abs(ref_dx) * 0.85):
+                    continue
+            if abs(ref_dy) >= 12.0 and move_dy * ref_dy < 0.0:
+                if abs(move_dy) > max(48.0, abs(ref_dy) * 0.95):
+                    continue
+
+            speed_delta = abs(move_dist - ref_dist)
+            trajectory_score = (
+                pred_dist
+                + 0.20 * speed_delta
+                + 14.0 * max(0.0, 1.0 - alignment)
+            )
+            trajectory_candidates.append(
+                (trajectory_score, pred_dist, move_dist, entry)
+            )
+
+        if not trajectory_candidates:
+            return None
+
+        trajectory_candidates.sort(key=lambda item: (item[0], item[1], item[2]))
+        chosen = trajectory_candidates[0][3]
+        default = min(candidate_meta, key=lambda entry: (entry['score'], entry['distance']))
+        if chosen is not default:
+            print(
+                '  [SERVE-FLIGHT LOCK] '
+                f"keeping trajectory candidate {chosen['source']} at {chosen['pos']} "
+                f"instead of {default['source']} at {default['pos']}"
+            )
+        return chosen
+
     def _prefer_predicted_continuation_candidate(self, candidate_meta, predicted_point):
         if self.ball_center is None or predicted_point is None or not candidate_meta:
             return None
@@ -5950,7 +6031,21 @@ class InteractiveBallAnalyzer:
                     f"source={back_meta['source']}"
                 )
 
+        serve_flight_meta = None
         if (candidate_meta and
+                getattr(self, '_awaiting_serve_bounce', False) and
+                not top_return_search_context and
+                not back_return_search_context):
+            serve_flight_meta = self._prefer_serve_flight_trajectory_candidate(
+                candidate_meta, predicted_point
+            )
+            if serve_flight_meta is not None:
+                best_contour = serve_flight_meta['contour']
+                best_source = serve_flight_meta['source']
+                best_score = serve_flight_meta['score']
+
+        if (candidate_meta and
+                serve_flight_meta is None and
                 not top_return_search_context and
                 not back_return_search_context and
                 not serve_direction_search):
