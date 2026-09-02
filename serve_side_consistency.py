@@ -14,11 +14,14 @@ from a sequence:
   1. the previous serve has evidence that it was IN,
   2. the rally is very short (0 or 1 return/hit),
   3. the immediately following serve is by the same server,
-  4. it uses the same serve attempt,
-  5. it starts from the same physical service side.
+  4. it starts from the same physical/service side.
 
-A direct tracker "serve let" label is accepted, but visible net contact is not
-required for retrospective inference. No frame numbers are hard-coded.
+The tracker serve-attempt label is NOT a prerequisite for inferred lets. If the
+tracker mistakenly called a first-serve let a fault, it may label the replay as
+2nd; that attempt change is itself evidence of tracker-state error after the
+same-side replay has confirmed the let. A direct tracker "serve let" label is
+accepted, but visible net contact is not required for retrospective inference.
+No frame numbers are hard-coded.
 """
 from __future__ import annotations
 
@@ -221,11 +224,7 @@ class ServeSideConsistencyGuard:
         return None, "none"
 
     @staticmethod
-    def _classify_position(
-        position: Optional[Point],
-        physical: str,
-        model: Optional[Tuple[float, float, float]],
-    ) -> Tuple[Optional[str], float]:
+    def _classify_position(position, physical, model):
         if position is None or model is None or physical not in {"near", "far"}:
             return None, 0.0
         low, high, midpoint = model
@@ -303,7 +302,6 @@ class ServeSideConsistencyGuard:
                 not prev.get("_is_let")
                 and same_server
                 and same_physical
-                and same_attempt
                 and same_reliable_side
                 and serve_in
                 and short_rally
@@ -315,6 +313,9 @@ class ServeSideConsistencyGuard:
                     "explicit": explicit,
                     "inferred": inferred,
                     "score_advanced": score_advanced,
+                    "attempt_changed": not same_attempt,
+                    "previous_attempt": _norm(prev.get("serve_attempt")),
+                    "current_attempt": _norm(cur.get("serve_attempt")),
                     "serve_in_source": serve_in_source,
                 }
 
@@ -342,7 +343,10 @@ class ServeSideConsistencyGuard:
             info = replay_info.get(i)
             replay_after_let = info is not None
             inferred_let_replay = bool(info and info["inferred"])
-            missed_let_candidate = bool(info and info["inferred"] and info["score_advanced"])
+            missed_let_candidate = bool(
+                info and info["inferred"]
+                and (info["score_advanced"] or info["attempt_changed"])
+            )
             details: List[str] = []
 
             model = row.get("_model")
@@ -359,15 +363,20 @@ class ServeSideConsistencyGuard:
                 details.append(
                     "retrospective let sequence: previous serve in "
                     f"({info['serve_in_source']}), rally_shots={prev_shots}, "
-                    f"same attempt and same reliable side={observed}"
+                    f"same server and same reliable service side={observed}"
                 )
-                if missed_let_candidate:
+                if info["attempt_changed"]:
                     details.append(
-                        "previous sequence appears to be a MISSED LET: score/point advanced "
-                        "even though players immediately replayed the same serve"
+                        "tracker attempt changed "
+                        f"({info['previous_attempt']} -> {info['current_attempt']}); "
+                        "attempt label is state to correct, not a let prerequisite"
                     )
+                if info["score_advanced"]:
+                    details.append("tracker score/point advanced across the apparent let replay")
+                if missed_let_candidate:
+                    details.append("previous sequence appears to be a MISSED LET")
                 else:
-                    details.append("inferred let replay; score did not advance")
+                    details.append("inferred let replay; score and attempt remained consistent")
 
             score_side_mismatch = bool(reliable and expected and observed != expected)
             if missed_let_candidate:
@@ -488,10 +497,7 @@ class ServeSideConsistencyGuard:
 
 def read_point_history(path: Path) -> List[dict]:
     with path.open("r", encoding="utf-8-sig", newline="") as handle:
-        return [
-            row for row in csv.DictReader(handle)
-            if row and (row.get("point_index") or "").strip()
-        ]
+        return [row for row in csv.DictReader(handle) if row and (row.get("point_index") or "").strip()]
 
 
 def print_report(checks: Sequence[ServeCheck], only_problems: bool = False) -> int:
