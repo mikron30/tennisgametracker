@@ -15,6 +15,12 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from retro_let_scoring import install_retro_let_bootstrap
+
+# interactive_ball_analyzer imports this module during startup.  The bootstrap
+# patches only InteractiveBallAnalyzer instances and otherwise stays inert.
+install_retro_let_bootstrap()
+
 
 DEFAULT_MODES = ("regular_court", "alt1", "alt2", "alt3", "s_30", "h_10")
 
