@@ -7,6 +7,8 @@ Tennis invariants:
 - A second serve is from the same side as the immediately preceding first serve
   for that tennis point.
 - Consecutive *new points* in one game alternate service sides.
+- A serve let (net touch + correct service-box bounce) replays the SAME serve:
+  score, serve attempt and service side do not change.
 
 The CSV auditor uses the SERVER position as the primary spatial observation.
 The toss/ball position is only a fallback when server position is unavailable.
@@ -79,6 +81,26 @@ def expected_serve_side(score: str) -> Optional[str]:
     return "right" if parity == 0 else "left"
 
 
+def _is_serve_let_row(row: dict) -> bool:
+    """Recognize a tracker-recorded let without relying on any frame number."""
+    category = (row.get("category") or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if category == "serve_let":
+        return True
+    for field in ("end_reason", "why"):
+        if "serve let" in (row.get(field) or "").strip().lower():
+            return True
+    return False
+
+
+def _same_server_score(a: Optional[dict], b: dict) -> bool:
+    if a is None:
+        return False
+    return (
+        (a.get("server") or "").strip() == (b.get("server") or "").strip()
+        and a.get("_score_before") == b.get("_score_before")
+    )
+
+
 def _kmeans_1d(values: Sequence[float]) -> Optional[Tuple[float, float]]:
     if len(values) < 4:
         return None
@@ -115,9 +137,12 @@ class ServeCheck:
     confidence: float
     x: Optional[float]
     position_source: str
+    is_let: bool
+    replay_after_let: bool
     score_side_mismatch: bool
     first_second_mismatch: bool
     alternation_mismatch: bool
+    let_replay_mismatch: bool
     status: str
     detail: str
 
@@ -131,8 +156,9 @@ class ServeSideConsistencyGuard:
 
     The offline audit learns two server-position x clusters independently for
     each server/physical end. Low-confidence or unknown observations BREAK the
-    alternation chain instead of being silently skipped; this prevents a later
-    valid serve from being compared against a non-consecutive earlier point.
+    alternation chain instead of being silently skipped. A serve let is treated
+    as a replay of the same tennis serve, so it must keep the score, attempt and
+    side unchanged and must NOT advance the first-serve alternation chain.
     """
 
     def __init__(self, min_cluster_separation_px: float = 160.0, min_confidence: float = 0.25):
@@ -160,7 +186,6 @@ class ServeSideConsistencyGuard:
 
     @staticmethod
     def _row_observation(row: dict) -> Tuple[Optional[Point], str]:
-        # Server position is the correct geometric measurement for service side.
         player_pos = _parse_position(row.get("serve_player_position", ""))
         if player_pos is not None:
             return player_pos, "server"
@@ -168,6 +193,24 @@ class ServeSideConsistencyGuard:
         if ball_pos is not None:
             return ball_pos, "ball-fallback"
         return None, "none"
+
+    @staticmethod
+    def _classify_position(
+        position: Optional[Point],
+        physical: str,
+        model: Optional[Tuple[float, float, float]],
+    ) -> Tuple[Optional[str], float]:
+        if position is None or model is None or physical not in {"near", "far"}:
+            return None, 0.0
+        low, high, midpoint = model
+        x = position[0]
+        if physical == "near":
+            observed = "right" if x >= midpoint else "left"
+        else:
+            observed = "right" if x <= midpoint else "left"
+        half_separation = max(1.0, (high - low) / 2.0)
+        confidence = min(1.0, abs(x - midpoint) / half_separation)
+        return observed, confidence
 
     def audit_rows(self, rows: Sequence[dict], initial_score: str = "0:0 0:0") -> List[ServeCheck]:
         enriched: List[dict] = []
@@ -178,24 +221,34 @@ class ServeSideConsistencyGuard:
             row["_score_before"] = score_before
             row["_row_number"] = row_number
             row["_serve_pos"], row["_position_source"] = self._row_observation(row)
+            row["_is_let"] = _is_serve_let_row(row)
             enriched.append(row)
             current = (row.get("current_score") or "").strip()
             if current:
                 previous_score = current
 
-        # Learn two x clusters per server and physical end from FIRST serves only.
+        # Learn two x clusters per server/physical end from FIRST serves only.
+        # A repeated first serve after a let is excluded so one let does not
+        # overweight one side of the cluster model.
         groups: Dict[Tuple[str, str], List[float]] = {}
+        previous_row: Optional[dict] = None
         for row in enriched:
-            if (row.get("serve_attempt") or "").strip().lower() not in _FIRST:
-                continue
-            position = row["_serve_pos"]
-            if position is None:
-                continue
-            key = (
-                (row.get("server") or "").strip(),
-                (row.get("serve_player_side") or "").strip().lower(),
+            attempt_norm = (row.get("serve_attempt") or "").strip().lower()
+            replay_after_let = bool(
+                previous_row is not None
+                and previous_row.get("_is_let")
+                and _same_server_score(previous_row, row)
+                and (previous_row.get("serve_attempt") or "").strip().lower() == attempt_norm
             )
-            groups.setdefault(key, []).append(position[0])
+            if attempt_norm in _FIRST and not replay_after_let:
+                position = row["_serve_pos"]
+                if position is not None:
+                    key = (
+                        (row.get("server") or "").strip(),
+                        (row.get("serve_player_side") or "").strip().lower(),
+                    )
+                    groups.setdefault(key, []).append(position[0])
+            previous_row = row
 
         models: Dict[Tuple[str, str], Tuple[float, float, float]] = {}
         for key, xs in groups.items():
@@ -208,9 +261,8 @@ class ServeSideConsistencyGuard:
             models[key] = (low, high, (low + high) / 2.0)
 
         checks: List[ServeCheck] = []
-        # Value None means the chain was deliberately broken by an uncertain serve.
         last_first_side_by_game: Dict[Tuple[str, str, str], Optional[str]] = {}
-        previous_row: Optional[dict] = None
+        previous_row = None
 
         for row in enriched:
             score_before = row["_score_before"]
@@ -224,19 +276,13 @@ class ServeSideConsistencyGuard:
             position = row["_serve_pos"]
             source = row["_position_source"]
             x = position[0] if position else None
-            observed: Optional[str] = None
-            confidence = 0.0
+            is_let = bool(row.get("_is_let"))
             details: List[str] = []
 
             model = models.get((server, physical))
-            if x is not None and model is not None and physical in {"near", "far"}:
+            observed, confidence = self._classify_position(position, physical, model)
+            if model is not None and position is not None and physical in {"near", "far"}:
                 low, high, midpoint = model
-                if physical == "near":
-                    observed = "right" if x >= midpoint else "left"
-                else:
-                    observed = "right" if x <= midpoint else "left"
-                half_separation = max(1.0, (high - low) / 2.0)
-                confidence = min(1.0, abs(x - midpoint) / half_separation)
                 details.append(
                     f"source={source} clusters={low:.0f}/{high:.0f}px midpoint={midpoint:.0f}px"
                 )
@@ -247,52 +293,84 @@ class ServeSideConsistencyGuard:
             score_side_mismatch = bool(reliable and expected and observed != expected)
             alternation_mismatch = False
             first_second_mismatch = False
+            let_replay_mismatch = False
 
-            games_token, _points_token = _split_score(score_before)
             is_first = attempt_norm in _FIRST
             is_second = attempt_norm in _SECOND
+            games_token, _points_token = _split_score(score_before)
 
-            # Consecutive FIRST serves in one game must alternate. Crucially,
-            # an uncertain/unknown first serve breaks the chain so we never
-            # compare across a missing observation.
+            # A let means the NEXT serve is a replay of this exact serve.
+            replay_after_let = bool(
+                previous_row is not None
+                and previous_row.get("_is_let")
+                and _same_server_score(previous_row, row)
+            )
+            if replay_after_let:
+                prev_attempt = (previous_row.get("serve_attempt") or "").strip().lower()
+                prev_physical = (previous_row.get("serve_player_side") or "").strip().lower()
+                prev_model = models.get((server, prev_physical))
+                prev_obs, prev_conf = self._classify_position(
+                    previous_row.get("_serve_pos"), prev_physical, prev_model
+                )
+                if attempt_norm != prev_attempt:
+                    let_replay_mismatch = True
+                    details.append(
+                        f"serve let must replay same attempt ({prev_attempt or '?'} -> {attempt_norm or '?'})"
+                    )
+                if prev_physical and physical and prev_physical != physical:
+                    let_replay_mismatch = True
+                    details.append(
+                        f"serve let changed physical server end ({prev_physical} -> {physical})"
+                    )
+                if (
+                    prev_obs is not None
+                    and observed is not None
+                    and min(prev_conf, confidence) >= self.min_confidence
+                ):
+                    if prev_obs != observed:
+                        let_replay_mismatch = True
+                        details.append(
+                            f"serve let replay changed side ({prev_obs} -> {observed})"
+                        )
+                    else:
+                        details.append(f"replay after serve let stayed on {observed}")
+                else:
+                    details.append("replay after serve let; side comparison uncertain")
+
+            # New FIRST serves alternate. A repeated FIRST serve after a let is
+            # explicitly NOT a new point and therefore must stay on the same side.
             if is_first:
                 game_key = (games_token, server, physical)
-                previous_observed = last_first_side_by_game.get(game_key)
-                if reliable:
-                    if previous_observed is not None and previous_observed == observed:
-                        alternation_mismatch = True
-                        details.append("consecutive reliable first serves stayed on same side")
-                    last_first_side_by_game[game_key] = observed
+                if replay_after_let:
+                    details.append("first-serve let replay; alternation not advanced")
                 else:
-                    last_first_side_by_game[game_key] = None
-                    details.append("alternation chain reset by uncertain first serve")
+                    previous_observed = last_first_side_by_game.get(game_key)
+                    if reliable:
+                        if previous_observed is not None and previous_observed == observed:
+                            alternation_mismatch = True
+                            details.append("consecutive reliable new-point first serves stayed on same side")
+                        last_first_side_by_game[game_key] = observed
+                    else:
+                        last_first_side_by_game[game_key] = None
+                        details.append("alternation chain reset by uncertain first serve")
 
-            # A second serve is paired ONLY with the immediately preceding row,
-            # and only when that row is the same server/physical end/score and
-            # is a first serve. This prevents distant rows with the same score
-            # from being paired accidentally.
-            if is_second and previous_row is not None:
+            # A normal second serve is paired only with the immediately
+            # preceding FIRST-serve row for the same score state. If the previous
+            # row was a let, replay rules above are authoritative instead.
+            if is_second and previous_row is not None and not replay_after_let:
                 prev_attempt = (previous_row.get("serve_attempt") or "").strip().lower()
                 same_point_state = (
                     prev_attempt in _FIRST
+                    and not previous_row.get("_is_let")
                     and (previous_row.get("server") or "").strip() == server
                     and (previous_row.get("serve_player_side") or "").strip().lower() == physical
                     and previous_row.get("_score_before") == score_before
                 )
                 if same_point_state:
-                    prev_pos = previous_row.get("_serve_pos")
+                    prev_obs, prev_conf = self._classify_position(
+                        previous_row.get("_serve_pos"), physical, model
+                    )
                     prev_source = previous_row.get("_position_source", "none")
-                    prev_obs: Optional[str] = None
-                    prev_conf = 0.0
-                    if prev_pos is not None and model is not None and physical in {"near", "far"}:
-                        low, high, midpoint = model
-                        prev_x = prev_pos[0]
-                        if physical == "near":
-                            prev_obs = "right" if prev_x >= midpoint else "left"
-                        else:
-                            prev_obs = "right" if prev_x <= midpoint else "left"
-                        half_separation = max(1.0, (high - low) / 2.0)
-                        prev_conf = min(1.0, abs(prev_x - midpoint) / half_separation)
                     if (
                         prev_obs is not None
                         and observed is not None
@@ -301,13 +379,18 @@ class ServeSideConsistencyGuard:
                     ):
                         first_second_mismatch = True
                         details.append(
-                            f"immediate first/second serve changed side ({prev_obs} -> {observed}; first source={prev_source})"
+                            f"immediate first/second serve changed side "
+                            f"({prev_obs} -> {observed}; first source={prev_source})"
                         )
 
+            if is_let:
+                details.append("serve let: no point, same attempt and side must be replayed")
             if score_side_mismatch:
                 details.append(f"score expects {expected}, observed {observed}")
 
-            if first_second_mismatch:
+            if let_replay_mismatch:
+                status = "LET_REPLAY_MISMATCH"
+            elif first_second_mismatch:
                 status = "FIRST_SECOND_MISMATCH"
             elif score_side_mismatch:
                 status = "SCORE_SIDE_MISMATCH"
@@ -332,9 +415,12 @@ class ServeSideConsistencyGuard:
                 confidence=confidence,
                 x=x,
                 position_source=source,
+                is_let=is_let,
+                replay_after_let=replay_after_let,
                 score_side_mismatch=score_side_mismatch,
                 first_second_mismatch=first_second_mismatch,
                 alternation_mismatch=alternation_mismatch,
+                let_replay_mismatch=let_replay_mismatch,
                 status=status,
                 detail="; ".join(details),
             ))
@@ -344,8 +430,6 @@ class ServeSideConsistencyGuard:
 
 
 def read_point_history(path: Path) -> List[dict]:
-    # A live CSV may end in a partially written final line. Rows without a
-    # point_index are ignored until the next watch poll.
     with path.open("r", encoding="utf-8-sig", newline="") as handle:
         return [
             row for row in csv.DictReader(handle)
@@ -357,25 +441,42 @@ def print_report(checks: Sequence[ServeCheck], only_problems: bool = False) -> i
     score_mismatches = sum(c.score_side_mismatch for c in checks)
     first_second_mismatches = sum(c.first_second_mismatch for c in checks)
     alternation_mismatches = sum(c.alternation_mismatch for c in checks)
+    let_replay_mismatches = sum(c.let_replay_mismatch for c in checks)
+    lets = sum(c.is_let for c in checks)
+    let_replays = sum(c.replay_after_let for c in checks)
     low_confidence = sum(c.status == "LOW_CONFIDENCE" for c in checks)
     unknown = sum(c.status == "UNKNOWN" for c in checks)
     problem_serves = sum(
-        c.score_side_mismatch or c.first_second_mismatch or c.alternation_mismatch
+        c.score_side_mismatch
+        or c.first_second_mismatch
+        or c.alternation_mismatch
+        or c.let_replay_mismatch
         for c in checks
     )
 
     for check in checks:
-        is_problem = check.score_side_mismatch or check.first_second_mismatch or check.alternation_mismatch
+        is_problem = (
+            check.score_side_mismatch
+            or check.first_second_mismatch
+            or check.alternation_mismatch
+            or check.let_replay_mismatch
+        )
         if only_problems and not is_problem:
             continue
         x_text = "?" if check.x is None else f"{check.x:.0f}"
         expected = check.expected or "?"
         observed = check.observed or "?"
+        flags = []
+        if check.is_let:
+            flags.append("let=yes")
+        if check.replay_after_let:
+            flags.append("let_replay=yes")
+        flag_text = (" " + " ".join(flags)) if flags else ""
         print(
             f"[SERVE_SIDE_{check.status}] point={check.point_index} f={check.frame} "
             f"server={check.server} attempt={check.attempt} score_before={check.score_before} "
             f"expected={expected} observed={observed} x={x_text} conf={check.confidence:.2f} "
-            f"source={check.position_source}"
+            f"source={check.position_source}{flag_text}"
             + (f" | {check.detail}" if check.detail else "")
         )
 
@@ -385,6 +486,8 @@ def print_report(checks: Sequence[ServeCheck], only_problems: bool = False) -> i
         f"score_side_mismatches={score_mismatches} "
         f"first_second_mismatches={first_second_mismatches} "
         f"alternation_mismatches={alternation_mismatches} "
+        f"let_replay_mismatches={let_replay_mismatches} "
+        f"lets={lets} let_replays={let_replays} "
         f"low_confidence={low_confidence} unknown={unknown}"
     )
     return problem_serves
