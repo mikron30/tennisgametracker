@@ -1323,15 +1323,33 @@ class InteractiveBallAnalyzer:
         current = int(self.frame_count)
         state = getattr(self, '_contact_local_ai_state', None)
         if arm_reason is not None and not isinstance(state, dict):
+            # Seed CONTACT_LOCAL_AI with the trusted pre-contact anchor.  On the
+            # contact frame this is only one history point, so no trajectory is
+            # imposed across the racket direction change.  After Local AI accepts
+            # the first outgoing point, the next frame immediately has two points
+            # and can predict the outgoing ball trajectory.
+            seed_history = []
+            if previous_position is not None:
+                seed_history.append({
+                    'frame': current - 1,
+                    'pos': tuple(previous_position),
+                    'score': 1.0,
+                    'contact_seed': True,
+                })
             state = {
                 'start_frame': current,
                 'deadline': current + 22,
-                'history': [],
+                'history': seed_history,
                 'outside_count': 0,
                 'miss_count': 0,
                 'reason': str(arm_reason),
             }
             self._contact_local_ai_state = state
+            if seed_history:
+                print(
+                    f"[CONTACT_LOCAL_AI_SEED] f{current}: "
+                    f"seed_frame={current - 1} position={tuple(previous_position)}"
+                )
             # Do not let an older tight-ROI experiment compete with contact
             # ownership.  The automatic owner is the stronger, player-excluding
             # path and will hand control back explicitly.
