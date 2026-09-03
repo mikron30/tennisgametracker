@@ -788,6 +788,40 @@ class PlayerRacketTracker:
             return "player_head_hat"
         if (x - int(w * 0.15) <= px <= x + int(w * 1.15)
                 and y + int(h * 0.80) <= py <= y + int(h * 1.15)):
+            debug_zone = os.environ.get("TGT_DEBUG_PLAYER_ZONE", "").strip().lower() in (
+                "1", "true", "yes", "on"
+            )
+            debug_range = os.environ.get("TGT_DEBUG_PLAYER_ZONE_RANGE", "").strip()
+            tracker_frame = int(self.last_frame) if self.last_frame is not None else -1
+            if debug_range:
+                try:
+                    left, right = debug_range.split(":", 1)
+                    debug_zone = int(left) <= tracker_frame <= int(right)
+                except (TypeError, ValueError):
+                    pass
+            if debug_zone:
+                track_last = int(track.last_frame)
+                age = tracker_frame - track_last if tracker_frame >= 0 and track_last >= 0 else None
+                shoe_rect = (
+                    x - int(w * 0.15),
+                    y + int(h * 0.80),
+                    x + int(w * 1.15),
+                    y + int(h * 1.15),
+                )
+                expanded = (
+                    x - int(w * 0.45),
+                    y - int(h * 0.25),
+                    x + int(w * 1.45),
+                    y + int(h * 1.25),
+                )
+                print(
+                    f"[PLAYER_ZONE_SHOES] tracker_frame={tracker_frame} point=({px},{py}) "
+                    f"side={track.side} bbox={track.bbox} center={track.center} "
+                    f"shoes_point={track.shoes} visible={track.visible} "
+                    f"confidence={track.confidence:.3f} track_last={track_last} age={age} "
+                    f"last_detection={self._last_detection_frame} "
+                    f"shoe_rect={shoe_rect} expanded_track_rect={expanded}"
+                )
             return "player_shoes"
         if track.racket and track.racket.get("line"):
             lx1, ly1, lx2, ly2 = track.racket["line"]
