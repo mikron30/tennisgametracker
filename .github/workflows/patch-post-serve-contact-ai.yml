@@ -1,11 +1,6 @@
 name: Patch post-serve CONTACT_LOCAL_AI consensus
 
-on:
-  push:
-    branches:
-      - revert_1
-    paths:
-      - .github/workflows/patch-post-serve-contact-ai.yml
+on: [push]
 
 permissions:
   contents: write
@@ -19,85 +14,11 @@ jobs:
           ref: revert_1
           fetch-depth: 0
 
-      - name: Patch CONTACT_LOCAL_AI candidate tie-break
+      - name: Patch analyzer
         shell: bash
         run: |
-          python - <<'PY'
-          from pathlib import Path
-
-          path = Path('interactive_ball_analyzer.py')
-          text = path.read_text(encoding='utf-8')
-
-          old = '''        # Diagnostic only: expose the geometry that the existing ranking is
-        # already using, plus agreement with the normal contact candidate.
-        # None of these values are used to reorder or reject candidates.
-        debug_normal_candidate = getattr(
-            self, "_contact_local_ai_debug_normal_candidate", None
-        )
-        best_ai_score = max((float(item["score"]) for item in eligible), default=0.0)
-'''
-
-          new = '''        # CONTACT_LOCAL_AI_POST_SERVE_CONSENSUS_V1
-        # On the verified serve-launch frame the normal tracker has already
-        # produced an airborne candidate. If Local AI independently gives a
-        # candidate at essentially the same position a score tied with its
-        # best candidate, prefer that cross-detector agreement over the
-        # anchor-distance tie-break. This is intentionally limited to the
-        # short post-serve launch lock and only when no AI trajectory exists
-        # yet. Candidate size/area is not used here.
-        debug_normal_candidate = getattr(
-            self, "_contact_local_ai_debug_normal_candidate", None
-        )
-        best_ai_score = max((float(item["score"]) for item in eligible), default=0.0)
-        if (
-                debug_normal_candidate is not None and
-                eligible and
-                predicted is None and
-                current <= int(getattr(self, "_post_serve_launch_lock_until_frame", -1))):
-            ai_tie_margin = 1.0e-4
-            consensus_pool = [
-                item for item in eligible
-                if best_ai_score - float(item["score"]) <= ai_tie_margin
-            ]
-            if consensus_pool:
-                consensus = min(
-                    consensus_pool,
-                    key=lambda item: math.hypot(
-                        float(item["point"][0]) - float(debug_normal_candidate[0]),
-                        float(item["point"][1]) - float(debug_normal_candidate[1]),
-                    ),
-                )
-                consensus_dist = math.hypot(
-                    float(consensus["point"][0]) - float(debug_normal_candidate[0]),
-                    float(consensus["point"][1]) - float(debug_normal_candidate[1]),
-                )
-                default = eligible[0]
-                default_dist = math.hypot(
-                    float(default["point"][0]) - float(debug_normal_candidate[0]),
-                    float(default["point"][1]) - float(debug_normal_candidate[1]),
-                )
-                if (
-                        consensus is not default and
-                        consensus_dist <= 35.0 and
-                        default_dist >= max(100.0, consensus_dist + 70.0)):
-                    eligible.remove(consensus)
-                    eligible.insert(0, consensus)
-                    print(
-                        f"[FORCE_LOCAL_AI_NORMAL_TIEBREAK] f{current}: "
-                        f"normal={debug_normal_candidate} chose={consensus['point']} "
-                        f"normal_dist={consensus_dist:.1f}px ai={consensus['score']:.12f} "
-                        f"over={default['point']} default_normal_dist={default_dist:.1f}px "
-                        f"default_ai={default['score']:.12f}"
-                    )
-'''
-
-          count = text.count(old)
-          if count != 1:
-              raise SystemExit(f'Expected exactly one patch target, found {count}')
-
-          path.write_text(text.replace(old, new, 1), encoding='utf-8')
-          PY
-
+          echo 'ZnJvbSBwYXRobGliIGltcG9ydCBQYXRoCgpwYXRoID0gUGF0aCgiaW50ZXJhY3RpdmVfYmFsbF9hbmFseXplci5weSIpCnRleHQgPSBwYXRoLnJlYWRfdGV4dChlbmNvZGluZz0idXRmLTgiKQoKb2xkID0gIiIiICAgICAgICAjIERpYWdub3N0aWMgb25seTogZXhwb3NlIHRoZSBnZW9tZXRyeSB0aGF0IHRoZSBleGlzdGluZyByYW5raW5nIGlzCiAgICAgICAgIyBhbHJlYWR5IHVzaW5nLCBwbHVzIGFncmVlbWVudCB3aXRoIHRoZSBub3JtYWwgY29udGFjdCBjYW5kaWRhdGUuCiAgICAgICAgIyBOb25lIG9mIHRoZXNlIHZhbHVlcyBhcmUgdXNlZCB0byByZW9yZGVyIG9yIHJlamVjdCBjYW5kaWRhdGVzLgogICAgICAgIGRlYnVnX25vcm1hbF9jYW5kaWRhdGUgPSBnZXRhdHRyKAogICAgICAgICAgICBzZWxmLCAiX2NvbnRhY3RfbG9jYWxfYWlfZGVidWdfbm9ybWFsX2NhbmRpZGF0ZSIsIE5vbmUKICAgICAgICApCiAgICAgICAgYmVzdF9haV9zY29yZSA9IG1heCgoZmxvYXQoaXRlbVsic2NvcmUiXSkgZm9yIGl0ZW0gaW4gZWxpZ2libGUpLCBkZWZhdWx0PTAuMCkKIiIiCgpuZXcgPSAiIiIgICAgICAgICMgQ09OVEFDVF9MT0NBTF9BSV9QT1NUX1NFUlZFX0NPTlNFTlNVU19WMQogICAgICAgICMgT24gdGhlIHZlcmlmaWVkIHNlcnZlLWxhdW5jaCBmcmFtZSB0aGUgbm9ybWFsIHRyYWNrZXIgaGFzIGFscmVhZHkKICAgICAgICAjIHByb2R1Y2VkIGFuIGFpcmJvcm5lIGNhbmRpZGF0ZS4gSWYgTG9jYWwgQUkgaW5kZXBlbmRlbnRseSBnaXZlcyBhCiAgICAgICAgIyBjYW5kaWRhdGUgYXQgZXNzZW50aWFsbHkgdGhlIHNhbWUgcG9zaXRpb24gYSBzY29yZSB0aWVkIHdpdGggaXRzCiAgICAgICAgIyBiZXN0IGNhbmRpZGF0ZSwgcHJlZmVyIHRoYXQgY3Jvc3MtZGV0ZWN0b3IgYWdyZWVtZW50IG92ZXIgdGhlCiAgICAgICAgIyBhbmNob3ItZGlzdGFuY2UgdGllLWJyZWFrLiBUaGlzIGlzIGludGVudGlvbmFsbHkgbGltaXRlZCB0byB0aGUKICAgICAgICAjIHNob3J0IHBvc3Qtc2VydmUgbGF1bmNoIGxvY2sgYW5kIG9ubHkgd2hlbiBubyBBSSB0cmFqZWN0b3J5IGV4aXN0cwogICAgICAgICMgeWV0LiBDYW5kaWRhdGUgc2l6ZS9hcmVhIGlzIG5vdCB1c2VkIGhlcmUuCiAgICAgICAgZGVidWdfbm9ybWFsX2NhbmRpZGF0ZSA9IGdldGF0dHIoCiAgICAgICAgICAgIHNlbGYsICJfY29udGFjdF9sb2NhbF9haV9kZWJ1Z19ub3JtYWxfY2FuZGlkYXRlIiwgTm9uZQogICAgICAgICkKICAgICAgICBiZXN0X2FpX3Njb3JlID0gbWF4KChmbG9hdChpdGVtWyJzY29yZSJdKSBmb3IgaXRlbSBpbiBlbGlnaWJsZSksIGRlZmF1bHQ9MC4wKQogICAgICAgIGlmICgKICAgICAgICAgICAgICAgIGRlYnVnX25vcm1hbF9jYW5kaWRhdGUgaXMgbm90IE5vbmUgYW5kCiAgICAgICAgICAgICAgICBlbGlnaWJsZSBhbmQKICAgICAgICAgICAgICAgIHByZWRpY3RlZCBpcyBOb25lIGFuZAogICAgICAgICAgICAgICAgY3VycmVudCA8PSBpbnQoZ2V0YXR0cihzZWxmLCAiX3Bvc3Rfc2VydmVfbGF1bmNoX2xvY2tfdW50aWxfZnJhbWUiLCAtMSkpKToKICAgICAgICAgICAgYWlfdGllX21hcmdpbiA9IDEuMGUtNAogICAgICAgICAgICBjb25zZW5zdXNfcG9vbCA9IFsKICAgICAgICAgICAgICAgIGl0ZW0gZm9yIGl0ZW0gaW4gZWxpZ2libGUKICAgICAgICAgICAgICAgIGlmIGJlc3RfYWlfc2NvcmUgLSBmbG9hdChpdGVtWyJzY29yZSJdKSA8PSBhaV90aWVfbWFyZ2luCiAgICAgICAgICAgIF0KICAgICAgICAgICAgaWYgY29uc2Vuc3VzX3Bvb2w6CiAgICAgICAgICAgICAgICBjb25zZW5zdXMgPSBtaW4oCiAgICAgICAgICAgICAgICAgICAgY29uc2Vuc3VzX3Bvb2wsCiAgICAgICAgICAgICAgICAgICAga2V5PWxhbWJkYSBpdGVtOiBtYXRoLmh5cG90KAogICAgICAgICAgICAgICAgICAgICAgICBmbG9hdChpdGVtWyJwb2ludCJdWzBdKSAtIGZsb2F0KGRlYnVnX25vcm1hbF9jYW5kaWRhdGVbMF0pLAogICAgICAgICAgICAgICAgICAgICAgICBmbG9hdChpdGVtWyJwb2ludCJdWzFdKSAtIGZsb2F0KGRlYnVnX25vcm1hbF9jYW5kaWRhdGVbMV0pLAogICAgICAgICAgICAgICAgICAgICksCiAgICAgICAgICAgICAgICApCiAgICAgICAgICAgICAgICBjb25zZW5zdXNfZGlzdCA9IG1hdGguaHlwb3QoCiAgICAgICAgICAgICAgICAgICAgZmxvYXQoY29uc2Vuc3VzWyJwb2ludCJdWzBdKSAtIGZsb2F0KGRlYnVnX25vcm1hbF9jYW5kaWRhdGVbMF0pLAogICAgICAgICAgICAgICAgICAgIGZsb2F0KGNvbnNlbnN1c1sicG9pbnQiXVsxXSkgLSBmbG9hdChkZWJ1Z19ub3JtYWxfY2FuZGlkYXRlWzFdKSwKICAgICAgICAgICAgICAgICkKICAgICAgICAgICAgICAgIGRlZmF1bHQgPSBlbGlnaWJsZVswXQogICAgICAgICAgICAgICAgZGVmYXVsdF9kaXN0ID0gbWF0aC5oeXBvdCgKICAgICAgICAgICAgICAgICAgICBmbG9hdChkZWZhdWx0WyJwb2ludCJdWzBdKSAtIGZsb2F0KGRlYnVnX25vcm1hbF9jYW5kaWRhdGVbMF0pLAogICAgICAgICAgICAgICAgICAgIGZsb2F0KGRlZmF1bHRbInBvaW50Il1bMV0pIC0gZmxvYXQoZGVidWdfbm9ybWFsX2NhbmRpZGF0ZVsxXSksCiAgICAgICAgICAgICAgICApCiAgICAgICAgICAgICAgICBpZiAoCiAgICAgICAgICAgICAgICAgICAgICAgIGNvbnNlbnN1cyBpcyBub3QgZGVmYXVsdCBhbmQKICAgICAgICAgICAgICAgICAgICAgICAgY29uc2Vuc3VzX2Rpc3QgPD0gMzUuMCBhbmQKICAgICAgICAgICAgICAgICAgICAgICAgZGVmYXVsdF9kaXN0ID49IG1heCgxMDAuMCwgY29uc2Vuc3VzX2Rpc3QgKyA3MC4wKSk6CiAgICAgICAgICAgICAgICAgICAgZWxpZ2libGUucmVtb3ZlKGNvbnNlbnN1cykKICAgICAgICAgICAgICAgICAgICBlbGlnaWJsZS5pbnNlcnQoMCwgY29uc2Vuc3VzKQogICAgICAgICAgICAgICAgICAgIHByaW50KAogICAgICAgICAgICAgICAgICAgICAgICBmIltGT1JDRV9MT0NBTF9BSV9OT1JNQUxfVElFQlJFQUtdIGZ7Y3VycmVudH06ICIKICAgICAgICAgICAgICAgICAgICAgICAgZiJub3JtYWw9e2RlYnVnX25vcm1hbF9jYW5kaWRhdGV9IGNob3NlPXtjb25zZW5zdXNbJ3BvaW50J119ICIKICAgICAgICAgICAgICAgICAgICAgICAgZiJub3JtYWxfZGlzdD17Y29uc2Vuc3VzX2Rpc3Q6LjFmfXB4IGFpPXtjb25zZW5zdXNbJ3Njb3JlJ106LjEyZn0gIgogICAgICAgICAgICAgICAgICAgICAgICBmIm92ZXI9e2RlZmF1bHRbJ3BvaW50J119IGRlZmF1bHRfbm9ybWFsX2Rpc3Q9e2RlZmF1bHRfZGlzdDouMWZ9cHggIgogICAgICAgICAgICAgICAgICAgICAgICBmImRlZmF1bHRfYWk9e2RlZmF1bHRbJ3Njb3JlJ106LjEyZn0iCiAgICAgICAgICAgICAgICAgICAgKQoiIiIKCmNvdW50ID0gdGV4dC5jb3VudChvbGQpCmlmIGNvdW50ICE9IDE6CiAgICByYWlzZSBTeXN0ZW1FeGl0KGYiRXhwZWN0ZWQgZXhhY3RseSBvbmUgcGF0Y2ggdGFyZ2V0LCBmb3VuZCB7Y291bnR9IikKCnBhdGgud3JpdGVfdGV4dCh0ZXh0LnJlcGxhY2Uob2xkLCBuZXcsIDEpLCBlbmNvZGluZz0idXRmLTgiKQo=' | base64 -d > /tmp/patch_contact_ai.py
+          python /tmp/patch_contact_ai.py
           python -m py_compile interactive_ball_analyzer.py
 
       - name: Commit patch and remove temporary workflow
