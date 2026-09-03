@@ -28,6 +28,9 @@ _MIN_CLUSTER_CONFIDENCE = 0.25
 _EARLY_SAME_SIDE_DX_PX = 150.0
 _EARLY_OPPOSITE_SIDE_DX_PX = 240.0
 _MAX_REPLAY_GAP_FRAMES = 1200
+# Shot events exclude the serve itself. A let can still be declared before
+# the server plays the first ball after the receiver's return: 0 = no return,
+# 1 = receiver returned serve, 2+ = server has already continued the rally.
 _MAX_SHORT_RALLY_SHOTS = 1
 
 
@@ -191,6 +194,11 @@ def _rally_shots(obj):
         if isinstance(events, list):
             return len(events)
     return _safe_int(getattr(obj, "_point_hit_count", 0), 0)
+
+
+def _let_window_open(rally_shots):
+    """True only until the server plays the first ball after the return."""
+    return _safe_int(rally_shots, 0) <= _MAX_SHORT_RALLY_SHOTS
 
 
 def _server_idx_for_current_context(obj):
@@ -516,7 +524,7 @@ def _patch_tracker_class(cls):
         )
         awarded = scored_now and winner is not None
         nonfault = not _service_fault_reason(reason, category)
-        short = rally_shots <= _MAX_SHORT_RALLY_SHOTS
+        short = _let_window_open(rally_shots)
 
         # Every apparent point is already scored by original_record above.
         # We only arm a reversible candidate.  Same-side replay on the next
@@ -564,7 +572,10 @@ def _patch_tracker_class(cls):
         if observed is None:
             observed = _context_observation_from_origin(self, origin_pos)
         self._retro_let_current_observation = observed
-        _evaluate_pending(self, final=False)
+        # Point-context creation is provisional. The main tracker can later
+        # reject this serve candidate, so it is not safe evidence for a let.
+        # Resolve the previous candidate only when the following rally reaches
+        # the finalized point boundary in record_point_result().
         return result
 
     cls._record_point_result = record_point_result
@@ -577,7 +588,9 @@ def _patch_tracker_class(cls):
             observed = _observation_from_context_dict(_point_context(self))
             if observed is not None:
                 self._retro_let_current_observation = observed
-            _evaluate_pending(self, final=False)
+            # A refreshed serve context is still provisional and may belong to
+            # a serve candidate that is subsequently rejected. Keep the server
+            # observation current, but do not confirm/discard the pending let.
             return result
         cls._refresh_player_serve_context = refresh_player_serve_context
 

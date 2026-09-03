@@ -112,3 +112,55 @@ def test_score_snapshot_restores_game_state_and_removes_let_serve_in():
     assert state.current_serve_attempt == 2
     assert state.point_stats == [{"won": 3}, {"won": 4}]
     assert state.serve_stats[0]["second_in"] == 1
+
+
+def test_let_window_closes_after_server_first_return():
+    from retro_let_scoring import _let_window_open
+
+    assert _let_window_open(0) is True
+    assert _let_window_open(1) is True
+    assert _let_window_open(2) is False
+    assert _let_window_open(3) is False
+
+
+def test_provisional_serve_context_does_not_resolve_pending(monkeypatch):
+    """A false same-side serve start must not turn the previous point into a let."""
+    import retro_let_scoring as rls
+
+    calls = []
+    monkeypatch.setattr(rls, "_PATCHED", False)
+    monkeypatch.setattr(
+        rls,
+        "_evaluate_pending",
+        lambda obj, *, final=False: calls.append(bool(final)) or "unknown",
+    )
+
+    class _Tracker:
+        def __init__(self):
+            self._point_history_current = None
+            self._retro_let_pending = {"sentinel": True}
+
+        def _record_point_result(self, reason, end_position=None, frame=None, history_end_frame=None):
+            return None
+
+        def _start_point_context(self, origin_pos, serve_start_frame=None, history_origin_pos=None):
+            self._point_history_current = {
+                "server_idx": 0,
+                "serve_context": {
+                    "player_position": [1900, 1500],
+                    "player_side": "near",
+                    "player_source": "server",
+                },
+            }
+            return None
+
+        def _refresh_player_serve_context(self):
+            return None
+
+    rls._patch_tracker_class(_Tracker)
+    tracker = _Tracker()
+    tracker._start_point_context((1900, 1500), serve_start_frame=200)
+    tracker._refresh_player_serve_context()
+
+    assert calls == []
+    assert tracker._retro_let_pending == {"sentinel": True}
