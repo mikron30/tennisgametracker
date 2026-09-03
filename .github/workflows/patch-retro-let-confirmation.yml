@@ -2,7 +2,8 @@ name: Patch retrospective let confirmation boundary
 
 on:
   push:
-    branches: [revert_1]
+    branches:
+      - revert_1
 
 permissions:
   contents: write
@@ -16,114 +17,20 @@ jobs:
           ref: revert_1
           fetch-depth: 0
 
-      - name: Patch retrospective let handling
-        shell: bash
+      - name: Apply patch
+        run: python .github/scripts/patch_retro_let_confirmation.py
+
+      - name: Run retrospective let tests
         run: |
-          python - <<'PY'
-          from pathlib import Path
-
-          path = Path('retro_let_scoring.py')
-          text = path.read_text(encoding='utf-8')
-
-          old_start = '''        self._retro_let_current_observation = observed
-        _evaluate_pending(self, final=False)
-        return result
-'''
-          new_start = '''        self._retro_let_current_observation = observed
-        # A point context can still be provisional and may later be rejected by
-        # SERVE_START_IGNORED / SERVE_CANDIDATE_RESET / SERVE_FP_RESET.  Do not
-        # resolve a retrospective let from provisional serve geometry.  The
-        # pending decision is resolved at the safe final-rally boundary in
-        # record_point_result(), once the following serve/rally is real.
-        return result
-'''
-          if text.count(old_start) != 1:
-              raise SystemExit(f'Expected exactly one start-point evaluation block, found {text.count(old_start)}')
-          text = text.replace(old_start, new_start, 1)
-
-          old_refresh = '''            if observed is not None:
-                self._retro_let_current_observation = observed
-            _evaluate_pending(self, final=False)
-            return result
-'''
-          new_refresh = '''            if observed is not None:
-                self._retro_let_current_observation = observed
-            # Refreshes are also provisional: they may belong to a serve start
-            # that the main tracker subsequently rejects.  Keep the observation
-            # current, but leave the pending let untouched until a finalized
-            # following rally proves which service side was actually used.
-            return result
-'''
-          if text.count(old_refresh) != 1:
-              raise SystemExit(f'Expected exactly one refresh evaluation block, found {text.count(old_refresh)}')
-          text = text.replace(old_refresh, new_refresh, 1)
-          path.write_text(text, encoding='utf-8')
-
-          test_path = Path('tests/test_retro_let_scoring.py')
-          tests = test_path.read_text(encoding='utf-8')
-          marker = 'def test_provisional_serve_context_does_not_resolve_pending'
-          if marker not in tests:
-              tests += r'''
-
-
-def test_provisional_serve_context_does_not_resolve_pending(monkeypatch):
-    """A false same-side serve start must not turn the previous point into a let."""
-    import retro_let_scoring as rls
-
-    calls = []
-    monkeypatch.setattr(rls, "_PATCHED", False)
-    monkeypatch.setattr(
-        rls,
-        "_evaluate_pending",
-        lambda obj, *, final=False: calls.append(bool(final)) or "unknown",
-    )
-
-    class _Tracker:
-        def __init__(self):
-            self._point_history_current = None
-            self._retro_let_pending = {"sentinel": True}
-
-        def _record_point_result(self, reason, end_position=None, frame=None, history_end_frame=None):
-            return None
-
-        def _start_point_context(self, origin_pos, serve_start_frame=None, history_origin_pos=None):
-            self._point_history_current = {
-                "server_idx": 0,
-                "serve_context": {
-                    "player_position": [1900, 1500],
-                    "player_side": "near",
-                    "player_source": "server",
-                },
-            }
-            return None
-
-        def _refresh_player_serve_context(self):
-            return None
-
-    rls._patch_tracker_class(_Tracker)
-    tracker = _Tracker()
-
-    # This represents a provisional same-side serve context that the main
-    # tracker may later discard.  Neither creation nor refresh may resolve the
-    # pending retrospective-let candidate.
-    tracker._start_point_context((1900, 1500), serve_start_frame=200)
-    tracker._refresh_player_serve_context()
-
-    assert calls == []
-    assert tracker._retro_let_pending == {"sentinel": True}
-'''
-              test_path.write_text(tests, encoding='utf-8')
-          PY
-
           python -m py_compile retro_let_scoring.py
           python -m pytest -q tests/test_retro_let_scoring.py
 
-      - name: Commit tested patch and remove temporary workflow
-        shell: bash
+      - name: Commit tested patch
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git rm .github/workflows/patch-retro-let-confirmation.yml
+          git rm .github/scripts/patch_retro_let_confirmation.py
           git add retro_let_scoring.py tests/test_retro_let_scoring.py
-          git commit -m "Wait for real rally before retrospective let decision"
+          git commit -m "Require real continuation before retrospective let"
           git push origin HEAD:revert_1
