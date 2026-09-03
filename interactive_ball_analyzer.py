@@ -300,6 +300,10 @@ class InteractiveBallAnalyzer:
         self._contact_local_ai_cooldown_until_frame = -1000000
         self._contact_local_ai_radius = 450.0
         self._contact_local_ai_min_score = 0.985
+        # Debug-only reference to the normal HSV/contact candidate that caused
+        # CONTACT_LOCAL_AI to arm. It is populated only while Local AI ranks
+        # that same frame and never participates in candidate selection.
+        self._contact_local_ai_debug_normal_candidate = None
         self._local_ai_frame_buffer = frame_buffer(12)
         self._local_ai_recovery_count = 0
         self._local_ai_all_body_rejections = 0
@@ -1601,12 +1605,38 @@ class InteractiveBallAnalyzer:
         else:
             eligible.sort(key=lambda item: (float(item["pred_dist"]), -item["score"]))
 
+        # Diagnostic only: expose the geometry that the existing ranking is
+        # already using, plus agreement with the normal contact candidate.
+        # None of these values are used to reorder or reject candidates.
+        debug_normal_candidate = getattr(
+            self, "_contact_local_ai_debug_normal_candidate", None
+        )
+        best_ai_score = max((float(item["score"]) for item in eligible), default=0.0)
         for rank, item in enumerate(eligible[:5], 1):
             pd = "n/a" if item["pred_dist"] is None else f"{item['pred_dist']:.1f}"
             cs = "n/a" if item["cosine"] is None else f"{item['cosine']:.3f}"
+            anchor_dist = math.hypot(
+                float(item["point"][0]) - float(anchor[0]),
+                float(item["point"][1]) - float(anchor[1]),
+            )
+            trajectory_cost = (
+                float(item["pred_dist"])
+                if item["pred_dist"] is not None else anchor_dist
+            )
+            normal_dist = None
+            if debug_normal_candidate is not None:
+                normal_dist = math.hypot(
+                    float(item["point"][0]) - float(debug_normal_candidate[0]),
+                    float(item["point"][1]) - float(debug_normal_candidate[1]),
+                )
+            nd = "n/a" if normal_dist is None else f"{normal_dist:.1f}"
+            ai_gap = best_ai_score - float(item["score"])
             print(
                 f"[FORCE_LOCAL_AI_CAND] f{current} #{rank} pos={item['point']} "
-                f"ai={item['score']:.6f} pred_dist={pd} cos={cs}"
+                f"ai={item['score']:.12f} ai_gap={ai_gap:.12g} "
+                f"pred_dist={pd} cos={cs} anchor_dist={anchor_dist:.1f} "
+                f"trajectory_cost={trajectory_cost:.1f} "
+                f"normal_ref={debug_normal_candidate} normal_dist={nd}"
             )
 
         if not eligible:
@@ -1678,8 +1708,9 @@ class InteractiveBallAnalyzer:
         self._force_local_ai_history = history[-4:]
 
         print(
-            f"[FORCE_LOCAL_AI] f{current}: selected={point} ai={selected['score']:.6f} "
+            f"[FORCE_LOCAL_AI] f{current}: selected={point} ai={selected['score']:.12f} "
             f"area={area:.1f}px anchor={anchor} predicted={predicted} "
+            f"normal_ref={getattr(self, '_contact_local_ai_debug_normal_candidate', None)} "
             f"normal_hsv_bypassed=True"
         )
         return tuple(point)
@@ -25042,9 +25073,13 @@ class InteractiveBallAnalyzer:
                                 self._local_ai_tight_roi_previous_gray = (
                                     pre_track_snapshot.get('_prev_frame_gray')
                                 )
+                                # Debug only: preserve the normal detector's contact
+                                # hypothesis long enough to print candidate agreement.
+                                self._contact_local_ai_debug_normal_candidate = rejected_hsv
                                 tracked_position = self._run_contact_local_ai_frame(
                                     frame, prev_ball_center, arm_reason=contact_reason
                                 )
+                                self._contact_local_ai_debug_normal_candidate = None
                                 if tracked_position is not None:
                                     contact_local_ai = True
                                     print(
