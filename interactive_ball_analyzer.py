@@ -1605,13 +1605,58 @@ class InteractiveBallAnalyzer:
         else:
             eligible.sort(key=lambda item: (float(item["pred_dist"]), -item["score"]))
 
-        # Diagnostic only: expose the geometry that the existing ranking is
-        # already using, plus agreement with the normal contact candidate.
-        # None of these values are used to reorder or reject candidates.
+        # CONTACT_LOCAL_AI_POST_SERVE_CONSENSUS_V1
+        # On the verified serve-launch frame the normal tracker has already
+        # produced an airborne candidate. If Local AI independently gives a
+        # candidate at essentially the same position a score tied with its
+        # best candidate, prefer that cross-detector agreement over the
+        # anchor-distance tie-break. This is intentionally limited to the
+        # short post-serve launch lock and only when no AI trajectory exists
+        # yet. Candidate size/area is not used here.
         debug_normal_candidate = getattr(
             self, "_contact_local_ai_debug_normal_candidate", None
         )
         best_ai_score = max((float(item["score"]) for item in eligible), default=0.0)
+        if (
+                debug_normal_candidate is not None and
+                eligible and
+                predicted is None and
+                current <= int(getattr(self, "_post_serve_launch_lock_until_frame", -1))):
+            ai_tie_margin = 1.0e-4
+            consensus_pool = [
+                item for item in eligible
+                if best_ai_score - float(item["score"]) <= ai_tie_margin
+            ]
+            if consensus_pool:
+                consensus = min(
+                    consensus_pool,
+                    key=lambda item: math.hypot(
+                        float(item["point"][0]) - float(debug_normal_candidate[0]),
+                        float(item["point"][1]) - float(debug_normal_candidate[1]),
+                    ),
+                )
+                consensus_dist = math.hypot(
+                    float(consensus["point"][0]) - float(debug_normal_candidate[0]),
+                    float(consensus["point"][1]) - float(debug_normal_candidate[1]),
+                )
+                default = eligible[0]
+                default_dist = math.hypot(
+                    float(default["point"][0]) - float(debug_normal_candidate[0]),
+                    float(default["point"][1]) - float(debug_normal_candidate[1]),
+                )
+                if (
+                        consensus is not default and
+                        consensus_dist <= 35.0 and
+                        default_dist >= max(100.0, consensus_dist + 70.0)):
+                    eligible.remove(consensus)
+                    eligible.insert(0, consensus)
+                    print(
+                        f"[FORCE_LOCAL_AI_NORMAL_TIEBREAK] f{current}: "
+                        f"normal={debug_normal_candidate} chose={consensus['point']} "
+                        f"normal_dist={consensus_dist:.1f}px ai={consensus['score']:.12f} "
+                        f"over={default['point']} default_normal_dist={default_dist:.1f}px "
+                        f"default_ai={default['score']:.12f}"
+                    )
         for rank, item in enumerate(eligible[:5], 1):
             pd = "n/a" if item["pred_dist"] is None else f"{item['pred_dist']:.1f}"
             cs = "n/a" if item["cosine"] is None else f"{item['cosine']:.3f}"
