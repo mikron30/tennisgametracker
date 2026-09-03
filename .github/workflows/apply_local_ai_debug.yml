@@ -1,0 +1,151 @@
+name: Apply Local AI debug patch
+
+on:
+  push:
+    branches:
+      - revert_1
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: revert_1
+          fetch-depth: 0
+
+      - name: Add Local AI candidate diagnostics
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('interactive_ball_analyzer.py')
+          text = path.read_text(encoding='utf-8')
+
+          old_init = '''        self._contact_local_ai_radius = 450.0
+        self._contact_local_ai_min_score = 0.985
+        self._local_ai_frame_buffer = frame_buffer(12)
+'''
+          new_init = '''        self._contact_local_ai_radius = 450.0
+        self._contact_local_ai_min_score = 0.985
+        # Debug-only reference to the normal HSV/contact candidate that caused
+        # CONTACT_LOCAL_AI to arm. It is populated only while Local AI ranks
+        # that same frame and never participates in candidate selection.
+        self._contact_local_ai_debug_normal_candidate = None
+        self._local_ai_frame_buffer = frame_buffer(12)
+'''
+          if text.count(old_init) != 1:
+              raise SystemExit(f'init patch target count={text.count(old_init)}')
+          text = text.replace(old_init, new_init, 1)
+
+          old_candidates = '''        for rank, item in enumerate(eligible[:5], 1):
+            pd = "n/a" if item["pred_dist"] is None else f"{item['pred_dist']:.1f}"
+            cs = "n/a" if item["cosine"] is None else f"{item['cosine']:.3f}"
+            print(
+                f"[FORCE_LOCAL_AI_CAND] f{current} #{rank} pos={item['point']} "
+                f"ai={item['score']:.6f} pred_dist={pd} cos={cs}"
+            )
+'''
+          new_candidates = '''        # Diagnostic only: expose the geometry that the existing ranking is
+        # already using, plus agreement with the normal contact candidate.
+        # None of these values are used to reorder or reject candidates.
+        debug_normal_candidate = getattr(
+            self, "_contact_local_ai_debug_normal_candidate", None
+        )
+        best_ai_score = max((float(item["score"]) for item in eligible), default=0.0)
+        for rank, item in enumerate(eligible[:5], 1):
+            pd = "n/a" if item["pred_dist"] is None else f"{item['pred_dist']:.1f}"
+            cs = "n/a" if item["cosine"] is None else f"{item['cosine']:.3f}"
+            anchor_dist = math.hypot(
+                float(item["point"][0]) - float(anchor[0]),
+                float(item["point"][1]) - float(anchor[1]),
+            )
+            trajectory_cost = (
+                float(item["pred_dist"])
+                if item["pred_dist"] is not None else anchor_dist
+            )
+            normal_dist = None
+            if debug_normal_candidate is not None:
+                normal_dist = math.hypot(
+                    float(item["point"][0]) - float(debug_normal_candidate[0]),
+                    float(item["point"][1]) - float(debug_normal_candidate[1]),
+                )
+            nd = "n/a" if normal_dist is None else f"{normal_dist:.1f}"
+            ai_gap = best_ai_score - float(item["score"])
+            print(
+                f"[FORCE_LOCAL_AI_CAND] f{current} #{rank} pos={item['point']} "
+                f"ai={item['score']:.12f} ai_gap={ai_gap:.12g} "
+                f"pred_dist={pd} cos={cs} anchor_dist={anchor_dist:.1f} "
+                f"trajectory_cost={trajectory_cost:.1f} "
+                f"normal_ref={debug_normal_candidate} normal_dist={nd}"
+            )
+'''
+          if text.count(old_candidates) != 1:
+              raise SystemExit(f'candidate patch target count={text.count(old_candidates)}')
+          text = text.replace(old_candidates, new_candidates, 1)
+
+          old_selected = '''        print(
+            f"[FORCE_LOCAL_AI] f{current}: selected={point} ai={selected['score']:.6f} "
+            f"area={area:.1f}px anchor={anchor} predicted={predicted} "
+            f"normal_hsv_bypassed=True"
+        )
+'''
+          new_selected = '''        print(
+            f"[FORCE_LOCAL_AI] f{current}: selected={point} ai={selected['score']:.12f} "
+            f"area={area:.1f}px anchor={anchor} predicted={predicted} "
+            f"normal_ref={getattr(self, '_contact_local_ai_debug_normal_candidate', None)} "
+            f"normal_hsv_bypassed=True"
+        )
+'''
+          if text.count(old_selected) != 1:
+              raise SystemExit(f'selected patch target count={text.count(old_selected)}')
+          text = text.replace(old_selected, new_selected, 1)
+
+          old_contact = '''                                self._local_ai_tight_roi_previous_gray = (
+                                    pre_track_snapshot.get('_prev_frame_gray')
+                                )
+                                tracked_position = self._run_contact_local_ai_frame(
+                                    frame, prev_ball_center, arm_reason=contact_reason
+                                )
+                                if tracked_position is not None:
+'''
+          new_contact = '''                                self._local_ai_tight_roi_previous_gray = (
+                                    pre_track_snapshot.get('_prev_frame_gray')
+                                )
+                                # Debug only: preserve the normal detector's contact
+                                # hypothesis long enough to print candidate agreement.
+                                self._contact_local_ai_debug_normal_candidate = rejected_hsv
+                                tracked_position = self._run_contact_local_ai_frame(
+                                    frame, prev_ball_center, arm_reason=contact_reason
+                                )
+                                self._contact_local_ai_debug_normal_candidate = None
+                                if tracked_position is not None:
+'''
+          if text.count(old_contact) != 1:
+              raise SystemExit(f'contact patch target count={text.count(old_contact)}')
+          text = text.replace(old_contact, new_contact, 1)
+
+          path.write_text(text, encoding='utf-8')
+          PY
+
+      - name: Verify syntax and debug markers
+        shell: bash
+        run: |
+          python -m py_compile interactive_ball_analyzer.py
+          grep -n "trajectory_cost=" interactive_ball_analyzer.py
+          grep -n "normal_ref=" interactive_ball_analyzer.py
+
+      - name: Commit patch and remove temporary workflow
+        shell: bash
+        run: |
+          rm .github/workflows/apply_local_ai_debug.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add interactive_ball_analyzer.py .github/workflows/apply_local_ai_debug.yml
+          git commit -m "Add Local AI candidate debug metrics"
+          git push origin HEAD:revert_1
