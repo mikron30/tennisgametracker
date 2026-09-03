@@ -653,6 +653,37 @@ class PlayerRacketTracker:
         })
         return result
 
+    def _box_is_plausible_for_side(self, box: BBox, side: str) -> bool:
+        """Reject player boxes whose body lies implausibly across the net plane.
+
+        ``_side_for_box`` intentionally classifies from the box center only. That
+        is useful for general tracking, but it is too permissive for player-zone
+        exclusions: a huge false box can have a far-side center while extending
+        hundreds of pixels onto the near court. Such a box must never create a
+        head/shoe/body exclusion zone for the ball tracker.
+        """
+        if side not in ("near", "far") or not box or len(box) != 4:
+            return False
+        x, y, w, h = [float(v) for v in box]
+        if w <= 0.0 or h <= 0.0:
+            return False
+        if self.frame_shape is None:
+            return True
+
+        frame_height = float(self.frame_shape[0])
+        net_y = float(self.net_y) if self.net_y is not None else frame_height * 0.5
+        overshoot = max(30.0, min(100.0, h * 0.12))
+
+        if side == "far":
+            if y + h > net_y + overshoot:
+                return False
+            if h > frame_height * 0.30:
+                return False
+        else:
+            if y < net_y - overshoot:
+                return False
+        return True
+
     def _receiver_detection_for_server(self, server_side: Optional[str]) -> Optional[Dict]:
         """Choose the receiver on the opposite side of the net."""
         if server_side not in ("near", "far"):
@@ -669,6 +700,8 @@ class PlayerRacketTracker:
             side = self._side_for_box(box, self.frame_shape[0] if self.frame_shape else 2160)
             if side != desired_side:
                 continue
+            if not self._box_is_plausible_for_side(box, side):
+                continue
             _, _, w, h = box
             shape_penalty = abs((float(h) / max(float(w), 1.0)) - 2.0) * 0.12
             score = shape_penalty - float(detection.get("score", 0.0)) * 0.20
@@ -678,6 +711,8 @@ class PlayerRacketTracker:
                 if track.side != desired_side or track.bbox is None or track.center is None:
                     continue
                 if not self._center_is_in_court(track.center):
+                    continue
+                if not self._box_is_plausible_for_side(track.bbox, track.side):
                     continue
                 _, _, w, h = track.bbox
                 score = abs((float(h) / max(float(w), 1.0)) - 2.0) * 0.12 - track.confidence * 0.20
@@ -756,12 +791,15 @@ class PlayerRacketTracker:
             bbox = context.get(f"{prefix}_bbox")
             if side not in self.tracks or not bbox or len(bbox) != 4:
                 continue
+            track_bbox = tuple(int(v) for v in bbox)
+            if prefix == "receiver" and not self._box_is_plausible_for_side(track_bbox, side):
+                continue
             track = self.tracks[side]
-            track.bbox = tuple(int(v) for v in bbox)
+            track.bbox = track_bbox
             track.center = self._box_center(track.bbox)
             x, y, w, h = track.bbox
             track.head = (int(round(x + w * 0.5)), int(round(y + h * 0.14)))
-            track.shoes = (int(round(x + w * 0.96)), int(round(y + h * 0.96)))
+            track.shoes = (int(round(x + w * 0.5)), int(round(y + h * 0.96)))
             track.confidence = max(track.confidence, 0.60)
             track.last_frame = int(frame_index)
             track.visible = True
@@ -775,6 +813,8 @@ class PlayerRacketTracker:
         """
         track = self._track_for_point(point)
         if track is None or track.bbox is None or float(track.confidence) < 0.30:
+            return None
+        if not self._box_is_plausible_for_side(track.bbox, track.side):
             return None
         x, y, w, h = track.bbox
         px, py = point
