@@ -1,0 +1,32 @@
+name: Seed CONTACT_LOCAL_AI outgoing trajectory
+
+on: [push]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: revert_1
+          fetch-depth: 0
+
+      - name: Patch analyzer
+        shell: bash
+        run: |
+          echo 'ZnJvbSBwYXRobGliIGltcG9ydCBQYXRoCgpwYXRoID0gUGF0aCgiaW50ZXJhY3RpdmVfYmFsbF9hbmFseXplci5weSIpCnRleHQgPSBwYXRoLnJlYWRfdGV4dChlbmNvZGluZz0idXRmLTgiKQoKb2xkID0gIiIiICAgICAgICBzdGF0ZSA9IGdldGF0dHIoc2VsZiwgJ19jb250YWN0X2xvY2FsX2FpX3N0YXRlJywgTm9uZSkKICAgICAgICBpZiBhcm1fcmVhc29uIGlzIG5vdCBOb25lIGFuZCBub3QgaXNpbnN0YW5jZShzdGF0ZSwgZGljdCk6CiAgICAgICAgICAgIHN0YXRlID0gewogICAgICAgICAgICAgICAgJ3N0YXJ0X2ZyYW1lJzogY3VycmVudCwKICAgICAgICAgICAgICAgICdkZWFkbGluZSc6IGN1cnJlbnQgKyAyMiwKICAgICAgICAgICAgICAgICdoaXN0b3J5JzogW10sCiAgICAgICAgICAgICAgICAnb3V0c2lkZV9jb3VudCc6IDAsCiAgICAgICAgICAgICAgICAnbWlzc19jb3VudCc6IDAsCiAgICAgICAgICAgICAgICAncmVhc29uJzogc3RyKGFybV9yZWFzb24pLAogICAgICAgICAgICB9CiAgICAgICAgICAgIHNlbGYuX2NvbnRhY3RfbG9jYWxfYWlfc3RhdGUgPSBzdGF0ZQoiIiIKCm5ldyA9ICIiIiAgICAgICAgc3RhdGUgPSBnZXRhdHRyKHNlbGYsICdfY29udGFjdF9sb2NhbF9haV9zdGF0ZScsIE5vbmUpCiAgICAgICAgaWYgYXJtX3JlYXNvbiBpcyBub3QgTm9uZSBhbmQgbm90IGlzaW5zdGFuY2Uoc3RhdGUsIGRpY3QpOgogICAgICAgICAgICAjIFNlZWQgQ09OVEFDVF9MT0NBTF9BSSB3aXRoIHRoZSB0cnVzdGVkIHByZS1jb250YWN0IGFuY2hvci4gIE9uIHRoZQogICAgICAgICAgICAjIGNvbnRhY3QgZnJhbWUgdGhpcyBpcyBvbmx5IG9uZSBoaXN0b3J5IHBvaW50LCBzbyBubyB0cmFqZWN0b3J5IGlzCiAgICAgICAgICAgICMgaW1wb3NlZCBhY3Jvc3MgdGhlIHJhY2tldCBkaXJlY3Rpb24gY2hhbmdlLiAgQWZ0ZXIgTG9jYWwgQUkgYWNjZXB0cwogICAgICAgICAgICAjIHRoZSBmaXJzdCBvdXRnb2luZyBwb2ludCwgdGhlIG5leHQgZnJhbWUgaW1tZWRpYXRlbHkgaGFzIHR3byBwb2ludHMKICAgICAgICAgICAgIyBhbmQgY2FuIHByZWRpY3QgdGhlIG91dGdvaW5nIGJhbGwgdHJhamVjdG9yeS4KICAgICAgICAgICAgc2VlZF9oaXN0b3J5ID0gW10KICAgICAgICAgICAgaWYgcHJldmlvdXNfcG9zaXRpb24gaXMgbm90IE5vbmU6CiAgICAgICAgICAgICAgICBzZWVkX2hpc3RvcnkuYXBwZW5kKHsKICAgICAgICAgICAgICAgICAgICAnZnJhbWUnOiBjdXJyZW50IC0gMSwKICAgICAgICAgICAgICAgICAgICAncG9zJzogdHVwbGUocHJldmlvdXNfcG9zaXRpb24pLAogICAgICAgICAgICAgICAgICAgICdzY29yZSc6IDEuMCwKICAgICAgICAgICAgICAgICAgICAnY29udGFjdF9zZWVkJzogVHJ1ZSwKICAgICAgICAgICAgICAgIH0pCiAgICAgICAgICAgIHN0YXRlID0gewogICAgICAgICAgICAgICAgJ3N0YXJ0X2ZyYW1lJzogY3VycmVudCwKICAgICAgICAgICAgICAgICdkZWFkbGluZSc6IGN1cnJlbnQgKyAyMiwKICAgICAgICAgICAgICAgICdoaXN0b3J5Jzogc2VlZF9oaXN0b3J5LAogICAgICAgICAgICAgICAgJ291dHNpZGVfY291bnQnOiAwLAogICAgICAgICAgICAgICAgJ21pc3NfY291bnQnOiAwLAogICAgICAgICAgICAgICAgJ3JlYXNvbic6IHN0cihhcm1fcmVhc29uKSwKICAgICAgICAgICAgfQogICAgICAgICAgICBzZWxmLl9jb250YWN0X2xvY2FsX2FpX3N0YXRlID0gc3RhdGUKICAgICAgICAgICAgaWYgc2VlZF9oaXN0b3J5OgogICAgICAgICAgICAgICAgcHJpbnQoCiAgICAgICAgICAgICAgICAgICAgZiJbQ09OVEFDVF9MT0NBTF9BSV9TRUVEXSBme2N1cnJlbnR9OiAiCiAgICAgICAgICAgICAgICAgICAgZiJzZWVkX2ZyYW1lPXtjdXJyZW50IC0gMX0gcG9zaXRpb249e3R1cGxlKHByZXZpb3VzX3Bvc2l0aW9uKX0iCiAgICAgICAgICAgICAgICApCiIiIgoKY291bnQgPSB0ZXh0LmNvdW50KG9sZCkKaWYgY291bnQgIT0gMToKICAgIHJhaXNlIFN5c3RlbUV4aXQoZiJFeHBlY3RlZCBleGFjdGx5IG9uZSBDT05UQUNUX0xPQ0FMX0FJIGFybSBibG9jaywgZm91bmQge2NvdW50fSIpCgpwYXRoLndyaXRlX3RleHQodGV4dC5yZXBsYWNlKG9sZCwgbmV3LCAxKSwgZW5jb2Rpbmc9InV0Zi04IikK' | base64 -d > /tmp/patch_contact_ai_seed.py
+          python /tmp/patch_contact_ai_seed.py
+          python -m py_compile interactive_ball_analyzer.py
+
+      - name: Commit patch and remove temporary workflow
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm .github/workflows/patch-contact-ai-seed.yml
+          git add interactive_ball_analyzer.py
+          git commit -m "Seed contact AI outgoing trajectory"
+          git push origin HEAD:revert_1
