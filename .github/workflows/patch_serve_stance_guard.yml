@@ -24,82 +24,86 @@ jobs:
         run: |
           python - <<'PY'
           from pathlib import Path
+          import re
 
           path = Path('interactive_ball_analyzer.py')
           text = path.read_text(encoding='utf-8')
-          old = '''        def low_to_up_serve_toss_context(history, details=None, require_bottom_entry=False):
-              if len(history) < 4:
-                  return None
-          '''
-          new = '''        def low_to_up_serve_toss_context(history, details=None, require_bottom_entry=False):
-              if history:
-                  try:
-                      from serve_stance_guard import evaluate_serve_stance, format_serve_stance_debug
-                      stance_result = evaluate_serve_stance(self, history[-1], frame)
-                  except Exception as stance_error:
-                      stance_result = {
-                          'decision': 'bypass',
-                          'reason': f'guard error: {stance_error}',
-                          'side': None,
-                      }
-
-                  stance_decision = str(stance_result.get('decision') or 'bypass').lower()
-                  previous_stance_decision = getattr(self, '_serve_stance_guard_decision', None)
-                  stance_debug_key = (
-                      stance_decision,
-                      stance_result.get('reason'),
-                      stance_result.get('side'),
-                      stance_result.get('feet'),
-                      round(float(stance_result.get('baseline_y')), 1)
-                          if isinstance(stance_result.get('baseline_y'), (int, float)) else None,
-                  )
-                  if stance_debug_key != getattr(self, '_serve_stance_guard_debug_key', None):
-                      try:
-                          print(format_serve_stance_debug(self.frame_count, stance_result))
-                      except Exception:
-                          print(
-                              f"[SERVE_STANCE_{stance_decision.upper()}] f{self.frame_count}: "
-                              f"reason={stance_result.get('reason', '')}"
-                          )
-                      self._serve_stance_guard_debug_key = stance_debug_key
-
-                  if stance_decision in ('hold', 'reject'):
-                      self._serve_stance_guard_decision = stance_decision
-                      if stance_decision == 'reject':
-                          # A player visibly inside the baseline cannot belong to
-                          # the start of a serve. Discard the old toss history so
-                          # moving behind the baseline later cannot retroactively
-                          # validate the same ball/artifact sequence.
-                          history[:] = history[-1:]
-                          if isinstance(details, list) and details:
-                              details[:] = details[-1:]
-                      return None
-
-                  if stance_decision == 'allow' and previous_stance_decision in ('hold', 'reject'):
-                      # The legal serving stance was established only now. Start
-                      # a fresh toss history from this point instead of using
-                      # motion collected while the player was not in a verified
-                      # serving position.
-                      history[:] = history[-1:]
-                      if isinstance(details, list) and details:
-                          details[:] = details[-1:]
-                      self._serve_stance_guard_decision = 'allow'
-                      print(
-                          f"[SERVE_STANCE_RESET] f{self.frame_count}: "
-                          "fresh behind-baseline player confirmed; restarting toss history"
-                      )
-                      return None
-
-                  self._serve_stance_guard_decision = stance_decision
-
-              if len(history) < 4:
-                  return None
-          '''
-          if old not in text:
-              raise SystemExit('target low_to_up_serve_toss_context header not found exactly once')
-          if text.count(old) != 1:
-              raise SystemExit(f'target count was {text.count(old)}, expected 1')
-          text = text.replace(old, new, 1)
+          pattern = re.compile(
+              r'^        def low_to_up_serve_toss_context\(history, details=None, require_bottom_entry=False\):\n'
+              r'            if len\(history\) < 4:\n'
+              r'                return None\n',
+              re.MULTILINE,
+          )
+          lines = [
+              '        def low_to_up_serve_toss_context(history, details=None, require_bottom_entry=False):',
+              '            if history:',
+              '                try:',
+              '                    from serve_stance_guard import evaluate_serve_stance, format_serve_stance_debug',
+              '                    stance_result = evaluate_serve_stance(self, history[-1], frame)',
+              '                except Exception as stance_error:',
+              '                    stance_result = {',
+              "                        'decision': 'bypass',",
+              "                        'reason': f'guard error: {stance_error}',",
+              "                        'side': None,",
+              '                    }',
+              '',
+              "                stance_decision = str(stance_result.get('decision') or 'bypass').lower()",
+              "                previous_stance_decision = getattr(self, '_serve_stance_guard_decision', None)",
+              '                stance_debug_key = (',
+              '                    stance_decision,',
+              "                    stance_result.get('reason'),",
+              "                    stance_result.get('side'),",
+              "                    stance_result.get('feet'),",
+              "                    round(float(stance_result.get('baseline_y')), 1)",
+              "                        if isinstance(stance_result.get('baseline_y'), (int, float)) else None,",
+              '                )',
+              "                if stance_debug_key != getattr(self, '_serve_stance_guard_debug_key', None):",
+              '                    try:',
+              '                        print(format_serve_stance_debug(self.frame_count, stance_result))',
+              '                    except Exception:',
+              '                        print(',
+              '                            f"[SERVE_STANCE_{stance_decision.upper()}] f{self.frame_count}: "',
+              "                            f\"reason={stance_result.get('reason', '')}\"",
+              '                        )',
+              '                    self._serve_stance_guard_debug_key = stance_debug_key',
+              '',
+              "                if stance_decision in ('hold', 'reject'):",
+              '                    self._serve_stance_guard_decision = stance_decision',
+              "                    if stance_decision == 'reject':",
+              '                        # A player visibly inside the baseline cannot belong to',
+              '                        # the start of a serve. Discard the old toss history so',
+              '                        # moving behind the baseline later cannot retroactively',
+              '                        # validate the same ball/artifact sequence.',
+              '                        history[:] = history[-1:]',
+              '                        if isinstance(details, list) and details:',
+              '                            details[:] = details[-1:]',
+              '                    return None',
+              '',
+              "                if stance_decision == 'allow' and previous_stance_decision in ('hold', 'reject'):",
+              '                    # The legal serving stance was established only now. Start',
+              '                    # a fresh toss history from this point instead of using',
+              '                    # motion collected while the player was not in a verified',
+              '                    # serving position.',
+              '                    history[:] = history[-1:]',
+              '                    if isinstance(details, list) and details:',
+              '                        details[:] = details[-1:]',
+              "                    self._serve_stance_guard_decision = 'allow'",
+              '                    print(',
+              '                        f"[SERVE_STANCE_RESET] f{self.frame_count}: "',
+              '                        "fresh behind-baseline player confirmed; restarting toss history"',
+              '                    )',
+              '                    return None',
+              '',
+              '                self._serve_stance_guard_decision = stance_decision',
+              '',
+              '            if len(history) < 4:',
+              '                return None',
+              '',
+          ]
+          replacement = '\n'.join(lines)
+          text, count = pattern.subn(replacement, text, count=1)
+          if count != 1:
+              raise SystemExit(f'low_to_up_serve_toss_context patch count={count}, expected 1')
           path.write_text(text, encoding='utf-8')
           PY
 
