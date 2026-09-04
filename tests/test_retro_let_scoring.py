@@ -114,6 +114,17 @@ def test_score_snapshot_restores_game_state_and_removes_let_serve_in():
     assert state.serve_stats[0]["second_in"] == 1
 
 
+def test_logical_point_end_frame_prefers_history_frame_over_delayed_callback():
+    from retro_let_scoring import _logical_point_end_frame
+
+    state = _State()
+    state.frame_count = 4677
+
+    assert _logical_point_end_frame(state, frame=4677, history_end_frame=4663) == 4663
+    assert _logical_point_end_frame(state, frame=4936, history_end_frame=None) == 4936
+    assert _logical_point_end_frame(state, frame=None, history_end_frame=None) == 4677
+
+
 def test_let_window_requires_the_only_shot_to_be_receiver_return():
     from retro_let_scoring import _let_window_open
 

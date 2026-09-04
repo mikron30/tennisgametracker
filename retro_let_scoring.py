@@ -41,6 +41,25 @@ def _safe_int(value, default=0):
         return int(default)
 
 
+def _logical_point_end_frame(obj, frame=None, history_end_frame=None):
+    """Return the frame used by point-history CSV for this point result.
+
+    Some point outcomes are finalized several frames after the actual landing or
+    timeout boundary. In those cases frame_count is the callback frame while
+    history_end_frame is the point_end_frame written to the CSV. A retrospective
+    let must remember the latter so it rewrites the same row whose score it rolls
+    back.
+    """
+    for value in (history_end_frame, frame):
+        if value is None:
+            continue
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            continue
+    return _safe_int(getattr(obj, "frame_count", -1), -1)
+
+
 def _score_snapshot(obj):
     """Capture score/stat state before an apparent point is awarded."""
     fields = (
@@ -544,6 +563,7 @@ def _patch_tracker_class(cls):
         observation = _current_observation(self)
         server_idx = _server_idx_for_current_context(self)
         attempt = _safe_int(getattr(self, "current_serve_attempt", 1), 1)
+        logical_end_frame = _logical_point_end_frame(self, frame, history_end_frame)
         rally_events = _rally_shot_events(self)
         rally_shots = _rally_shots(self)
         let_window_open = _let_window_open(self, rally_shots, server_idx, rally_events)
@@ -601,7 +621,8 @@ def _patch_tracker_class(cls):
                 "attempt": int(attempt),
                 "observation": dict(observation),
                 "start_frame": start_frame,
-                "end_frame": frame_now,
+                "end_frame": int(logical_end_frame),
+                "record_frame": int(frame_now),
                 "hits": int(rally_shots),
                 "temporary_score": _score_text(self),
                 "reason": str(reason or ""),
@@ -613,6 +634,7 @@ def _patch_tracker_class(cls):
                 f"server={self.player_names[int(server_idx)]} attempt={attempt} "
                 f"server_x={observation['x']:.0f} physical={observation.get('physical_side') or '?'} "
                 f"hits={rally_shots} evidence={in_evidence} "
+                f"history_end={logical_end_frame} record_frame={frame_now} "
                 f"temporary_score={_score_text(self)}"
             )
         return result
