@@ -1,0 +1,186 @@
+name: Patch retrospective let server-shot eligibility
+
+on:
+  push:
+    branches: [revert_1]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: revert_1
+          fetch-depth: 0
+
+      - name: Patch retrospective let eligibility
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('retro_let_scoring.py')
+          text = path.read_text(encoding='utf-8')
+
+          old_helpers = '''def _rally_shots(obj):
+    context = _point_context(obj)
+    if isinstance(context, dict):
+        events = context.get("shot_events")
+        if isinstance(events, list):
+            return len(events)
+    return _safe_int(getattr(obj, "_point_hit_count", 0), 0)
+
+
+def _let_window_open(rally_shots):
+    """True only until the server plays the first ball after the return."""
+    return _safe_int(rally_shots, 0) <= _MAX_SHORT_RALLY_SHOTS
+'''
+          new_helpers = '''def _rally_shot_events(obj):
+    context = _point_context(obj)
+    if isinstance(context, dict):
+        events = context.get("shot_events")
+        if isinstance(events, list):
+            return list(events)
+    return []
+
+
+def _rally_shots(obj):
+    context = _point_context(obj)
+    if isinstance(context, dict):
+        events = context.get("shot_events")
+        if isinstance(events, list):
+            return len(events)
+    return _safe_int(getattr(obj, "_point_hit_count", 0), 0)
+
+
+def _server_hit_after_serve(obj, server_idx, events):
+    """Return the first post-serve shot attributed to the server, if any."""
+    names = getattr(obj, "player_names", None)
+    idx = _safe_int(server_idx, -1)
+    if not isinstance(names, (list, tuple)) or not (0 <= idx < len(names)):
+        return None
+    server_name = str(names[idx]).strip()
+    if not server_name:
+        return None
+    for event in events or []:
+        if not isinstance(event, dict):
+            continue
+        player = str(event.get("player") or "").strip()
+        if player and player == server_name:
+            return event
+    return None
+
+
+def _let_window_open(obj, rally_shots, server_idx, events=None):
+    """True only before the server plays the first ball after the return.
+
+    A raw count of one shot is not enough: that one detected shot may itself be
+    the server's next ball, as happened in the real f1727 and f2223 points.
+    """
+    shots = _safe_int(rally_shots, 0)
+    if shots > _MAX_SHORT_RALLY_SHOTS:
+        return False
+    if events is None:
+        events = _rally_shot_events(obj)
+    return _server_hit_after_serve(obj, server_idx, events) is None
+'''
+          if text.count(old_helpers) != 1:
+              raise SystemExit(f'Expected one rally helper block, found {text.count(old_helpers)}')
+          text = text.replace(old_helpers, new_helpers, 1)
+
+          old_pre = '''        attempt = _safe_int(getattr(self, "current_serve_attempt", 1), 1)
+        rally_shots = _rally_shots(self)
+        snapshot = _score_snapshot(self)
+'''
+          new_pre = '''        attempt = _safe_int(getattr(self, "current_serve_attempt", 1), 1)
+        rally_events = _rally_shot_events(self)
+        rally_shots = _rally_shots(self)
+        server_continuation = _server_hit_after_serve(self, server_idx, rally_events)
+        let_window_open = _let_window_open(self, rally_shots, server_idx, rally_events)
+        snapshot = _score_snapshot(self)
+'''
+          if text.count(old_pre) != 1:
+              raise SystemExit(f'Expected one pre-record rally block, found {text.count(old_pre)}')
+          text = text.replace(old_pre, new_pre, 1)
+
+          old_short = '''        nonfault = not _service_fault_reason(reason, category)
+        short = _let_window_open(rally_shots)
+
+        # Every apparent point is already scored by original_record above.
+'''
+          new_short = '''        nonfault = not _service_fault_reason(reason, category)
+        short = let_window_open
+
+        if awarded and nonfault and not short and server_continuation is not None and rally_shots <= 1:
+            print(
+                f"[RETRO_LET_CLOSED_SERVER_CONTINUED] f{frame_now}: "
+                f"server={self.player_names[int(server_idx)]} "
+                f"shot_frame={server_continuation.get('frame', '?')} "
+                f"label={server_continuation.get('label', '?')}"
+            )
+
+        # Every apparent point is already scored by original_record above.
+'''
+          if text.count(old_short) != 1:
+              raise SystemExit(f'Expected one let-window call, found {text.count(old_short)}')
+          text = text.replace(old_short, new_short, 1)
+          path.write_text(text, encoding='utf-8')
+
+          test_path = Path('tests/test_retro_let_scoring.py')
+          tests = test_path.read_text(encoding='utf-8')
+          old_test = '''def test_let_window_closes_after_server_first_return():
+    from retro_let_scoring import _let_window_open
+
+    assert _let_window_open(0) is True
+    assert _let_window_open(1) is True
+    assert _let_window_open(2) is False
+    assert _let_window_open(3) is False
+'''
+          new_test = '''def test_let_window_checks_who_hit_the_only_post_serve_shot():
+    from retro_let_scoring import _let_window_open
+
+    state = _State()
+    state.player_names = ["P1", "P2"]
+
+    assert _let_window_open(state, 0, 0, []) is True
+    assert _let_window_open(
+        state, 1, 0,
+        [{"frame": 1800, "player": "P2", "label": "return"}],
+    ) is True
+    assert _let_window_open(
+        state, 1, 0,
+        [{"frame": 1813, "player": "P1", "label": "racket contact"}],
+    ) is False
+    assert _let_window_open(
+        state, 2, 0,
+        [
+            {"frame": 1800, "player": "P2", "label": "return"},
+            {"frame": 1813, "player": "P1", "label": "racket contact"},
+        ],
+    ) is False
+'''
+          if tests.count(old_test) != 1:
+              raise SystemExit(f'Expected old let-window test once, found {tests.count(old_test)}')
+          tests = tests.replace(old_test, new_test, 1)
+          test_path.write_text(tests, encoding='utf-8')
+          PY
+
+      - name: Test patch
+        shell: bash
+        run: |
+          python -m py_compile retro_let_scoring.py
+          python -m pip install -q pytest
+          python -m pytest -q tests/test_retro_let_scoring.py
+
+      - name: Commit tested patch
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm .github/workflows/patch-retro-let-server-shot.yml
+          git add retro_let_scoring.py tests/test_retro_let_scoring.py
+          git commit -m "Close retrospective let after server continuation"
+          git push origin HEAD:revert_1
