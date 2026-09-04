@@ -114,13 +114,42 @@ def test_score_snapshot_restores_game_state_and_removes_let_serve_in():
     assert state.serve_stats[0]["second_in"] == 1
 
 
-def test_let_window_closes_after_server_first_return():
+def test_let_window_requires_the_only_shot_to_be_receiver_return():
     from retro_let_scoring import _let_window_open
 
-    assert _let_window_open(0) is True
-    assert _let_window_open(1) is True
-    assert _let_window_open(2) is False
-    assert _let_window_open(3) is False
+    state = _State()
+    state.player_names = ["P1", "P2"]
+
+    # No return yet: a let can still have stopped play.
+    assert _let_window_open(state, 0, 0, []) is True
+
+    # One positively identified receiver return: still possible.
+    assert _let_window_open(
+        state, 1, 0,
+        [{"frame": 1800, "player": "P2", "label": "return"}],
+    ) is True
+
+    # Regression from the real video: the one recorded shot is P1, the server.
+    # The rally therefore continued and the previous point must never become a let.
+    assert _let_window_open(
+        state, 1, 0,
+        [{"frame": 1813, "player": "P1", "label": "racket contact"}],
+    ) is False
+
+    # Unknown shooter is not enough positive evidence to roll back a scored point.
+    assert _let_window_open(
+        state, 1, 0,
+        [{"frame": 1813, "player": "", "label": "racket contact"}],
+    ) is False
+
+    # Two post-serve shots means the rally necessarily continued.
+    assert _let_window_open(
+        state, 2, 0,
+        [
+            {"frame": 1800, "player": "P2", "label": "return"},
+            {"frame": 1813, "player": "P1", "label": "racket contact"},
+        ],
+    ) is False
 
 
 def test_provisional_serve_context_does_not_resolve_pending(monkeypatch):

@@ -187,6 +187,15 @@ def _context_observation_from_origin(obj, origin_pos):
     return _observation_from_context_dict({"serve_context": context})
 
 
+def _rally_shot_events(obj):
+    context = _point_context(obj)
+    if isinstance(context, dict):
+        events = context.get("shot_events")
+        if isinstance(events, list):
+            return list(events)
+    return []
+
+
 def _rally_shots(obj):
     context = _point_context(obj)
     if isinstance(context, dict):
@@ -196,9 +205,45 @@ def _rally_shots(obj):
     return _safe_int(getattr(obj, "_point_hit_count", 0), 0)
 
 
-def _let_window_open(rally_shots):
-    """True only until the server plays the first ball after the return."""
-    return _safe_int(rally_shots, 0) <= _MAX_SHORT_RALLY_SHOTS
+def _post_serve_shot_player(obj, event):
+    if not isinstance(event, dict):
+        return None
+    player = str(event.get("player") or "").strip()
+    names = getattr(obj, "player_names", None)
+    if not player or not isinstance(names, (list, tuple)):
+        return None
+    return player if player in {str(name).strip() for name in names} else None
+
+
+def _let_window_open(obj, rally_shots, server_idx, events=None):
+    """Return True only while a retrospective let is still plausible.
+
+    Shot events exclude the serve itself.  A let may survive no post-serve shot,
+    or one positively identified receiver return.  Once the server hits the
+    next ball the rally has continued and a let is impossible.  Unknown shooter
+    identity is deliberately not treated as positive evidence for a let.
+    """
+    shots = _safe_int(rally_shots, 0)
+    if shots <= 0:
+        return True
+    if shots != 1:
+        return False
+
+    if events is None:
+        events = _rally_shot_events(obj)
+    if not isinstance(events, list) or len(events) != 1:
+        return False
+
+    names = getattr(obj, "player_names", None)
+    idx = _safe_int(server_idx, -1)
+    if not isinstance(names, (list, tuple)) or not (0 <= idx < len(names)):
+        return False
+
+    server_name = str(names[idx]).strip()
+    shooter = _post_serve_shot_player(obj, events[0])
+    if shooter is None:
+        return False
+    return shooter != server_name
 
 
 def _server_idx_for_current_context(obj):
@@ -499,7 +544,9 @@ def _patch_tracker_class(cls):
         observation = _current_observation(self)
         server_idx = _server_idx_for_current_context(self)
         attempt = _safe_int(getattr(self, "current_serve_attempt", 1), 1)
+        rally_events = _rally_shot_events(self)
         rally_shots = _rally_shots(self)
+        let_window_open = _let_window_open(self, rally_shots, server_idx, rally_events)
         snapshot = _score_snapshot(self)
         pre_scored_frame = getattr(self, "_last_scored_point_end_frame", None)
         serve_stat_counted = bool(getattr(self, "_serve_landed_in_current_attempt", False))
@@ -524,7 +571,18 @@ def _patch_tracker_class(cls):
         )
         awarded = scored_now and winner is not None
         nonfault = not _service_fault_reason(reason, category)
-        short = _let_window_open(rally_shots)
+        short = let_window_open
+
+        if awarded and nonfault and not short and rally_shots == 1:
+            event = rally_events[0] if len(rally_events) == 1 and isinstance(rally_events[0], dict) else {}
+            shooter = _post_serve_shot_player(self, event)
+            print(
+                f"[RETRO_LET_CLOSED_AFTER_SHOT] f{frame_now}: "
+                f"server={self.player_names[int(server_idx)]} "
+                f"shot_player={shooter or '?'} "
+                f"shot_frame={event.get('frame', '?')} "
+                f"label={event.get('label', '?')}"
+            )
 
         # Every apparent point is already scored by original_record above.
         # We only arm a reversible candidate.  Same-side replay on the next
