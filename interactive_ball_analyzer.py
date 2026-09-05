@@ -9370,6 +9370,21 @@ class InteractiveBallAnalyzer:
         )
         return recent_contact, contact_player, contact_frame, contact_point
 
+    def _point_contact_info(self, frame=None):
+        """Return the last racket owner when it belongs to the active point."""
+        contact_point = getattr(self, '_last_racket_contact_point', None)
+        contact_frame = int(getattr(self, '_last_racket_contact_frame', -1000000))
+        contact_player = getattr(self, '_last_racket_contact_player', None)
+        if contact_player is None and contact_point is not None:
+            contact_player = self._player_index_at_point(contact_point, frame)
+        point_start = getattr(self, 'point_start_frame_internal', None)
+        point_contact = (
+            contact_player in (0, 1) and
+            point_start is not None and
+            int(point_start) <= contact_frame <= int(self.frame_count)
+        )
+        return point_contact, contact_player, contact_frame, contact_point
+
     def _point_bounced_after_contact(self, contact_frame):
         return int(getattr(self, 'last_ground_bounce_frame', -1000000)) > int(contact_frame)
 
@@ -10018,6 +10033,7 @@ class InteractiveBallAnalyzer:
             return self._point_outcome(receiver_idx, "server lost serve fault", "serve_fault", server_idx)
 
         recent_contact, contact_player, contact_frame, _ = self._recent_contact_info(frame=frame)
+        point_contact, point_contact_player, point_contact_frame, _ = self._point_contact_info(frame=frame)
         landing_player = self._player_index_at_point(end_position or self.ball_center, frame)
 
         if "ball hit the net" in reason_lower:
@@ -10040,25 +10056,28 @@ class InteractiveBallAnalyzer:
                     landing_player,
                 )
             # For an OUT, the landing side tells us where the miss landed; it
-            # does not tell us who made the error. A recent verified racket
-            # contact is direct ownership evidence, so the last hitter loses.
-            if recent_contact:
-                winner_idx = 1 - contact_player
+            # does not tell us who made the error. A verified racket contact
+            # from this same point is direct ownership evidence, even after a
+            # long tracking/Local-AI gap, so the last hitter loses.
+            if point_contact:
+                winner_idx = 1 - point_contact_player
                 landing_text = (
                     self.player_names[landing_player]
                     if landing_player in (0, 1) else "unknown"
                 )
+                contact_age = max(0, self.frame_count - point_contact_frame)
                 print(
                     f"[OUT_SCORE_OWNER] f{self.frame_count}: "
-                    f"last_hitter={self.player_names[contact_player]} "
-                    f"contact=f{contact_frame} landing_side={landing_text} "
+                    f"last_hitter={self.player_names[point_contact_player]} "
+                    f"contact=f{point_contact_frame} age={contact_age}f "
+                    f"landing_side={landing_text} "
                     f"-> winner={self.player_names[winner_idx]}"
                 )
                 return self._point_outcome(
                     winner_idx,
                     "last hitter missed court",
                     "out_error",
-                    contact_player,
+                    point_contact_player,
                 )
             if (
                 self.point_start_frame_internal is not None and
