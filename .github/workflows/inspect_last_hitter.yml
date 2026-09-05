@@ -1,40 +1,156 @@
-name: Inspect current OUT ownership block
+name: Fix point-scoped OUT ownership
 on:
   push:
     branches: [revert_1]
     paths: ['.github/workflows/inspect_last_hitter.yml']
+permissions:
+  contents: write
 jobs:
-  inspect:
+  fix:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           ref: revert_1
-      - name: Print current OUT scoring code
+      - name: Preserve verified hitter for OUT scoring
         run: |
           python - <<'PY'
           from pathlib import Path
-          lines = Path('interactive_ball_analyzer.py').read_text(encoding='utf-8').splitlines()
-          needles = [
-              'OUT_SCORE_OWNER',
-              'OUT_WINNER_FALLBACK',
-              'landing-side fallback',
-              'recent_contact',
-              'contact_history',
-              'primary_bounce_frame',
-              '_latest_contact_player_before',
-          ]
-          printed = set()
-          for needle in needles:
-              print(f'\n######## {needle} ########')
-              matches = [i for i,line in enumerate(lines) if needle in line]
-              print('matches:', [i+1 for i in matches])
-              for i in matches:
-                  start=max(0,i-70); end=min(len(lines),i+90)
-                  key=(start,end)
-                  if key in printed:
-                      continue
-                  printed.add(key)
-                  for j in range(start,end):
-                      print(f'{j+1:06d}: {lines[j]}')
+
+          path = Path('interactive_ball_analyzer.py')
+          text = path.read_text(encoding='utf-8')
+
+          def replace_once(old, new, label):
+              global text
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f'{label}: expected exactly 1 match, found {count}')
+              text = text.replace(old, new, 1)
+
+          old_recent = """    def _recent_contact_info(self, frame=None, max_frames=180):
+        contact_point = getattr(self, '_last_racket_contact_point', None)
+        contact_frame = int(getattr(self, '_last_racket_contact_frame', -1000000))
+        contact_player = getattr(self, '_last_racket_contact_player', None)
+        if contact_player is None:
+            contact_player = self._player_index_at_point(contact_point, frame)
+        recent_contact = (
+            contact_player is not None and
+            (self.frame_count - contact_frame) <= max_frames
+        )
+        return recent_contact, contact_player, contact_frame, contact_point
+
+    def _point_bounced_after_contact(self, contact_frame):
+"""
+          new_recent = """    def _recent_contact_info(self, frame=None, max_frames=180):
+        contact_point = getattr(self, '_last_racket_contact_point', None)
+        contact_frame = int(getattr(self, '_last_racket_contact_frame', -1000000))
+        contact_player = getattr(self, '_last_racket_contact_player', None)
+        if contact_player is None:
+            contact_player = self._player_index_at_point(contact_point, frame)
+        recent_contact = (
+            contact_player is not None and
+            (self.frame_count - contact_frame) <= max_frames
+        )
+        return recent_contact, contact_player, contact_frame, contact_point
+
+    def _point_contact_info(self, frame=None):
+        \"\"\"Return the last racket owner when it belongs to the active point.\"\"\"
+        contact_point = getattr(self, '_last_racket_contact_point', None)
+        contact_frame = int(getattr(self, '_last_racket_contact_frame', -1000000))
+        contact_player = getattr(self, '_last_racket_contact_player', None)
+        if contact_player is None and contact_point is not None:
+            contact_player = self._player_index_at_point(contact_point, frame)
+        point_start = getattr(self, 'point_start_frame_internal', None)
+        point_contact = (
+            contact_player in (0, 1) and
+            point_start is not None and
+            int(point_start) <= contact_frame <= int(self.frame_count)
+        )
+        return point_contact, contact_player, contact_frame, contact_point
+
+    def _point_bounced_after_contact(self, contact_frame):
+"""
+          replace_once(old_recent, new_recent, 'add point-scoped contact helper')
+
+          old_infer = """        recent_contact, contact_player, contact_frame, _ = self._recent_contact_info(frame=frame)
+        landing_player = self._player_index_at_point(end_position or self.ball_center, frame)
+"""
+          new_infer = """        recent_contact, contact_player, contact_frame, _ = self._recent_contact_info(frame=frame)
+        point_contact, point_contact_player, point_contact_frame, _ = self._point_contact_info(frame=frame)
+        landing_player = self._player_index_at_point(end_position or self.ball_center, frame)
+"""
+          replace_once(old_infer, new_infer, 'wire point-scoped contact into scoring')
+
+          old_out = """            # For an OUT, the landing side tells us where the miss landed; it
+            # does not tell us who made the error. A recent verified racket
+            # contact is direct ownership evidence, so the last hitter loses.
+            if recent_contact:
+                winner_idx = 1 - contact_player
+                landing_text = (
+                    self.player_names[landing_player]
+                    if landing_player in (0, 1) else \"unknown\"
+                )
+                print(
+                    f\"[OUT_SCORE_OWNER] f{self.frame_count}: \"
+                    f\"last_hitter={self.player_names[contact_player]} \"
+                    f\"contact=f{contact_frame} landing_side={landing_text} \"
+                    f\"-> winner={self.player_names[winner_idx]}\"
+                )
+                return self._point_outcome(
+                    winner_idx,
+                    \"last hitter missed court\",
+                    \"out_error\",
+                    contact_player,
+                )
+"""
+          new_out = """            # For an OUT, the landing side tells us where the miss landed; it
+            # does not tell us who made the error. A verified racket contact
+            # from this same point is direct ownership evidence, even after a
+            # long tracking/Local-AI gap, so the last hitter loses.
+            if point_contact:
+                winner_idx = 1 - point_contact_player
+                landing_text = (
+                    self.player_names[landing_player]
+                    if landing_player in (0, 1) else \"unknown\"
+                )
+                contact_age = max(0, self.frame_count - point_contact_frame)
+                print(
+                    f\"[OUT_SCORE_OWNER] f{self.frame_count}: \"
+                    f\"last_hitter={self.player_names[point_contact_player]} \"
+                    f\"contact=f{point_contact_frame} age={contact_age}f \"
+                    f\"landing_side={landing_text} \"
+                    f\"-> winner={self.player_names[winner_idx]}\"
+                )
+                return self._point_outcome(
+                    winner_idx,
+                    \"last hitter missed court\",
+                    \"out_error\",
+                    point_contact_player,
+                )
+"""
+          replace_once(old_out, new_out, 'use point-scoped owner for OUT')
+
+          path.write_text(text, encoding='utf-8')
+          print('Point-scoped OUT ownership patch applied')
           PY
+      - name: Validate application patch
+        run: |
+          python -m py_compile interactive_ball_analyzer.py
+          git diff --check
+          python - <<'PY'
+          from pathlib import Path
+          text = Path('interactive_ball_analyzer.py').read_text(encoding='utf-8')
+          assert 'def _point_contact_info(self, frame=None):' in text
+          assert 'if point_contact:' in text
+          assert 'age={contact_age}f' in text
+          assert 'if recent_contact:' in text  # still used by non-OUT scoring paths
+          print('Syntax and structural validation passed')
+          PY
+          git diff -- interactive_ball_analyzer.py
+      - name: Commit application fix
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add interactive_ball_analyzer.py
+          git commit -m "Preserve point hitter across long tracking gaps"
+          git push origin HEAD:revert_1
