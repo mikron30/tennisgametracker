@@ -10,38 +10,32 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: revert_1
-      - name: Print hit and last-hitter source
+      - name: Print exact last-hitter reset/update contexts
         run: |
           python - <<'PY'
           from pathlib import Path
-          p=Path('interactive_ball_analyzer.py')
-          lines=p.read_text(encoding='utf-8').splitlines()
+          lines=Path('interactive_ball_analyzer.py').read_text(encoding='utf-8').splitlines()
           needles=[
-            'RALLY_HIT',
-            'last_hitter',
-            '_last_hitter',
-            'large lower-court launch',
-            'inward sideline return',
-            'racket contact',
-            'shot_strokes',
-            '_record_rally',
-            '_record_shot',
-            'last_racket_contact',
-            'OUT_SCORE_OWNER',
+            'def reset_for_next_point',
+            'def start_new_point',
+            'self._last_hitter_side =',
+            'self._last_hitter_frame =',
+            'self._rally_last_hit_player = None',
+            'self._rally_last_hit_frame =',
+            "self._serve_state = 'toss'",
+            'ball out; hitter unknown, landing-side fallback',
           ]
-          printed=[]
+          printed=set()
           for needle in needles:
             print(f'\n######## NEEDLE: {needle} ########')
-            hits=0
             for i,line in enumerate(lines):
               if needle in line:
-                hits += 1
-                start=max(0,i-35); end=min(len(lines),i+70)
+                start=max(0,i-25); end=min(len(lines),i+55)
                 key=(start,end)
-                if key in printed: continue
-                printed.append(key)
+                if key in printed:
+                  continue
+                printed.add(key)
                 print(f'\n===== {needle} @ line {i+1} =====')
                 for j in range(start,end):
                   print(f'{j+1:06d}: {lines[j]}')
-            print(f'HITS={hits}')
           PY
