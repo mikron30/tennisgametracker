@@ -1,0 +1,149 @@
+name: Apply auto Local AI trajectory patch
+
+on:
+  push:
+    branches: [revert_1]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: startsWith(github.event.head_commit.message, 'Run auto Local AI trajectory patch')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: revert_1
+          fetch-depth: 0
+
+      - name: Patch automatic trajectory Local AI trigger
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('interactive_ball_analyzer.py')
+          text = path.read_text(encoding='utf-8')
+
+          hotspot_old = """                if selected_predicted_path_override and (static_hotspot or frame0_background):
+                    debug = selected_meta_for_guard.get('predicted_path_hotspot_debug') or {}
+                    print(
+"""
+          hotspot_new = """                if selected_predicted_path_override and (static_hotspot or frame0_background):
+                    debug = selected_meta_for_guard.get('predicted_path_hotspot_debug') or {}
+                    # Remember this exact normal-HSV decision until the post-track
+                    # arbitration runs below.  A predicted-path hotspot is normally
+                    # allowed for continuity, but a large unexplained turn on a nearly
+                    # static hotspot is precisely where the short Local-AI bridge is
+                    # safer than letting the hotspot become the next trajectory anchor.
+                    self._trajectory_local_ai_hotspot = {
+                        'frame': int(self.frame_count),
+                        'position': (int(cx), int(cy)),
+                        'motion_mean': float(motion_mean),
+                        'motion_max': float(motion_max),
+                        'predicted_distance': float(
+                            debug.get('predicted_distance', selected_predicted_distance or 0.0)
+                        ),
+                    }
+                    print(
+"""
+          if hotspot_old not in text:
+              raise SystemExit('hotspot insertion point not found')
+          text = text.replace(hotspot_old, hotspot_new, 1)
+
+          trigger_old = """        if zone is not None or contact_near:
+            self._contact_local_ai_watch_until_frame = max(watch_until, current + 8)
+            watch_active = True
+        if zone is None and not contact_near and not watch_active:
+            return None
+
+        recent_speeds = [
+"""
+          trigger_new = """        if zone is not None or contact_near:
+            self._contact_local_ai_watch_until_frame = max(watch_until, current + 8)
+            watch_active = True
+
+        # Generic trajectory-break recovery.  Do not invoke AI merely because
+        # the ball changed direction: real tennis hits and bounces do that all
+        # the time.  Escalate only when the normal detector has just accepted a
+        # predicted-path background hotspot, local image motion is extremely
+        # weak, the turn is large, and there is no active serve/rally/bounce
+        # contact grace explaining the change.  This catches the f2447 failure
+        # class without making Local AI the normal tracker.
+        trajectory_hotspot = getattr(self, '_trajectory_local_ai_hotspot', None)
+        if (
+                zone is None and not contact_near and not watch_active and
+                isinstance(trajectory_hotspot, dict) and
+                int(trajectory_hotspot.get('frame', -1)) == current):
+            hotspot_motion_mean = float(trajectory_hotspot.get('motion_mean', 999.0) or 0.0)
+            hotspot_motion_max = float(trajectory_hotspot.get('motion_max', 999.0) or 0.0)
+            physical_event_grace = any(
+                int(getattr(self, attr, 0) or 0) > 0
+                for attr in (
+                    '_serve_contact_grace_frames',
+                    '_rally_contact_grace_frames',
+                    '_ground_bounce_grace_frames',
+                )
+            )
+            if (
+                    not physical_event_grace and
+                    prior_speed >= 14.0 and proposed_speed >= 14.0 and
+                    angle_delta >= 50.0 and prediction_error >= 12.0 and
+                    hotspot_motion_mean <= 3.0 and hotspot_motion_max <= 12.0):
+                reason = (
+                    f'trajectory-hotspot-turn:{angle_delta:.0f}deg/'
+                    f'pred={prediction_error:.0f}px/'
+                    f'motion={hotspot_motion_mean:.1f}/{hotspot_motion_max:.1f}'
+                )
+                print(
+                    f'[TRAJECTORY_LOCAL_AI_TRIGGER] f{current}: '
+                    f'previous={previous} normal={tracked} predicted={predicted} '
+                    f'angle={angle_delta:.1f}deg pred_error={prediction_error:.1f}px '
+                    f'motion={hotspot_motion_mean:.1f}/{hotspot_motion_max:.1f}'
+                )
+                return reason
+
+        if zone is None and not contact_near and not watch_active:
+            return None
+
+        recent_speeds = [
+"""
+          if trigger_old not in text:
+              raise SystemExit('trajectory trigger insertion point not found')
+          text = text.replace(trigger_old, trigger_new, 1)
+
+          handoff_old = """        # Keep AI for several frames after contact.  This prevents an immediate
+        # handback to HSV while its search anchor is still the racket/player.
+        if age >= 5 and int(state.get('outside_count', 0)) >= 3:
+"""
+          handoff_new = """        # Keep AI for several frames after contact.  This prevents an immediate
+        # handback to HSV while its search anchor is still the racket/player.
+        # A trajectory-hotspot takeover is not a player-contact recovery; keep
+        # it through six transitions so it can bridge the bad HSV zone, then
+        # hand control back on the following frame when normal HSV is coherent.
+        minimum_owner_age = (
+            6
+            if str(state.get('reason', '')).startswith('trajectory-hotspot-turn:')
+            else 5
+        )
+        if age >= minimum_owner_age and int(state.get('outside_count', 0)) >= 3:
+"""
+          if handoff_old not in text:
+              raise SystemExit('Local AI handoff insertion point not found')
+          text = text.replace(handoff_old, handoff_new, 1)
+
+          path.write_text(text, encoding='utf-8')
+          PY
+
+      - name: Syntax check
+        run: python -m py_compile interactive_ball_analyzer.py
+
+      - name: Commit patch
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add interactive_ball_analyzer.py
+          git commit -m "Auto-trigger Local AI on unexplained hotspot turns"
+          git push origin HEAD:revert_1
