@@ -1,0 +1,47 @@
+name: Inspect last hitter logic
+on:
+  push:
+    branches: [revert_1]
+    paths: ['.github/workflows/inspect_last_hitter.yml']
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: revert_1
+      - name: Print hit and last-hitter source
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p=Path('interactive_ball_analyzer.py')
+          lines=p.read_text(encoding='utf-8').splitlines()
+          needles=[
+            'RALLY_HIT',
+            'last_hitter',
+            '_last_hitter',
+            'large lower-court launch',
+            'inward sideline return',
+            'racket contact',
+            'shot_strokes',
+            '_record_rally',
+            '_record_shot',
+            'last_racket_contact',
+            'OUT_SCORE_OWNER',
+          ]
+          printed=[]
+          for needle in needles:
+            print(f'\n######## NEEDLE: {needle} ########')
+            hits=0
+            for i,line in enumerate(lines):
+              if needle in line:
+                hits += 1
+                start=max(0,i-35); end=min(len(lines),i+70)
+                key=(start,end)
+                if key in printed: continue
+                printed.append(key)
+                print(f'\n===== {needle} @ line {i+1} =====')
+                for j in range(start,end):
+                  print(f'{j+1:06d}: {lines[j]}')
+            print(f'HITS={hits}')
+          PY
