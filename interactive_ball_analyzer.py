@@ -1245,6 +1245,46 @@ class InteractiveBallAnalyzer:
         if zone is not None or contact_near:
             self._contact_local_ai_watch_until_frame = max(watch_until, current + 8)
             watch_active = True
+
+        # Generic trajectory-break recovery. Do not invoke AI merely because
+        # the ball changed direction: real tennis hits and bounces do that all
+        # the time. Escalate only when the normal detector has just accepted a
+        # predicted-path background hotspot, local image motion is extremely
+        # weak, the turn is large, and there is no active serve/rally/bounce
+        # contact grace explaining the change.
+        trajectory_hotspot = getattr(self, '_trajectory_local_ai_hotspot', None)
+        if (
+                zone is None and not contact_near and not watch_active and
+                isinstance(trajectory_hotspot, dict) and
+                int(trajectory_hotspot.get('frame', -1)) == current):
+            hotspot_motion_mean = float(trajectory_hotspot.get('motion_mean', 999.0) or 0.0)
+            hotspot_motion_max = float(trajectory_hotspot.get('motion_max', 999.0) or 0.0)
+            physical_event_grace = any(
+                int(getattr(self, attr, 0) or 0) > 0
+                for attr in (
+                    '_serve_contact_grace_frames',
+                    '_rally_contact_grace_frames',
+                    '_ground_bounce_grace_frames',
+                )
+            )
+            if (
+                    not physical_event_grace and
+                    prior_speed >= 14.0 and proposed_speed >= 14.0 and
+                    angle_delta >= 50.0 and prediction_error >= 12.0 and
+                    hotspot_motion_mean <= 3.0 and hotspot_motion_max <= 12.0):
+                reason = (
+                    f'trajectory-hotspot-turn:{angle_delta:.0f}deg/'
+                    f'pred={prediction_error:.0f}px/'
+                    f'motion={hotspot_motion_mean:.1f}/{hotspot_motion_max:.1f}'
+                )
+                print(
+                    f'[TRAJECTORY_LOCAL_AI_TRIGGER] f{current}: '
+                    f'previous={previous} normal={tracked} predicted={predicted} '
+                    f'angle={angle_delta:.1f}deg pred_error={prediction_error:.1f}px '
+                    f'motion={hotspot_motion_mean:.1f}/{hotspot_motion_max:.1f}'
+                )
+                return reason
+
         if zone is None and not contact_near and not watch_active:
             return None
 
@@ -1434,7 +1474,15 @@ class InteractiveBallAnalyzer:
 
         # Keep AI for several frames after contact.  This prevents an immediate
         # handback to HSV while its search anchor is still the racket/player.
-        if age >= 5 and int(state.get('outside_count', 0)) >= 3:
+        # A trajectory-hotspot takeover is not a player-contact recovery; keep
+        # it through six transitions so it can bridge the bad HSV zone, then
+        # hand control back on the following frame when normal HSV is coherent.
+        minimum_owner_age = (
+            6
+            if str(state.get('reason', '')).startswith('trajectory-hotspot-turn:')
+            else 5
+        )
+        if age >= minimum_owner_age and int(state.get('outside_count', 0)) >= 3:
             print(
                 f"[CONTACT_LOCAL_AI_HANDOFF] f{current}: selected={selected} "
                 f"clear of player/contact corridor for {state['outside_count']}f"
@@ -19090,6 +19138,20 @@ class InteractiveBallAnalyzer:
                 )
                 if selected_predicted_path_override and (static_hotspot or frame0_background):
                     debug = selected_meta_for_guard.get('predicted_path_hotspot_debug') or {}
+                    # Remember this exact normal-HSV decision until the post-track
+                    # arbitration runs below. A predicted-path hotspot is normally
+                    # allowed for continuity, but a large unexplained turn on a nearly
+                    # static hotspot is precisely where the short Local-AI bridge is
+                    # safer than letting the hotspot become the next trajectory anchor.
+                    self._trajectory_local_ai_hotspot = {
+                        'frame': int(self.frame_count),
+                        'position': (int(cx), int(cy)),
+                        'motion_mean': float(motion_mean),
+                        'motion_max': float(motion_max),
+                        'predicted_distance': float(
+                            debug.get('predicted_distance', selected_predicted_distance or 0.0)
+                        ),
+                    }
                     print(
                         f"Frame {self.frame_count}: [PREDICTED-PATH HOTSPOT] accepting selected "
                         f"candidate at ({cx},{cy}) pred_dist="
