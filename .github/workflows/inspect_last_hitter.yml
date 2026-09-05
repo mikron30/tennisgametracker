@@ -1,4 +1,4 @@
-name: Fix point-scoped OUT ownership
+name: Fix point scoped OUT ownership
 on:
   push:
     branches: [revert_1]
@@ -12,128 +12,96 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: revert_1
-      - name: Preserve verified hitter for OUT scoring
+      - name: Patch OUT scoring
         run: |
           python - <<'PY'
           from pathlib import Path
-
-          path = Path('interactive_ball_analyzer.py')
-          text = path.read_text(encoding='utf-8')
-
-          def replace_once(old, new, label):
-              global text
-              count = text.count(old)
-              if count != 1:
-                  raise SystemExit(f'{label}: expected exactly 1 match, found {count}')
+          p = Path('interactive_ball_analyzer.py')
+          text = p.read_text(encoding='utf-8')
+          marker = "    def _point_bounced_after_contact(self, contact_frame):\n"
+          helper = (
+              "    def _point_contact_info(self, frame=None):\n"
+              "        \"\"\"Return the last racket owner when it belongs to the active point.\"\"\"\n"
+              "        contact_point = getattr(self, '_last_racket_contact_point', None)\n"
+              "        contact_frame = int(getattr(self, '_last_racket_contact_frame', -1000000))\n"
+              "        contact_player = getattr(self, '_last_racket_contact_player', None)\n"
+              "        if contact_player is None and contact_point is not None:\n"
+              "            contact_player = self._player_index_at_point(contact_point, frame)\n"
+              "        point_start = getattr(self, 'point_start_frame_internal', None)\n"
+              "        point_contact = (\n"
+              "            contact_player in (0, 1) and\n"
+              "            point_start is not None and\n"
+              "            int(point_start) <= contact_frame <= int(self.frame_count)\n"
+              "        )\n"
+              "        return point_contact, contact_player, contact_frame, contact_point\n\n"
+          )
+          if '    def _point_contact_info(self, frame=None):\n' not in text:
+              if text.count(marker) != 1:
+                  raise SystemExit(f'point helper insertion marker count={text.count(marker)}')
+              text = text.replace(marker, helper + marker, 1)
+          infer_old = "        recent_contact, contact_player, contact_frame, _ = self._recent_contact_info(frame=frame)\n        landing_player = self._player_index_at_point(end_position or self.ball_center, frame)\n"
+          infer_new = "        recent_contact, contact_player, contact_frame, _ = self._recent_contact_info(frame=frame)\n        point_contact, point_contact_player, point_contact_frame, _ = self._point_contact_info(frame=frame)\n        landing_player = self._player_index_at_point(end_position or self.ball_center, frame)\n"
+          if infer_new not in text:
+              if text.count(infer_old) != 1:
+                  raise SystemExit(f'infer wiring marker count={text.count(infer_old)}')
+              text = text.replace(infer_old, infer_new, 1)
+          old = (
+              "            # For an OUT, the landing side tells us where the miss landed; it\n"
+              "            # does not tell us who made the error. A recent verified racket\n"
+              "            # contact is direct ownership evidence, so the last hitter loses.\n"
+              "            if recent_contact:\n"
+              "                winner_idx = 1 - contact_player\n"
+              "                landing_text = (\n"
+              "                    self.player_names[landing_player]\n"
+              "                    if landing_player in (0, 1) else \"unknown\"\n"
+              "                )\n"
+              "                print(\n"
+              "                    f\"[OUT_SCORE_OWNER] f{self.frame_count}: \"\n"
+              "                    f\"last_hitter={self.player_names[contact_player]} \"\n"
+              "                    f\"contact=f{contact_frame} landing_side={landing_text} \"\n"
+              "                    f\"-> winner={self.player_names[winner_idx]}\"\n"
+              "                )\n"
+              "                return self._point_outcome(\n"
+              "                    winner_idx,\n"
+              "                    \"last hitter missed court\",\n"
+              "                    \"out_error\",\n"
+              "                    contact_player,\n"
+              "                )\n"
+          )
+          new = (
+              "            # For an OUT, the landing side tells us where the miss landed; it\n"
+              "            # does not tell us who made the error. A verified racket contact\n"
+              "            # from this same point is direct ownership evidence, even after a\n"
+              "            # long tracking/Local-AI gap, so the last hitter loses.\n"
+              "            if point_contact:\n"
+              "                winner_idx = 1 - point_contact_player\n"
+              "                landing_text = (\n"
+              "                    self.player_names[landing_player]\n"
+              "                    if landing_player in (0, 1) else \"unknown\"\n"
+              "                )\n"
+              "                contact_age = max(0, self.frame_count - point_contact_frame)\n"
+              "                print(\n"
+              "                    f\"[OUT_SCORE_OWNER] f{self.frame_count}: \"\n"
+              "                    f\"last_hitter={self.player_names[point_contact_player]} \"\n"
+              "                    f\"contact=f{point_contact_frame} age={contact_age}f \"\n"
+              "                    f\"landing_side={landing_text} \"\n"
+              "                    f\"-> winner={self.player_names[winner_idx]}\"\n"
+              "                )\n"
+              "                return self._point_outcome(\n"
+              "                    winner_idx,\n"
+              "                    \"last hitter missed court\",\n"
+              "                    \"out_error\",\n"
+              "                    point_contact_player,\n"
+              "                )\n"
+          )
+          if new not in text:
+              if text.count(old) != 1:
+                  raise SystemExit(f'OUT owner block count={text.count(old)}')
               text = text.replace(old, new, 1)
-
-          old_recent = """    def _recent_contact_info(self, frame=None, max_frames=180):
-        contact_point = getattr(self, '_last_racket_contact_point', None)
-        contact_frame = int(getattr(self, '_last_racket_contact_frame', -1000000))
-        contact_player = getattr(self, '_last_racket_contact_player', None)
-        if contact_player is None:
-            contact_player = self._player_index_at_point(contact_point, frame)
-        recent_contact = (
-            contact_player is not None and
-            (self.frame_count - contact_frame) <= max_frames
-        )
-        return recent_contact, contact_player, contact_frame, contact_point
-
-    def _point_bounced_after_contact(self, contact_frame):
-"""
-          new_recent = """    def _recent_contact_info(self, frame=None, max_frames=180):
-        contact_point = getattr(self, '_last_racket_contact_point', None)
-        contact_frame = int(getattr(self, '_last_racket_contact_frame', -1000000))
-        contact_player = getattr(self, '_last_racket_contact_player', None)
-        if contact_player is None:
-            contact_player = self._player_index_at_point(contact_point, frame)
-        recent_contact = (
-            contact_player is not None and
-            (self.frame_count - contact_frame) <= max_frames
-        )
-        return recent_contact, contact_player, contact_frame, contact_point
-
-    def _point_contact_info(self, frame=None):
-        \"\"\"Return the last racket owner when it belongs to the active point.\"\"\"
-        contact_point = getattr(self, '_last_racket_contact_point', None)
-        contact_frame = int(getattr(self, '_last_racket_contact_frame', -1000000))
-        contact_player = getattr(self, '_last_racket_contact_player', None)
-        if contact_player is None and contact_point is not None:
-            contact_player = self._player_index_at_point(contact_point, frame)
-        point_start = getattr(self, 'point_start_frame_internal', None)
-        point_contact = (
-            contact_player in (0, 1) and
-            point_start is not None and
-            int(point_start) <= contact_frame <= int(self.frame_count)
-        )
-        return point_contact, contact_player, contact_frame, contact_point
-
-    def _point_bounced_after_contact(self, contact_frame):
-"""
-          replace_once(old_recent, new_recent, 'add point-scoped contact helper')
-
-          old_infer = """        recent_contact, contact_player, contact_frame, _ = self._recent_contact_info(frame=frame)
-        landing_player = self._player_index_at_point(end_position or self.ball_center, frame)
-"""
-          new_infer = """        recent_contact, contact_player, contact_frame, _ = self._recent_contact_info(frame=frame)
-        point_contact, point_contact_player, point_contact_frame, _ = self._point_contact_info(frame=frame)
-        landing_player = self._player_index_at_point(end_position or self.ball_center, frame)
-"""
-          replace_once(old_infer, new_infer, 'wire point-scoped contact into scoring')
-
-          old_out = """            # For an OUT, the landing side tells us where the miss landed; it
-            # does not tell us who made the error. A recent verified racket
-            # contact is direct ownership evidence, so the last hitter loses.
-            if recent_contact:
-                winner_idx = 1 - contact_player
-                landing_text = (
-                    self.player_names[landing_player]
-                    if landing_player in (0, 1) else \"unknown\"
-                )
-                print(
-                    f\"[OUT_SCORE_OWNER] f{self.frame_count}: \"
-                    f\"last_hitter={self.player_names[contact_player]} \"
-                    f\"contact=f{contact_frame} landing_side={landing_text} \"
-                    f\"-> winner={self.player_names[winner_idx]}\"
-                )
-                return self._point_outcome(
-                    winner_idx,
-                    \"last hitter missed court\",
-                    \"out_error\",
-                    contact_player,
-                )
-"""
-          new_out = """            # For an OUT, the landing side tells us where the miss landed; it
-            # does not tell us who made the error. A verified racket contact
-            # from this same point is direct ownership evidence, even after a
-            # long tracking/Local-AI gap, so the last hitter loses.
-            if point_contact:
-                winner_idx = 1 - point_contact_player
-                landing_text = (
-                    self.player_names[landing_player]
-                    if landing_player in (0, 1) else \"unknown\"
-                )
-                contact_age = max(0, self.frame_count - point_contact_frame)
-                print(
-                    f\"[OUT_SCORE_OWNER] f{self.frame_count}: \"
-                    f\"last_hitter={self.player_names[point_contact_player]} \"
-                    f\"contact=f{point_contact_frame} age={contact_age}f \"
-                    f\"landing_side={landing_text} \"
-                    f\"-> winner={self.player_names[winner_idx]}\"
-                )
-                return self._point_outcome(
-                    winner_idx,
-                    \"last hitter missed court\",
-                    \"out_error\",
-                    point_contact_player,
-                )
-"""
-          replace_once(old_out, new_out, 'use point-scoped owner for OUT')
-
-          path.write_text(text, encoding='utf-8')
-          print('Point-scoped OUT ownership patch applied')
+          p.write_text(text, encoding='utf-8')
+          print('Patch applied')
           PY
-      - name: Validate application patch
+      - name: Validate
         run: |
           python -m py_compile interactive_ball_analyzer.py
           git diff --check
@@ -143,8 +111,7 @@ jobs:
           assert 'def _point_contact_info(self, frame=None):' in text
           assert 'if point_contact:' in text
           assert 'age={contact_age}f' in text
-          assert 'if recent_contact:' in text  # still used by non-OUT scoring paths
-          print('Syntax and structural validation passed')
+          print('Validation passed')
           PY
           git diff -- interactive_ball_analyzer.py
       - name: Commit application fix
