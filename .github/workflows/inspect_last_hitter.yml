@@ -1,41 +1,130 @@
-name: Inspect last hitter logic
+name: Fix persistent last hitter scoring
 on:
   push:
     branches: [revert_1]
     paths: ['.github/workflows/inspect_last_hitter.yml']
+permissions:
+  contents: write
 jobs:
-  inspect:
+  fix:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           ref: revert_1
-      - name: Print exact last-hitter reset/update contexts
+      - name: Patch last verified hitter persistence
         run: |
           python - <<'PY'
           from pathlib import Path
-          lines=Path('interactive_ball_analyzer.py').read_text(encoding='utf-8').splitlines()
-          needles=[
-            'def reset_for_next_point',
-            'def start_new_point',
-            'self._last_hitter_side =',
-            'self._last_hitter_frame =',
-            'self._rally_last_hit_player = None',
-            'self._rally_last_hit_frame =',
-            "self._serve_state = 'toss'",
-            'ball out; hitter unknown, landing-side fallback',
+
+          path = Path('interactive_ball_analyzer.py')
+          text = path.read_text(encoding='utf-8')
+
+          def replace_once(old, new, label):
+              global text
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f'{label}: expected exactly 1 match, found {count}')
+              text = text.replace(old, new, 1)
+
+          # 1) Keep a point-scoped copy of the last VERIFIED racket owner.  The
+          # normal transient hitter fields are intentionally cleared by some
+          # serve/reacquisition paths, so they cannot be the sole source for
+          # terminal OUT scoring.
+          replace_once(
+              "        self._last_hitter_side = None\n        self._last_hitter_frame = -10000\n        self._last_fast_side = None\n",
+              "        self._last_hitter_side = None\n        self._last_hitter_frame = -10000\n        # Point-scoped verified hitter survives temporary tracker/serve-state\n        # resets.  It is cleared only when the tennis point itself is reset.\n        self._point_last_verified_hitter_side = None\n        self._point_last_verified_hitter_frame = -10000\n        self._last_fast_side = None\n",
+              'initial point-scoped hitter state',
+          )
+
+          # 2) Any accepted hitter update that stamps the current frame is a
+          # verified contact. Mirror it into the point-scoped state.  There are
+          # currently two such paths: legal serve contact and rally racket hit.
+          stamp = "self._last_hitter_frame = int(self.frame_count)"
+          stamp_count = text.count(stamp)
+          if stamp_count != 2:
+              raise SystemExit(
+                  f'verified hitter frame stamps: expected 2 matches, found {stamp_count}'
+              )
+          lines = text.splitlines(True)
+          out = []
+          patched_stamps = 0
+          for line in lines:
+              out.append(line)
+              if stamp in line:
+                  indent = line[:len(line) - len(line.lstrip())]
+                  out.append(
+                      f"{indent}self._point_last_verified_hitter_side = self._last_hitter_side\n"
+                  )
+                  out.append(
+                      f"{indent}self._point_last_verified_hitter_frame = self._last_hitter_frame\n"
+                  )
+                  patched_stamps += 1
+          if patched_stamps != 2:
+              raise SystemExit(f'patched verified hitter stamps: {patched_stamps}')
+          text = ''.join(out)
+
+          # 3) OUT resolution: before compatibility/server/landing-side fallbacks,
+          # recover the last verified hitter from this SAME tennis point.
+          replace_once(
+              "                if last_hitter not in ('near', 'far'):\n                    # Compatibility fallback for older state that only tracked the\n                    # last contact player number.\n",
+              "                if last_hitter not in ('near', 'far'):\n                    verified_hitter = getattr(\n                        self, '_point_last_verified_hitter_side', None\n                    )\n                    if verified_hitter in ('near', 'far'):\n                        last_hitter = verified_hitter\n                        last_hitter_frame = int(\n                            getattr(\n                                self, '_point_last_verified_hitter_frame',\n                                -1_000_000_000,\n                            )\n                            or -1_000_000_000\n                        )\n                        print(\n                            f\"[LAST_HITTER_FALLBACK] Frame {self.frame_count}: \"\n                            f\"using point-verified {last_hitter} hitter from \"\n                            f\"frame {last_hitter_frame}\"\n                        )\n                if last_hitter not in ('near', 'far'):\n                    # Compatibility fallback for older state that only tracked the\n                    # last contact player number.\n",
+              'OUT point-verified hitter fallback',
+          )
+
+          # 4) Clear the persistent owner only in reset_for_next_point().  Locate
+          # that method and mirror its existing transient-hitter reset without
+          # touching the temporary serve/toss resets elsewhere in the file.
+          lines = text.splitlines(True)
+          reset_start = next(
+              (i for i, line in enumerate(lines) if line.startswith('    def reset_for_next_point(')),
+              None,
+          )
+          if reset_start is None:
+              raise SystemExit('reset_for_next_point definition not found')
+          reset_end = next(
+              (i for i in range(reset_start + 1, len(lines))
+               if lines[i].startswith('    def ')),
+              len(lines),
+          )
+          reset_side_indexes = [
+              i for i in range(reset_start, reset_end)
+              if 'self._last_hitter_side = None' in lines[i]
           ]
-          printed=set()
-          for needle in needles:
-            print(f'\n######## NEEDLE: {needle} ########')
-            for i,line in enumerate(lines):
-              if needle in line:
-                start=max(0,i-25); end=min(len(lines),i+55)
-                key=(start,end)
-                if key in printed:
-                  continue
-                printed.add(key)
-                print(f'\n===== {needle} @ line {i+1} =====')
-                for j in range(start,end):
-                  print(f'{j+1:06d}: {lines[j]}')
+          if len(reset_side_indexes) != 1:
+              raise SystemExit(
+                  'reset_for_next_point: expected exactly one transient hitter reset, '
+                  f'found {len(reset_side_indexes)}'
+              )
+          idx = reset_side_indexes[0]
+          indent = lines[idx][:len(lines[idx]) - len(lines[idx].lstrip())]
+          insert_at = idx + 1
+          if insert_at < reset_end and 'self._last_hitter_frame = ' in lines[insert_at]:
+              insert_at += 1
+          lines[insert_at:insert_at] = [
+              f"{indent}self._point_last_verified_hitter_side = None\n",
+              f"{indent}self._point_last_verified_hitter_frame = -10000\n",
+          ]
+          text = ''.join(lines)
+
+          # Text-level invariants prevent a half-applied patch from being committed.
+          if text.count('_point_last_verified_hitter_side') < 5:
+              raise SystemExit('persistent hitter side was not wired into all required paths')
+          if text.count('[LAST_HITTER_FALLBACK]') != 1:
+              raise SystemExit('expected one LAST_HITTER_FALLBACK diagnostic')
+
+          path.write_text(text, encoding='utf-8')
+          print('Patch applied successfully')
           PY
+      - name: Validate syntax and patch
+        run: |
+          python -m py_compile interactive_ball_analyzer.py
+          git diff --check
+          git diff -- interactive_ball_analyzer.py
+      - name: Commit application fix
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add interactive_ball_analyzer.py
+          git commit -m "Preserve verified rally hitter through tracking loss"
+          git push origin HEAD:revert_1
