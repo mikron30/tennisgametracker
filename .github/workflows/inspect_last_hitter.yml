@@ -1,56 +1,51 @@
-name: Inspect current point ownership
+name: Fix long-gap hitter ownership
 on:
   push:
     branches: [revert_1]
     paths: ['.github/workflows/inspect_last_hitter.yml']
+permissions:
+  contents: write
 jobs:
-  inspect:
+  fix:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           ref: revert_1
-      - name: Inspect contact ownership and point reset
+      - name: Preserve verified hitter across long tracking gaps
         run: |
           python - <<'PY'
           from pathlib import Path
-          import re
-          lines = Path('interactive_ball_analyzer.py').read_text(encoding='utf-8').splitlines()
 
-          print('=== POINT/RESET METHOD DEFINITIONS ===')
-          for i,line in enumerate(lines):
-              if re.match(r'^    def .*?(point|rally|contact|hit)', line, re.I) or re.match(r'^    def .*reset', line, re.I):
-                  print(f'{i+1:06d}: {line}')
+          path = Path('interactive_ball_analyzer.py')
+          text = path.read_text(encoding='utf-8')
 
-          print('\n=== CONTACT/HITTER/RALLY STATE ATTRIBUTES ===')
-          attrs = {}
-          for i,line in enumerate(lines):
-              for name in re.findall(r'self\.(_[A-Za-z0-9_]*(?:contact|hitter|rally|hit)[A-Za-z0-9_]*)', line, re.I):
-                  attrs.setdefault(name, []).append(i)
-          for name, idxs in sorted(attrs.items()):
-              print(f'{name}: {len(idxs)} occurrences; lines {[i+1 for i in idxs[:12]]}')
+          old = """                if (\n                        contact_player not in (1, 2)\n                        or contact_frame < point_start_frame\n                        or contact_frame > target_frame\n                        or primary_bounce_frame - contact_frame > 90):\n                    continue\n"""
+          new = """                # Score ownership is point-scoped, not time-limited. A verified\n                # racket/serve contact can legitimately be more than 90 frames before\n                # the terminal OUT bounce when the ball is temporarily lost or a Local\n                # AI bridge is used. Keep that verified hitter as long as the contact\n                # belongs to this point and occurred before the scoring snapshot.\n                if (\n                        contact_player not in (1, 2)\n                        or contact_frame < point_start_frame\n                        or contact_frame > target_frame):\n                    continue\n"""
 
-          needles = [
-              'recent_contact =',
-              'contact_player =',
-              'contact_frame =',
-              'last hitter missed court',
-              'ball out; hitter unknown, landing-side fallback',
-              '[OUT_SCORE_OWNER]',
-              'def _resolve',
-              'def _point_outcome',
-              'def reset',
-              'point_start_frame_internal =',
-          ]
-          printed=set()
-          for needle in needles:
-              print(f'\n######## {needle} ########')
-              for i,line in enumerate(lines):
-                  if needle in line:
-                      start=max(0,i-45); end=min(len(lines),i+75)
-                      key=(start,end)
-                      if key in printed: continue
-                      printed.add(key)
-                      for j in range(start,end):
-                          print(f'{j+1:06d}: {lines[j]}')
+          count = text.count(old)
+          if count != 1:
+              raise SystemExit(f'expected exactly one 90-frame OUT ownership guard, found {count}')
+          text = text.replace(old, new, 1)
+          path.write_text(text, encoding='utf-8')
+          print('Removed 90-frame expiry from verified current-point hitter ownership')
           PY
+      - name: Validate patch
+        run: |
+          python -m py_compile interactive_ball_analyzer.py
+          git diff --check
+          python - <<'PY'
+          from pathlib import Path
+          text = Path('interactive_ball_analyzer.py').read_text(encoding='utf-8')
+          assert 'primary_bounce_frame - contact_frame > 90' not in text
+          assert 'Score ownership is point-scoped, not time-limited.' in text
+          print('Validation passed')
+          PY
+          git diff -- interactive_ball_analyzer.py
+      - name: Commit application fix
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add interactive_ball_analyzer.py
+          git commit -m "Preserve verified hitter across long tracking gaps"
+          git push origin HEAD:revert_1
