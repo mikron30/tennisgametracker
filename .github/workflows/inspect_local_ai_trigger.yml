@@ -1,0 +1,36 @@
+name: Inspect Local AI Trigger
+on:
+  push:
+    branches: [revert_1]
+    paths: ['.github/workflows/inspect_local_ai_trigger.yml']
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Print relevant source
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p=Path('interactive_ball_analyzer.py')
+          lines=p.read_text(encoding='utf-8').splitlines()
+          needles=[
+            'def _contact_local_ai_trigger',
+            '_contact_local_ai_trigger(',
+            'TRAJECTORY_LOCAL_AI_TRIGGER',
+            '_trajectory_local_ai_hotspot',
+            'PREDICTED-PATH HOTSPOT',
+            'CONTACT_LOCAL_AI_ARM',
+          ]
+          seen=[]
+          for needle in needles:
+            for i,line in enumerate(lines):
+              if needle in line:
+                start=max(0,i-50); end=min(len(lines),i+100)
+                key=(start,end)
+                if key in seen: continue
+                seen.append(key)
+                print(f'\n===== {needle} @ line {i+1} =====')
+                for j in range(start,end):
+                  print(f'{j+1:06d}: {lines[j]}')
+          PY
