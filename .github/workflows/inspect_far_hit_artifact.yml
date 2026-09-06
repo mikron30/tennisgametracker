@@ -1,37 +1,33 @@
-name: Inspect far hit artifact
+name: Apply missed far return fix
 on:
   push:
     branches: [revert_1]
     paths: ['.github/workflows/inspect_far_hit_artifact.yml']
 permissions:
-  contents: read
+  contents: write
 jobs:
-  inspect:
+  apply_fix:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           ref: revert_1
-      - name: Build focused source report
+          fetch-depth: 0
+      - name: Apply patch
+        run: python .github/patches/fix_missing_far_return.py
+      - name: Validate
         run: |
-          python - <<'PY'
-          from pathlib import Path
-          p = Path('interactive_ball_analyzer.py')
-          lines = p.read_text(encoding='utf-8').splitlines()
-          ranges = [
-              (8500, 8900),
-              (11500, 12250),
-              (19800, 21050),
-          ]
-          out=[f'total_lines={len(lines)}']
-          for start,end in ranges:
-              lo=max(0,start-1); hi=min(len(lines),end)
-              out.append(f'\n===== lines {lo+1}-{hi} =====')
-              for j in range(lo,hi):
-                  out.append(f'{j+1}: {lines[j]}')
-          Path('far_hit_inspection.txt').write_text('\n'.join(out), encoding='utf-8')
-          PY
-      - uses: actions/upload-artifact@v4
-        with:
-          name: far-hit-inspection
-          path: far_hit_inspection.txt
+          python -m py_compile interactive_ball_analyzer.py
+          python .github/patches/fix_missing_far_return.py --test
+          git diff --check
+      - name: Commit fix
+        run: |
+          rm -f .github/workflows/fix_missing_far_return.yml
+          rm -f .github/workflows/inspect_far_hit_artifact.yml
+          rm -f .github/workflows/inspect_far_hit.yml
+          rm -f .github/patches/fix_missing_far_return.py
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add interactive_ball_analyzer.py .github
+          git commit -m "Infer missed return from court-side recross"
+          git push origin HEAD:revert_1
