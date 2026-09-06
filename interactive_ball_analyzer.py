@@ -10701,6 +10701,173 @@ class InteractiveBallAnalyzer:
         )
         return True
 
+    def _resume_false_serve_bounce_from_motion(self, reason, end_position):
+        """Cancel a stale service-box fault when the real ball keeps its incoming path.
+
+        This is intentionally narrower than terminal timeout recovery.  A real
+        bounce reverses away from the incoming vector; the false f1785-style
+        event has a separate moving, ball-coloured candidate continuing in the
+        same direction as the preceding frame.
+        """
+        reason_text = str(reason or '').lower()
+        if (
+            end_position is None or
+            not reason_text.startswith('serve bounce outside') or
+            'serve net' in reason_text or
+            self._serve_net_touch_active(window_frames=120)
+        ):
+            return False
+
+        current_image = getattr(self, '_terminal_current_frame', None)
+        previous_gray = getattr(self, '_terminal_previous_gray', None)
+        current_gray = getattr(self, '_terminal_current_gray', None)
+        if current_image is None or previous_gray is None or current_gray is None:
+            return False
+
+        candidate = self._terminal_moving_ball_candidate(
+            end_position, current_image, previous_gray, current_gray,
+            allow_static_anywhere=False, allow_small_static=False,
+        )
+        if candidate is None:
+            return False
+
+        previous = tuple(int(v) for v in end_position)
+        recovered = tuple(int(v) for v in candidate)
+        step_dx = recovered[0] - previous[0]
+        step_dy = recovered[1] - previous[1]
+        displacement = math.hypot(step_dx, step_dy)
+        if displacement < 18.0:
+            return False
+
+        # Require real local frame-to-frame change at the recovered candidate.
+        height, width = current_gray.shape[:2]
+        radius = 12
+        x1, x2 = max(0, recovered[0] - radius), min(width, recovered[0] + radius + 1)
+        y1, y2 = max(0, recovered[1] - radius), min(height, recovered[1] + radius + 1)
+        local_diff = cv2.absdiff(previous_gray[y1:y2, x1:x2], current_gray[y1:y2, x1:x2])
+        motion_ratio = float(np.count_nonzero(local_diff >= 18)) / max(1, local_diff.size)
+        if motion_ratio < 0.035:
+            return False
+
+        # ``log_motion_metrics`` puts the motion from the preceding source frame
+        # in prev_motion before evaluating the apparent current-frame turn.
+        reference = getattr(self, 'prev_motion', None)
+        reference_source = 'prev_motion'
+        if reference is None or float(reference.get('distance', 0.0) or 0.0) < 6.0:
+            reference = None
+            for entry in reversed(getattr(self, 'motion_history', [])):
+                if int(entry.get('frame', -1000000)) >= int(self.frame_count):
+                    continue
+                pos, prev_pos = entry.get('pos'), entry.get('prev_pos')
+                if pos is None or prev_pos is None:
+                    continue
+                ref_dx = float(pos[0] - prev_pos[0])
+                ref_dy = float(pos[1] - prev_pos[1])
+                if math.hypot(ref_dx, ref_dy) < 6.0:
+                    continue
+                reference = {'dx': ref_dx, 'dy': ref_dy}
+                reference_source = f"history:f{int(entry.get('frame', -1))}"
+                break
+        if reference is None:
+            return False
+
+        ref_dx = float(reference.get('dx', 0.0) or 0.0)
+        ref_dy = float(reference.get('dy', 0.0) or 0.0)
+        ref_distance = math.hypot(ref_dx, ref_dy)
+        if ref_distance < 6.0:
+            return False
+
+        cosine = (ref_dx * step_dx + ref_dy * step_dy) / max(1e-6, ref_distance * displacement)
+        predicted = (previous[0] + ref_dx, previous[1] + ref_dy)
+        predicted_error = math.hypot(recovered[0] - predicted[0], recovered[1] - predicted[1])
+        if (
+            cosine < 0.65 or
+            (abs(ref_dy) >= 6.0 and ref_dy * step_dy <= 0.0) or
+            displacement > max(140.0, ref_distance * 4.0) or
+            predicted_error > max(65.0, ref_distance * 2.4)
+        ):
+            return False
+
+        # Undo only the provisional side effects created when the false
+        # serve-bounce event was queued inside track_ball_in_frame().
+        if int(getattr(self, 'last_ground_bounce_frame', -1000000)) == int(self.frame_count):
+            self.ground_bounce_count = max(0, int(getattr(self, 'ground_bounce_count', 0)) - 1)
+            if self.ground_bounce_count == 0:
+                self.last_ground_bounce_frame = -1000000
+        self._awaiting_serve_bounce = True
+        self.recent_bounce_markers = [
+            marker for marker in getattr(self, 'recent_bounce_markers', [])
+            if not (
+                marker.get('kind') == 'serve_bounce' and
+                int(marker.get('start_frame', -1)) == int(self.frame_count)
+            )
+        ]
+        if (
+            int(getattr(self, '_last_impact_marker_frame', -1000000)) == int(self.frame_count) and
+            getattr(self, '_last_impact_marker_kind', None) == 'serve_bounce'
+        ):
+            self._last_impact_marker_frame = -1000000
+            self._last_impact_marker_pos = None
+            self._last_impact_marker_kind = None
+
+        # Replace the stale current-frame marker with the recovered moving ball.
+        self.ball_center = recovered
+        self.prev_motion = dict(reference)
+        self.last_delta = (step_dx, step_dy)
+        self.last_motion = {
+            'distance': displacement,
+            'dx': step_dx,
+            'dy': step_dy,
+            'direction_deg': math.degrees(math.atan2(step_dy, step_dx)),
+        }
+        self.last_nonzero_motion = dict(self.last_motion)
+        self.last_seen_frame = int(self.frame_count)
+        self.stuck_frame_count = 0
+        self.edge_wait = False
+
+        velocity_history = getattr(self, 'ball_velocity_history', None)
+        if isinstance(velocity_history, list) and velocity_history:
+            velocity_history[-1] = displacement
+        motion_history = getattr(self, 'motion_history', None)
+        if isinstance(motion_history, list):
+            motion_history[:] = [
+                entry for entry in motion_history
+                if int(entry.get('frame', -1000000)) != int(self.frame_count)
+            ]
+            motion_history.append({
+                'frame': int(self.frame_count),
+                'distance': displacement,
+                'direction_deg': self.last_motion['direction_deg'],
+                'pos': recovered,
+                'prev_pos': previous,
+                'serve_bounce_motion_override': True,
+            })
+            del motion_history[:-200]
+
+        context = getattr(self, '_point_history_current', None)
+        if isinstance(context, dict):
+            trace = context.setdefault('tracking_trace', [])
+            trace[:] = [
+                sample for sample in trace
+                if int(sample.get('frame', -1000000)) != int(self.frame_count)
+            ]
+            trace.append({
+                'frame': int(self.frame_count),
+                'pos': [recovered[0], recovered[1]],
+                'size': float(self.ball_size) if self.ball_size is not None else None,
+                'stuck': 0,
+                'source': 'serve_bounce_motion_override',
+            })
+
+        print(
+            f"Frame {self.frame_count}: [SERVE-BOUNCE MOTION OVERRIDE] "
+            f"suppressed '{reason}' at {previous}; moving ball={recovered} "
+            f"step=({step_dx:+d},{step_dy:+d})/{displacement:.1f}px "
+            f"incoming=({ref_dx:+.1f},{ref_dy:+.1f})/{ref_distance:.1f}px "
+            f"cos={cosine:.2f} source={reference_source} motion={motion_ratio:.3f}"
+        )
+        return True
+
     def _record_point_result(self, reason, end_position=None, frame=None, history_end_frame=None):
         if self._last_scored_point_end_frame == self.frame_count:
             return None
@@ -25618,6 +25785,16 @@ class InteractiveBallAnalyzer:
                         self._pending_rally_end_frame = -1
                         pending_reason = None
                     if pending_reason:
+                        # Before scoring a service-box fault, prefer a separate
+                        # moving ball that continues the incoming trajectory.
+                        # This catches the f1785 stale-marker regression without
+                        # weakening genuine bounce reversals.
+                        if self._resume_false_serve_bounce_from_motion(
+                            pending_reason, tracked_position
+                        ):
+                            self._pending_rally_end_reason = None
+                            self._pending_rally_end_frame = -1
+                            continue
                         # Point-end detection can queue an out reason one or
                         # more frames before the stuck timeout is reached.  If
                         # this is still an unconfirmed serve toss with no
