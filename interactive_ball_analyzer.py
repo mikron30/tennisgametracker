@@ -9316,12 +9316,27 @@ class InteractiveBallAnalyzer:
         self._last_point_hit_count = 0
         self._last_counted_contact_frame = -1000000
         self._last_racket_contact_player = None
+        self._reset_side_recross_watch()
 
-    def _record_racket_contact(self, point, label=None):
+    def _reset_side_recross_watch(self, hitter_idx=None):
+        """Reset evidence used to infer a visually missed opponent return."""
+        self._side_recross_hitter = hitter_idx if hitter_idx in (0, 1) else None
+        self._side_recross_opponent_frames = 0
+        self._side_recross_opponent_first_frame = -1
+        self._side_recross_opponent_last_frame = -1
+        self._side_recross_opponent_last_point = None
+        self._side_recross_return_frames = 0
+        self._side_recross_return_last_frame = -1
+
+    def _record_racket_contact(self, point, label=None, player_idx_override=None):
         self._last_racket_contact_frame = self.frame_count
         self._last_racket_contact_point = point
-        player_idx = self._player_index_at_point(point) if point is not None else None
+        if player_idx_override in (0, 1):
+            player_idx = int(player_idx_override)
+        else:
+            player_idx = self._player_index_at_point(point) if point is not None else None
         self._last_racket_contact_player = player_idx
+        self._reset_side_recross_watch(player_idx)
         tracker = getattr(self, "player_tracker", None)
         if tracker is not None:
             try:
@@ -9384,6 +9399,93 @@ class InteractiveBallAnalyzer:
             int(point_start) <= contact_frame <= int(self.frame_count)
         )
         return point_contact, contact_player, contact_frame, contact_point
+
+    def _maybe_infer_return_contact_from_side_recross(self, point, frame=None):
+        """Infer a missed return when a live ball crosses the net back after a hit.
+
+        Camera/racket occlusion can hide the far player's contact. Court-side
+        ownership is stronger evidence in that case: once a ball from hitter A
+        has spent several tracked frames on player B's side and then comes back
+        onto A's side, B must have returned it. This is symmetric for near/far
+        players and deliberately does not depend on a particular frame number.
+        """
+        point_start = getattr(self, 'point_start_frame_internal', None)
+        last_hitter = getattr(self, '_last_racket_contact_player', None)
+        last_contact_frame = int(getattr(self, '_last_racket_contact_frame', -1000000))
+        if (
+            point is None or
+            point_start is None or
+            last_hitter not in (0, 1) or
+            last_contact_frame < int(point_start) or
+            (int(self.frame_count) - last_contact_frame) < 6
+        ):
+            return False
+
+        if getattr(self, '_side_recross_hitter', None) != last_hitter:
+            self._reset_side_recross_watch(last_hitter)
+
+        point_player = self._player_index_at_point(point, frame)
+        if point_player not in (0, 1):
+            return False
+
+        opponent = 1 - last_hitter
+        now = int(self.frame_count)
+        if point_player == opponent:
+            previous_opponent_frame = int(
+                getattr(self, '_side_recross_opponent_last_frame', -1)
+            )
+            if previous_opponent_frame >= 0 and now - previous_opponent_frame > 4:
+                self._side_recross_opponent_frames = 0
+                self._side_recross_opponent_first_frame = -1
+            if int(getattr(self, '_side_recross_opponent_frames', 0)) == 0:
+                self._side_recross_opponent_first_frame = now
+            self._side_recross_opponent_frames = int(
+                getattr(self, '_side_recross_opponent_frames', 0)
+            ) + 1
+            self._side_recross_opponent_last_frame = now
+            self._side_recross_opponent_last_point = tuple(point)
+            self._side_recross_return_frames = 0
+            self._side_recross_return_last_frame = -1
+            return False
+
+        opponent_frames = int(getattr(self, '_side_recross_opponent_frames', 0))
+        opponent_last_frame = int(getattr(self, '_side_recross_opponent_last_frame', -1))
+        if opponent_frames < 3 or opponent_last_frame < 0:
+            return False
+        if now - opponent_last_frame > 18:
+            self._reset_side_recross_watch(last_hitter)
+            return False
+
+        previous_return_frame = int(getattr(self, '_side_recross_return_last_frame', -1))
+        if previous_return_frame >= 0 and now - previous_return_frame > 3:
+            self._side_recross_return_frames = 0
+        self._side_recross_return_frames = int(
+            getattr(self, '_side_recross_return_frames', 0)
+        ) + 1
+        self._side_recross_return_last_frame = now
+        if self._side_recross_return_frames < 2:
+            return False
+
+        inferred_hitter = opponent
+        evidence_point = getattr(self, '_side_recross_opponent_last_point', None)
+        if evidence_point is None:
+            evidence_point = point
+        first_opponent_frame = int(
+            getattr(self, '_side_recross_opponent_first_frame', opponent_last_frame)
+        )
+        print(
+            f"[INFERRED_RETURN_OWNER] f{self.frame_count}: "
+            f"previous_hitter={self.player_names[last_hitter]} "
+            f"opponent_side=f{first_opponent_frame}-f{opponent_last_frame} "
+            f"returned_to={self.player_names[last_hitter]} -> "
+            f"inferred_hitter={self.player_names[inferred_hitter]}"
+        )
+        self._record_racket_contact(
+            evidence_point,
+            label='inferred side-recross return',
+            player_idx_override=inferred_hitter,
+        )
+        return True
 
     def _point_bounced_after_contact(self, contact_frame):
         return int(getattr(self, 'last_ground_bounce_frame', -1000000)) > int(contact_frame)
@@ -25481,6 +25583,8 @@ class InteractiveBallAnalyzer:
                     vel_hist_tail = [round(v, 1) for v in getattr(self, 'ball_velocity_history', [])[-5:]]
                     print(f"Frame {self.frame_count}: Ball tracked at {tracked_position} - Size: {size_text}")
                     print(f"[TRACK] f{self.frame_count}: pos={tracked_position} vel={vel:.1f}px stuck={self.stuck_frame_count} vel_hist={vel_hist_tail}")
+                    # Infer a visually missed return before any queued point-end is scored.
+                    self._maybe_infer_return_contact_from_side_recross(tracked_position, frame)
                     if self._point_history_current is not None:
                         self._point_history_current.setdefault('tracking_trace', []).append({
                             'frame': int(self.frame_count),
