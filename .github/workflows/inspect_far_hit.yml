@@ -1,0 +1,33 @@
+name: Inspect far-side hit recognition
+on:
+  push:
+    branches: [revert_1]
+    paths: ['.github/workflows/inspect_far_hit.yml']
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: revert_1
+      - name: Inspect hit/contact code
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p=Path('interactive_ball_analyzer.py')
+          lines=p.read_text(encoding='utf-8').splitlines()
+          needles=['[PLAYER_SHOT]','[RALLY_HIT]','large lower-court launch','upper slow-arc continuation','NEAR-SIDE RACKET PREP','NEAR-CAMERA RACKET TURN','def _recent_contact_info','def _point_contact_info','_register_rally','_record_rally','racket_contact','PLAYER_SHOT']
+          shown=set()
+          for needle in needles:
+              print('\n###',needle)
+              for i,line in enumerate(lines):
+                  if needle in line:
+                      lo=max(0,i-90); hi=min(len(lines),i+120)
+                      key=(lo,hi)
+                      if key in shown: continue
+                      shown.add(key)
+                      print(f'--- lines {lo+1}-{hi} match {i+1} ---')
+                      for j in range(lo,hi): print(f'{j+1}: {lines[j]}')
+          PY
