@@ -1,0 +1,53 @@
+name: Inspect false serve bounce
+on:
+  push:
+    branches: [revert_1]
+    paths: ['.github/workflows/inspect_false_serve_bounce.yml']
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: revert_1
+      - name: Extract exact bounce call paths
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p=Path('interactive_ball_analyzer.py')
+          lines=p.read_text(encoding='utf-8').splitlines()
+          needles=[
+            '_serve_bounce_out_from_turn_candidate(',
+            '_serve_bounce_in_from_turn_candidate(',
+            '_terminal_moving_ball_candidate(',
+            'TERMINAL MOTION REPAIR',
+          ]
+          hits=[]
+          for i,line in enumerate(lines):
+              if any(n in line for n in needles): hits.append(i)
+          ranges=[]
+          for i in hits:
+              lo=max(0,i-90); hi=min(len(lines),i+140)
+              if ranges and lo <= ranges[-1][1]+10:
+                  ranges[-1]=(ranges[-1][0],max(ranges[-1][1],hi))
+              else: ranges.append((lo,hi))
+          # Also force the service-box evaluator gap.
+          ranges.append((23220-1,23430))
+          ranges=sorted(ranges)
+          merged=[]
+          for lo,hi in ranges:
+              if merged and lo <= merged[-1][1]+10:
+                  merged[-1]=(merged[-1][0],max(merged[-1][1],hi))
+              else: merged.append((lo,hi))
+          out=[]
+          for lo,hi in merged:
+              out.append(f'===== lines {lo+1}-{hi} =====')
+              out.extend(f'{j+1}: {lines[j]}' for j in range(lo,hi))
+          Path('false_serve_bounce_inspection.txt').write_text('\n'.join(out),encoding='utf-8')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: false-serve-bounce-inspection
+          path: false_serve_bounce_inspection.txt
