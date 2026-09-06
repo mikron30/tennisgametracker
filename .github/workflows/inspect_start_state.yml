@@ -1,0 +1,47 @@
+name: Inspect start-dependent score state
+on:
+  push:
+    branches: [revert_1]
+    paths: ['.github/workflows/inspect_start_state.yml']
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: revert_1
+      - name: Extract scoring and start-state code
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p=Path('interactive_ball_analyzer.py')
+          lines=p.read_text(encoding='utf-8').splitlines()
+          needles=[
+            'start_frame','start-score','start_score','MATCH_SEED','_reset_point_score_context',
+            '_point_hit_count','_last_point_hit_count','point_start_frame_internal',
+            'first serve fault','next serve is second serve','second serve','_serve_attempt',
+            'current_score','point_score','score_points','game_score','_award_point',
+            '_apply_point','_score_point','player_scores','score=' 
+          ]
+          idx=[]
+          for i,line in enumerate(lines):
+              ll=line.lower()
+              if any(n.lower() in ll for n in needles): idx.append(i)
+          ranges=[]
+          for i in idx:
+              lo=max(0,i-25); hi=min(len(lines),i+45)
+              if ranges and lo <= ranges[-1][1]+5:
+                  ranges[-1]=(ranges[-1][0],max(ranges[-1][1],hi))
+              else: ranges.append((lo,hi))
+          out=[f'total_lines={len(lines)} matches={len(idx)} ranges={len(ranges)}']
+          for lo,hi in ranges:
+              out.append(f'\n===== lines {lo+1}-{hi} =====')
+              out.extend(f'{j+1}: {lines[j]}' for j in range(lo,hi))
+          Path('start_state_inspection.txt').write_text('\n'.join(out),encoding='utf-8')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: start-state-inspection
+          path: start_state_inspection.txt
