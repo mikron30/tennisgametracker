@@ -1,0 +1,248 @@
+from pathlib import Path
+import ast
+import sys
+from textwrap import indent
+
+TARGET = Path('interactive_ball_analyzer.py')
+
+
+def apply_patch():
+    text = TARGET.read_text(encoding='utf-8')
+
+    old_reset_record = '''    def _reset_point_score_context(self):
+        self._point_hit_count = 0
+        self._last_point_hit_count = 0
+        self._last_counted_contact_frame = -1000000
+        self._last_racket_contact_player = None
+
+    def _record_racket_contact(self, point, label=None):
+        self._last_racket_contact_frame = self.frame_count
+        self._last_racket_contact_point = point
+        player_idx = self._player_index_at_point(point) if point is not None else None
+        self._last_racket_contact_player = player_idx
+'''
+    new_reset_record = '''    def _reset_point_score_context(self):
+        self._point_hit_count = 0
+        self._last_point_hit_count = 0
+        self._last_counted_contact_frame = -1000000
+        self._last_racket_contact_player = None
+        self._reset_side_recross_watch()
+
+    def _reset_side_recross_watch(self, hitter_idx=None):
+        """Reset evidence used to infer a visually missed opponent return."""
+        self._side_recross_hitter = hitter_idx if hitter_idx in (0, 1) else None
+        self._side_recross_opponent_frames = 0
+        self._side_recross_opponent_first_frame = -1
+        self._side_recross_opponent_last_frame = -1
+        self._side_recross_opponent_last_point = None
+        self._side_recross_return_frames = 0
+        self._side_recross_return_last_frame = -1
+
+    def _record_racket_contact(self, point, label=None, player_idx_override=None):
+        self._last_racket_contact_frame = self.frame_count
+        self._last_racket_contact_point = point
+        if player_idx_override in (0, 1):
+            player_idx = int(player_idx_override)
+        else:
+            player_idx = self._player_index_at_point(point) if point is not None else None
+        self._last_racket_contact_player = player_idx
+        self._reset_side_recross_watch(player_idx)
+'''
+    if new_reset_record not in text:
+        count = text.count(old_reset_record)
+        if count != 1:
+            raise SystemExit(f'reset/contact marker count={count}')
+        text = text.replace(old_reset_record, new_reset_record, 1)
+
+    helper_marker = '''        return point_contact, contact_player, contact_frame, contact_point
+
+    def _point_bounced_after_contact(self, contact_frame):
+'''
+    helper_insert = '''        return point_contact, contact_player, contact_frame, contact_point
+
+    def _maybe_infer_return_contact_from_side_recross(self, point, frame=None):
+        """Infer a missed return when a live ball crosses the net back after a hit.
+
+        Camera/racket occlusion can hide the far player's contact. Court-side
+        ownership is stronger evidence in that case: once a ball from hitter A
+        has spent several tracked frames on player B's side and then comes back
+        onto A's side, B must have returned it. This is symmetric for near/far
+        players and deliberately does not depend on a particular frame number.
+        """
+        point_start = getattr(self, 'point_start_frame_internal', None)
+        last_hitter = getattr(self, '_last_racket_contact_player', None)
+        last_contact_frame = int(getattr(self, '_last_racket_contact_frame', -1000000))
+        if (
+            point is None or
+            point_start is None or
+            last_hitter not in (0, 1) or
+            last_contact_frame < int(point_start) or
+            (int(self.frame_count) - last_contact_frame) < 6
+        ):
+            return False
+
+        if getattr(self, '_side_recross_hitter', None) != last_hitter:
+            self._reset_side_recross_watch(last_hitter)
+
+        point_player = self._player_index_at_point(point, frame)
+        if point_player not in (0, 1):
+            return False
+
+        opponent = 1 - last_hitter
+        now = int(self.frame_count)
+        if point_player == opponent:
+            previous_opponent_frame = int(
+                getattr(self, '_side_recross_opponent_last_frame', -1)
+            )
+            if previous_opponent_frame >= 0 and now - previous_opponent_frame > 4:
+                self._side_recross_opponent_frames = 0
+                self._side_recross_opponent_first_frame = -1
+            if int(getattr(self, '_side_recross_opponent_frames', 0)) == 0:
+                self._side_recross_opponent_first_frame = now
+            self._side_recross_opponent_frames = int(
+                getattr(self, '_side_recross_opponent_frames', 0)
+            ) + 1
+            self._side_recross_opponent_last_frame = now
+            self._side_recross_opponent_last_point = tuple(point)
+            self._side_recross_return_frames = 0
+            self._side_recross_return_last_frame = -1
+            return False
+
+        opponent_frames = int(getattr(self, '_side_recross_opponent_frames', 0))
+        opponent_last_frame = int(getattr(self, '_side_recross_opponent_last_frame', -1))
+        if opponent_frames < 3 or opponent_last_frame < 0:
+            return False
+        if now - opponent_last_frame > 18:
+            self._reset_side_recross_watch(last_hitter)
+            return False
+
+        previous_return_frame = int(getattr(self, '_side_recross_return_last_frame', -1))
+        if previous_return_frame >= 0 and now - previous_return_frame > 3:
+            self._side_recross_return_frames = 0
+        self._side_recross_return_frames = int(
+            getattr(self, '_side_recross_return_frames', 0)
+        ) + 1
+        self._side_recross_return_last_frame = now
+        if self._side_recross_return_frames < 2:
+            return False
+
+        inferred_hitter = opponent
+        evidence_point = getattr(self, '_side_recross_opponent_last_point', None)
+        if evidence_point is None:
+            evidence_point = point
+        first_opponent_frame = int(
+            getattr(self, '_side_recross_opponent_first_frame', opponent_last_frame)
+        )
+        print(
+            f"[INFERRED_RETURN_OWNER] f{self.frame_count}: "
+            f"previous_hitter={self.player_names[last_hitter]} "
+            f"opponent_side=f{first_opponent_frame}-f{opponent_last_frame} "
+            f"returned_to={self.player_names[last_hitter]} -> "
+            f"inferred_hitter={self.player_names[inferred_hitter]}"
+        )
+        self._record_racket_contact(
+            evidence_point,
+            label='inferred side-recross return',
+            player_idx_override=inferred_hitter,
+        )
+        return True
+
+    def _point_bounced_after_contact(self, contact_frame):
+'''
+    if '    def _maybe_infer_return_contact_from_side_recross(self, point, frame=None):\n' not in text:
+        count = text.count(helper_marker)
+        if count != 1:
+            raise SystemExit(f'helper insertion marker count={count}')
+        text = text.replace(helper_marker, helper_insert, 1)
+
+    track_old = '''                    print(f"[TRACK] f{self.frame_count}: pos={tracked_position} vel={vel:.1f}px stuck={self.stuck_frame_count} vel_hist={vel_hist_tail}")
+                    if self._point_history_current is not None:
+'''
+    track_new = '''                    print(f"[TRACK] f{self.frame_count}: pos={tracked_position} vel={vel:.1f}px stuck={self.stuck_frame_count} vel_hist={vel_hist_tail}")
+                    # Infer a visually missed return before any queued point-end is scored.
+                    self._maybe_infer_return_contact_from_side_recross(tracked_position, frame)
+                    if self._point_history_current is not None:
+'''
+    if track_new not in text:
+        count = text.count(track_old)
+        if count != 1:
+            raise SystemExit(f'track hook marker count={count}')
+        text = text.replace(track_old, track_new, 1)
+
+    TARGET.write_text(text, encoding='utf-8')
+    print('Application patch applied')
+
+
+def test_patched_helper():
+    source = TARGET.read_text(encoding='utf-8')
+    assert 'player_idx_override=None' in source
+    assert '[INFERRED_RETURN_OWNER]' in source
+    assert "label='inferred side-recross return'" in source
+    assert 'self._maybe_infer_return_contact_from_side_recross(tracked_position, frame)' in source
+
+    tree = ast.parse(source)
+    wanted = {'_reset_side_recross_watch', '_maybe_infer_return_contact_from_side_recross'}
+    methods = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name in wanted:
+            methods[node.name] = ast.get_source_segment(source, node)
+    assert wanted == set(methods), methods.keys()
+    class_src = (
+        'class Harness:\n'
+        + indent(methods['_reset_side_recross_watch'], '    ')
+        + '\n'
+        + indent(methods['_maybe_infer_return_contact_from_side_recross'], '    ')
+    )
+    ns = {}
+    exec(class_src, ns)
+    Harness = ns['Harness']
+    h = Harness()
+    h.frame_count = 10
+    h.point_start_frame_internal = 1
+    h._last_racket_contact_player = 0
+    h._last_racket_contact_frame = 10
+    h.player_names = ['P1', 'P2']
+    h._player_index_at_point = lambda point, frame=None: int(point[0])
+    recorded = []
+
+    def record(point, label=None, player_idx_override=None):
+        recorded.append((h.frame_count, tuple(point), label, player_idx_override))
+        h._last_racket_contact_frame = h.frame_count
+        h._last_racket_contact_player = player_idx_override
+        h._reset_side_recross_watch(player_idx_override)
+        return player_idx_override
+
+    h._record_racket_contact = record
+    h._reset_side_recross_watch(0)
+
+    # A single stray opposite-side frame must not invent a hit.
+    h.frame_count = 20
+    assert not h._maybe_infer_return_contact_from_side_recross((1, 100), None)
+    h.frame_count = 21
+    assert not h._maybe_infer_return_contact_from_side_recross((0, 100), None)
+    h.frame_count = 22
+    assert not h._maybe_infer_return_contact_from_side_recross((0, 100), None)
+    assert recorded == []
+
+    # Genuine travel to P2's side and back must infer exactly one P2 return.
+    h._last_racket_contact_player = 0
+    h._last_racket_contact_frame = 30
+    h._reset_side_recross_watch(0)
+    for f in (40, 41, 42, 43):
+        h.frame_count = f
+        assert not h._maybe_infer_return_contact_from_side_recross((1, 200 + f), None)
+    h.frame_count = 44
+    assert not h._maybe_infer_return_contact_from_side_recross((0, 300), None)
+    h.frame_count = 45
+    assert h._maybe_infer_return_contact_from_side_recross((0, 320), None)
+    assert recorded[-1][3] == 1, recorded
+    assert recorded[-1][2] == 'inferred side-recross return'
+    assert len(recorded) == 1, recorded
+    print('Generic side-recross regression passed:', recorded[-1])
+
+
+if __name__ == '__main__':
+    if '--test' in sys.argv:
+        test_patched_helper()
+    else:
+        apply_patch()
