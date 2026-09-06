@@ -18,29 +18,14 @@ jobs:
           from pathlib import Path
           p = Path('interactive_ball_analyzer.py')
           lines = p.read_text(encoding='utf-8').splitlines()
-          needles = [
-              '_last_racket_contact_player', '_last_racket_contact_frame',
-              '_last_racket_contact_point', 'PLAYER_SHOT', 'RALLY_HIT',
-              'racket contact', 'inferred return', 'large lower-court launch',
-              'upper slow-arc continuation', 'far-side', 'far side',
-              '_record_player', '_register_rally', '_record_rally',
-              '_detect_player_shot', '_detect_racket', '_point_contact_info',
-              '_infer_point_outcome'
+          ranges = [
+              (8500, 8900),
+              (11500, 12250),
+              (19800, 21050),
           ]
-          matches=[]
-          for i,line in enumerate(lines):
-              if any(n.lower() in line.lower() for n in needles):
-                  matches.append(i)
-          ranges=[]
-          for i in matches:
-              lo=max(0,i-35); hi=min(len(lines),i+55)
-              if ranges and lo <= ranges[-1][1] + 8:
-                  ranges[-1]=(ranges[-1][0], max(ranges[-1][1],hi))
-              else:
-                  ranges.append((lo,hi))
-          out=[]
-          out.append(f'total_lines={len(lines)} matches={len(matches)} ranges={len(ranges)}')
-          for lo,hi in ranges:
+          out=[f'total_lines={len(lines)}']
+          for start,end in ranges:
+              lo=max(0,start-1); hi=min(len(lines),end)
               out.append(f'\n===== lines {lo+1}-{hi} =====')
               for j in range(lo,hi):
                   out.append(f'{j+1}: {lines[j]}')
