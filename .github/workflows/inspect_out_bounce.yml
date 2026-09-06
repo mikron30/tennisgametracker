@@ -1,0 +1,19 @@
+name: Inspect OUT bounce detector
+on:
+  push:
+    branches: [revert_1]
+    paths: ['.github/workflows/inspect_out_bounce.yml']
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: revert_1
+      - name: Show OUT bounce code
+        run: |
+          grep -n -C 80 "OUT-BOUNCE" interactive_ball_analyzer.py || true
+          echo "--- ground bounce references ---"
+          grep -n -C 35 "last_ground_bounce_frame" interactive_ball_analyzer.py || true
