@@ -23733,6 +23733,26 @@ class InteractiveBallAnalyzer:
             (side == 'left' and curr_dx <= -4.0) or
             (side == 'right' and curr_dx >= 4.0)
         )
+        previous_outward_motion = (
+            (side == 'left' and prev_dx <= -4.0) or
+            (side == 'right' and prev_dx >= 4.0)
+        )
+        # A real sideline OUT can bounce with only a shallow upward Y reversal.
+        # Do not require the old -12px vertical rebound when the ball was already
+        # clearly outside, descending for several frames, and continues outward.
+        # Reviewed f2486->f2487: (-23,+26) -> (-36,-6).
+        max_physical_out_bounce_step = max(125.0, float(frame.shape[1]) * 0.035)
+        shallow_outward_rebound = (
+            prev_pos_outside and
+            curr_pos_outside and
+            recent_descending and
+            previous_outward_motion and
+            outward_motion and
+            prev_dy >= 14.0 and
+            -12.0 < curr_dy <= -3.0 and
+            prev_speed >= 18.0 and
+            18.0 <= curr_speed <= max_physical_out_bounce_step
+        )
         soft_out_reversal = (
             (
                 (
@@ -23741,7 +23761,7 @@ class InteractiveBallAnalyzer:
                 ) or
                 soft_out_near_sideline
             ) and
-            soft_turn_motion and
+            (soft_turn_motion or shallow_outward_rebound) and
             outward_motion and
             curr_speed >= 18.0
         )
@@ -23770,6 +23790,28 @@ class InteractiveBallAnalyzer:
         if prev_dir is not None and curr_dir is not None:
             delta = abs(curr_dir - prev_dir) % 360
             angle_diff = min(delta, 360 - delta)
+
+        # A very large inward X reversal while already outside is a
+        # reacquisition/artifact jump, not a ground bounce.
+        inward_horizontal_reversal = (
+            (side == 'left' and prev_dx <= -8.0 and curr_dx >= 8.0) or
+            (side == 'right' and prev_dx >= 8.0 and curr_dx <= -8.0)
+        )
+        if (
+            prev_pos_outside and
+            inward_horizontal_reversal and
+            curr_speed > max_physical_out_bounce_step
+        ):
+            self._last_out_bounce_suppressed_frame = self.frame_count
+            self._last_out_bounce_suppressed_point = tuple(ball_position)
+            print(
+                f"Frame {self.frame_count}: [OUT-BOUNCE SUPPRESSED] "
+                f"implausible inward jump pos={ball_position} side={side} "
+                f"prev_motion=({prev_dx:.1f},{prev_dy:.1f}) "
+                f"curr_motion=({curr_dx:.1f},{curr_dy:.1f}) "
+                f"speed={curr_speed:.1f} limit={max_physical_out_bounce_step:.1f}"
+            )
+            return False, None
 
         vertical_reversal = prev_dy >= 18.0 and curr_dy <= -12.0
         sharp_turn = angle_diff >= 95.0
