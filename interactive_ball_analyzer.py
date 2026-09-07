@@ -9790,6 +9790,7 @@ class InteractiveBallAnalyzer:
     def _record_serve_in(self):
         self._serve_phase_active = False
         self._serve_phase_closed_frame = int(getattr(self, 'frame_count', -1000000))
+        self._awaiting_serve_bounce = False
         server_idx = self._current_server_index()
         stats = self.serve_stats[server_idx]
         if int(getattr(self, 'current_serve_attempt', 1)) <= 1:
@@ -23543,7 +23544,10 @@ class InteractiveBallAnalyzer:
 
     def _serve_bounce_out_from_turn_candidate(self, new_pos, frame, dx, dy, angle_jump, velocity):
         """Catch first-serve bounce jumps that miss the target service box."""
-        if not getattr(self, '_awaiting_serve_bounce', False):
+        if not (
+            getattr(self, '_serve_phase_active', False) and
+            getattr(self, '_awaiting_serve_bounce', False)
+        ):
             return None
         if self.point_start_frame_internal is None:
             return None
@@ -23655,7 +23659,10 @@ class InteractiveBallAnalyzer:
 
     def _serve_bounce_in_from_turn_candidate(self, new_pos, frame, dx, dy, angle_jump, velocity):
         """Catch soft first-serve bounce turns that land inside the target service box."""
-        if not getattr(self, '_awaiting_serve_bounce', False):
+        if not (
+            getattr(self, '_serve_phase_active', False) and
+            getattr(self, '_awaiting_serve_bounce', False)
+        ):
             return None
         if self.point_start_frame_internal is None:
             return None
@@ -23811,6 +23818,14 @@ class InteractiveBallAnalyzer:
             frame,
             accepted_in_reason="Serve bounce in",
         )
+        # A committed in-service bounce is the serve->rally boundary.  The
+        # generic handler normally closes it; force the state closed here as
+        # well so a specialized bounce path can never leak serve logic into
+        # the later rally.  A true net-touch serve remains a replayable let.
+        if not self._serve_net_touch_active(window_frames=120):
+            self._serve_phase_active = False
+            self._serve_phase_closed_frame = int(self.frame_count)
+            self._awaiting_serve_bounce = False
         print(
             f"Frame {self.frame_count}: Allowing serve-bounce-in continuation "
             f"at {bounce_point}"
