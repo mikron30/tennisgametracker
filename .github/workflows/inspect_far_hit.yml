@@ -1,0 +1,24 @@
+name: Inspect far-side hit detection
+on:
+  push:
+    branches: [revert_1]
+    paths: ['.github/workflows/inspect_far_hit.yml']
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: revert_1
+      - name: Inspect hit code
+        run: |
+          echo '--- PLAYER_SHOT contexts ---'
+          grep -n -C 45 "\[PLAYER_SHOT\]" interactive_ball_analyzer.py || true
+          echo '--- RALLY_HIT contexts ---'
+          grep -n -C 55 "\[RALLY_HIT\]" interactive_ball_analyzer.py || true
+          echo '--- upper/far hit logic ---'
+          grep -n -E -C 35 "far.*hit|upper.*hit|receiver.*hit|racket.*turn|large lower-court launch|LOWER-HIT|UPPER-HIT" interactive_ball_analyzer.py || true
+          echo '--- contact registration helpers ---'
+          grep -n -E -C 30 "point_contact|last_racket_contact|shot_events|register.*hit|record.*hit|rally_hit" interactive_ball_analyzer.py || true
