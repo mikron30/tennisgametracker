@@ -23598,13 +23598,31 @@ class InteractiveBallAnalyzer:
         incoming_dy = float(self.last_motion.get('dy', 0.0) or 0.0)
         net_touch_active = self._serve_net_touch_active(window_frames=120)
 
-        # A serve that clips the net often loses most of its vertical speed.
-        # Its first ground bounce can therefore be a shallow turn rather than
-        # the >=8px upward rebound required for an untouched serve.  Tennis
-        # scoring still depends only on where that first bounce lands:
-        # inside the correct service box -> let; outside -> service fault.
-        # Relax the motion threshold only after a confirmed serve-net touch.
-        if net_touch_active:
+        # At the far end of this night camera, a real first service bounce can
+        # appear as only a few pixels of upward screen motion.  Do not require
+        # a large rebound when the trajectory itself gives strong bounce
+        # evidence: the ball was descending, reverses upward, and turns sharply.
+        # This is still serve-only logic because the function is gated above by
+        # _serve_phase_active/_awaiting_serve_bounce and by the no-rally-contact
+        # check.  Service-box geometry below decides IN vs OUT.
+        shallow_serve_turn = (
+            self._is_night_session_config() and
+            incoming_dy >= 4.0 and
+            dy <= -2.0 and
+            upward_progress >= 2.0 and
+            velocity >= 7.0 and
+            angle_jump >= 60.0
+        )
+
+        if shallow_serve_turn:
+            print(
+                f"Frame {self.frame_count}: [SHALLOW SERVE BOUNCE TURN] "
+                f"point={bounce_point} incoming_dy={incoming_dy:.1f} "
+                f"outgoing_dy={dy:.1f} up={upward_progress:.1f} "
+                f"angle={angle_jump:.1f} vel={velocity:.1f}"
+            )
+        elif net_touch_active:
+            # A confirmed net clip can weaken the rebound even further.
             if velocity < 7.0 or dy > -2.0 or upward_progress < 2.0:
                 return None
             if angle_jump < 35.0 and not (incoming_dy >= 1.0 and dy <= -3.0):
