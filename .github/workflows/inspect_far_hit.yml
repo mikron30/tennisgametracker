@@ -13,43 +13,22 @@ jobs:
         with:
           ref: revert_1
           fetch-depth: 0
-      - name: Capture relevant source
+      - name: Capture exact source ranges
         run: |
           python - <<'PY'
           from pathlib import Path
           src = Path('interactive_ball_analyzer.py').read_text(encoding='utf-8').splitlines()
-          markers = [
-              'def _classify_direction_change_impact',
-              'upper_racket_contact_turn_candidate',
-              'def _upper_racket_contact',
-              'def _night_far_player_contact_motion_debug',
-              'def _player_index_on_court_end',
-              'def _court_end_for_point',
-              'direction_only_shot_change',
-              'def _maybe_infer_return_contact_from_side_recross',
-          ]
-          hits=[]
-          for i,line in enumerate(src):
-              if any(m in line for m in markers):
-                  hits.append(i)
-          ranges=[]
-          for i in hits:
-              a=max(0,i-120); b=min(len(src),i+161)
-              if ranges and a <= ranges[-1][1]+10:
-                  ranges[-1]=(ranges[-1][0], max(ranges[-1][1], b))
-              else:
-                  ranges.append((a,b))
+          ranges=[(12260,12620),(20450,20680)]
           out=[]
           for a,b in ranges:
               out.append(f'===== LINES {a+1}-{b} =====')
-              out.extend(f'{j+1:06d}: {src[j]}' for j in range(a,b))
-          Path('.github/inspect_far_hit_output2.txt').write_text('\n'.join(out), encoding='utf-8')
-          print(f'captured {len(ranges)} ranges, {len(out)} lines')
+              out.extend(f'{j+1:06d}: {src[j]}' for j in range(a,min(b,len(src))))
+          Path('.github/inspect_far_hit_output3.txt').write_text('\n'.join(out), encoding='utf-8')
           PY
       - name: Commit inspection output
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add .github/inspect_far_hit_output2.txt
-          git commit -m "Capture far hit classifier inspection"
+          git add .github/inspect_far_hit_output3.txt
+          git commit -m "Capture far hit exact ranges"
           git push origin HEAD:revert_1
