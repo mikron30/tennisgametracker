@@ -7,23 +7,31 @@ permissions:
   contents: write
 jobs:
   inspect:
-    if: startsWith(github.event.head_commit.message, 'Extract exact far hit logic')
+    if: startsWith(github.event.head_commit.message, 'Extract side recross call logic')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           ref: revert_1
           fetch-depth: 1
-      - name: Extract exact source ranges
+      - name: Extract side recross logic
         run: |
           python - <<'PY'
           from pathlib import Path
           src=Path('interactive_ball_analyzer.py').read_text(encoding='utf-8').splitlines()
-          ranges=[(12390,12590),(20520,20690),(20970,21180),(9320,9470)]
-          out=[]
+          hits=[i for i,l in enumerate(src,1) if '_maybe_infer_return_contact_from_side_recross' in l or '_side_recross_' in l]
+          ranges=[(9380,9540)]
+          for i in hits:
+              if not (9380 <= i <= 9540): ranges.append((max(1,i-20),min(len(src),i+30)))
+          ranges=sorted(ranges)
+          merged=[]
           for a,b in ranges:
+              if merged and a<=merged[-1][1]+2: merged[-1]=(merged[-1][0],max(merged[-1][1],b))
+              else: merged.append((a,b))
+          out=['HITS '+repr(hits)]
+          for a,b in merged:
               out.append(f'===== LINES {a}-{b} =====')
-              out.extend(f'{n:06d}: {src[n-1]}' for n in range(a,min(b,len(src))+1))
+              out.extend(f'{n:06d}: {src[n-1]}' for n in range(a,b+1))
           Path('.github/far_hit_current_sections.txt').write_text('\n'.join(out)+'\n',encoding='utf-8')
           PY
       - name: Commit extraction
@@ -31,5 +39,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add .github/far_hit_current_sections.txt
-          git commit -m "Save exact far hit logic"
+          git commit -m "Save side recross call logic"
           git push origin HEAD:revert_1
