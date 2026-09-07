@@ -2,7 +2,8 @@ name: One-shot serve phase state fix
 
 on:
   push:
-    branches: [revert_1]
+    branches:
+      - revert_1
 
 permissions:
   contents: write
@@ -15,159 +16,14 @@ jobs:
         with:
           ref: revert_1
           fetch-depth: 0
-
-      - name: Patch serve phase state
+      - name: Patch and validate
         shell: bash
         run: |
-          python - <<'PY'
-          from pathlib import Path
-
-          path = Path('interactive_ball_analyzer.py')
-          text = path.read_text(encoding='utf-8')
-
-          def replace_once(old, new, label):
-              global text
-              count = text.count(old)
-              if count != 1:
-                  raise SystemExit(f'{label}: expected exactly 1 match, found {count}')
-              text = text.replace(old, new, 1)
-
-          replace_once(
-              """    def _start_point_context(self, origin_pos, serve_start_frame=None, history_origin_pos=None):
-        self._pending_rally_end_reason = None
-        self._pending_rally_end_frame = -1
-        self._awaiting_serve_bounce = False
-        self._point_serve_start_side = None
-""",
-              """    def _start_point_context(self, origin_pos, serve_start_frame=None, history_origin_pos=None):
-        self._pending_rally_end_reason = None
-        self._pending_rally_end_frame = -1
-        self._awaiting_serve_bounce = False
-        self._serve_phase_active = False
-        self._serve_phase_closed_frame = -1000000
-        self._point_serve_start_side = None
-""",
-              'initialize serve phase state',
-          )
-
-          replace_once(
-              """        self._point_serve_start_side = start_side
-        self._point_target_service_side = target_side
-        self._awaiting_serve_bounce = True
-""",
-              """        self._point_serve_start_side = start_side
-        self._point_target_service_side = target_side
-        self._serve_phase_active = True
-        self._serve_phase_closed_frame = -1000000
-        self._awaiting_serve_bounce = True
-""",
-              'activate serve phase',
-          )
-
-          replace_once(
-              """    def _record_serve_in(self):
-        server_idx = self._current_server_index()
-""",
-              """    def _record_serve_in(self):
-        # A confirmed in-serve is the one-way transition from serve handling
-        # to rally handling for this point. Serve-only detectors must remain
-        # disabled until _start_point_context() begins the next serve attempt.
-        self._serve_phase_active = False
-        self._serve_phase_closed_frame = int(getattr(self, 'frame_count', -1000000))
-        server_idx = self._current_server_index()
-""",
-              'close serve phase on confirmed serve-in',
-          )
-
-          replace_once(
-              """    def _mark_serve_net_contact_candidate(self, ball_position, frame):
-        if ball_position is None or frame is None:
-            return False
-        if not getattr(self, '_awaiting_serve_bounce', False):
-""",
-              """    def _mark_serve_net_contact_candidate(self, ball_position, frame):
-        if ball_position is None or frame is None:
-            return False
-        if not (
-            getattr(self, '_serve_phase_active', False) and
-            getattr(self, '_awaiting_serve_bounce', False)
-        ):
-""",
-              'gate serve net detector',
-          )
-
-          replace_once(
-              """        if getattr(self, '_awaiting_serve_bounce', False):
-            serve_bounce_window_active = (
-""",
-              """        if (
-            getattr(self, '_serve_phase_active', False) and
-            getattr(self, '_awaiting_serve_bounce', False)
-        ):
-            serve_bounce_window_active = (
-""",
-              'gate service-box bounce classification',
-          )
-
-          replace_once(
-              """        serve_bounce_active = getattr(self, '_awaiting_serve_bounce', False)
-        bounce_kind = \"serve_bounce\" if getattr(self, '_awaiting_serve_bounce', False) else \"ground_bounce\"
-        self._add_impact_marker(point, kind=bounce_kind, color=color, label=reason)
-        if getattr(self, '_awaiting_serve_bounce', False):
-            self._awaiting_serve_bounce = False
-""",
-              """        serve_bounce_active = bool(
-            getattr(self, '_serve_phase_active', False) and
-            getattr(self, '_awaiting_serve_bounce', False)
-        )
-        bounce_kind = \"serve_bounce\" if serve_bounce_active else \"ground_bounce\"
-        self._add_impact_marker(point, kind=bounce_kind, color=color, label=reason)
-        if serve_bounce_active:
-            self._awaiting_serve_bounce = False
-""",
-              'gate serve bounce event handling',
-          )
-
-          replace_once(
-              """        # Undo only the provisional side effects created when the false
-        # serve-bounce event was queued inside track_ball_in_frame().
-        if int(getattr(self, 'last_ground_bounce_frame', -1000000)) == int(self.frame_count):
-            self.ground_bounce_count = max(0, int(getattr(self, 'ground_bounce_count', 0)) - 1)
-            if self.ground_bounce_count == 0:
-                self.last_ground_bounce_frame = -1000000
-        self._awaiting_serve_bounce = True
-""",
-              """        # Undo only the provisional side effects created when the false
-        # serve-bounce event was queued inside track_ball_in_frame().
-        if int(getattr(self, 'last_ground_bounce_frame', -1000000)) == int(self.frame_count):
-            self.ground_bounce_count = max(0, int(getattr(self, 'ground_bounce_count', 0)) - 1)
-            if self.ground_bounce_count == 0:
-                self.last_ground_bounce_frame = -1000000
-
-        # A same-frame recovery may reopen a provisional serve bounce that was
-        # just rejected.  It must never resurrect serve mode later in a rally.
-        may_restore_serve_phase = (
-            getattr(self, '_serve_phase_active', False) or
-            int(getattr(self, '_serve_phase_closed_frame', -1000000)) == int(self.frame_count)
-        )
-        if may_restore_serve_phase:
-            self._serve_phase_active = True
-            self._serve_phase_closed_frame = -1000000
-            self._awaiting_serve_bounce = True
-""",
-              'prevent rally recovery from rearming serve state',
-          )
-
-          path.write_text(text, encoding='utf-8')
-          PY
-
+          echo 'ZnJvbSBwYXRobGliIGltcG9ydCBQYXRoCgpwYXRoID0gUGF0aCgiaW50ZXJhY3RpdmVfYmFsbF9hbmFseXplci5weSIpCnRleHQgPSBwYXRoLnJlYWRfdGV4dChlbmNvZGluZz0idXRmLTgiKQoKZGVmIHJlcGxhY2Vfb25jZShvbGQsIG5ldywgbGFiZWwpOgogICAgZ2xvYmFsIHRleHQKICAgIGNvdW50ID0gdGV4dC5jb3VudChvbGQpCiAgICBpZiBjb3VudCAhPSAxOgogICAgICAgIHJhaXNlIFN5c3RlbUV4aXQoZiJ7bGFiZWx9OiBleHBlY3RlZCBleGFjdGx5IDEgbWF0Y2gsIGZvdW5kIHtjb3VudH0iKQogICAgdGV4dCA9IHRleHQucmVwbGFjZShvbGQsIG5ldywgMSkKCnJlcGxhY2Vfb25jZSgKICAgICIgICAgZGVmIF9zdGFydF9wb2ludF9jb250ZXh0KHNlbGYsIG9yaWdpbl9wb3MsIHNlcnZlX3N0YXJ0X2ZyYW1lPU5vbmUsIGhpc3Rvcnlfb3JpZ2luX3Bvcz1Ob25lKTpcbiIKICAgICIgICAgICAgIHNlbGYuX3BlbmRpbmdfcmFsbHlfZW5kX3JlYXNvbiA9IE5vbmVcbiIKICAgICIgICAgICAgIHNlbGYuX3BlbmRpbmdfcmFsbHlfZW5kX2ZyYW1lID0gLTFcbiIKICAgICIgICAgICAgIHNlbGYuX2F3YWl0aW5nX3NlcnZlX2JvdW5jZSA9IEZhbHNlXG4iCiAgICAiICAgICAgICBzZWxmLl9wb2ludF9zZXJ2ZV9zdGFydF9zaWRlID0gTm9uZVxuIiwKICAgICIgICAgZGVmIF9zdGFydF9wb2ludF9jb250ZXh0KHNlbGYsIG9yaWdpbl9wb3MsIHNlcnZlX3N0YXJ0X2ZyYW1lPU5vbmUsIGhpc3Rvcnlfb3JpZ2luX3Bvcz1Ob25lKTpcbiIKICAgICIgICAgICAgIHNlbGYuX3BlbmRpbmdfcmFsbHlfZW5kX3JlYXNvbiA9IE5vbmVcbiIKICAgICIgICAgICAgIHNlbGYuX3BlbmRpbmdfcmFsbHlfZW5kX2ZyYW1lID0gLTFcbiIKICAgICIgICAgICAgIHNlbGYuX2F3YWl0aW5nX3NlcnZlX2JvdW5jZSA9IEZhbHNlXG4iCiAgICAiICAgICAgICBzZWxmLl9zZXJ2ZV9waGFzZV9hY3RpdmUgPSBGYWxzZVxuIgogICAgIiAgICAgICAgc2VsZi5fc2VydmVfcGhhc2VfY2xvc2VkX2ZyYW1lID0gLTEwMDAwMDBcbiIKICAgICIgICAgICAgIHNlbGYuX3BvaW50X3NlcnZlX3N0YXJ0X3NpZGUgPSBOb25lXG4iLAogICAgImluaXRpYWxpemUgc2VydmUgcGhhc2Ugc3RhdGUiLAopCgpyZXBsYWNlX29uY2UoCiAgICAiICAgICAgICBzZWxmLl9wb2ludF9zZXJ2ZV9zdGFydF9zaWRlID0gc3RhcnRfc2lkZVxuIgogICAgIiAgICAgICAgc2VsZi5fcG9pbnRfdGFyZ2V0X3NlcnZpY2Vfc2lkZSA9IHRhcmdldF9zaWRlXG4iCiAgICAiICAgICAgICBzZWxmLl9hd2FpdGluZ19zZXJ2ZV9ib3VuY2UgPSBUcnVlXG4iLAogICAgIiAgICAgICAgc2VsZi5fcG9pbnRfc2VydmVfc3RhcnRfc2lkZSA9IHN0YXJ0X3NpZGVcbiIKICAgICIgICAgICAgIHNlbGYuX3BvaW50X3RhcmdldF9zZXJ2aWNlX3NpZGUgPSB0YXJnZXRfc2lkZVxuIgogICAgIiAgICAgICAgc2VsZi5fc2VydmVfcGhhc2VfYWN0aXZlID0gVHJ1ZVxuIgogICAgIiAgICAgICAgc2VsZi5fc2VydmVfcGhhc2VfY2xvc2VkX2ZyYW1lID0gLTEwMDAwMDBcbiIKICAgICIgICAgICAgIHNlbGYuX2F3YWl0aW5nX3NlcnZlX2JvdW5jZSA9IFRydWVcbiIsCiAgICAiYWN0aXZhdGUgc2VydmUgcGhhc2UiLAopCgpyZXBsYWNlX29uY2UoCiAgICAiICAgIGRlZiBfcmVjb3JkX3NlcnZlX2luKHNlbGYpOlxuIgogICAgIiAgICAgICAgc2VydmVyX2lkeCA9IHNlbGYuX2N1cnJlbnRfc2VydmVyX2luZGV4KClcbiIsCiAgICAiICAgIGRlZiBfcmVjb3JkX3NlcnZlX2luKHNlbGYpOlxuIgogICAgIiAgICAgICAgIyBBIGNvbmZpcm1lZCBpbi1zZXJ2ZSBpcyB0aGUgb25lLXdheSB0cmFuc2l0aW9uIGZyb20gc2VydmUgaGFuZGxpbmdcbiIKICAgICIgICAgICAgICMgdG8gcmFsbHkgaGFuZGxpbmcgZm9yIHRoaXMgcG9pbnQuIFNlcnZlLW9ubHkgZGV0ZWN0b3JzIG11c3QgcmVtYWluXG4iCiAgICAiICAgICAgICAjIGRpc2FibGVkIHVudGlsIF9zdGFydF9wb2ludF9jb250ZXh0KCkgYmVnaW5zIHRoZSBuZXh0IHNlcnZlIGF0dGVtcHQuXG4iCiAgICAiICAgICAgICBzZWxmLl9zZXJ2ZV9waGFzZV9hY3RpdmUgPSBGYWxzZVxuIgogICAgIiAgICAgICAgc2VsZi5fc2VydmVfcGhhc2VfY2xvc2VkX2ZyYW1lID0gaW50KGdldGF0dHIoc2VsZiwgJ2ZyYW1lX2NvdW50JywgLTEwMDAwMDApKVxuIgogICAgIiAgICAgICAgc2VydmVyX2lkeCA9IHNlbGYuX2N1cnJlbnRfc2VydmVyX2luZGV4KClcbiIsCiAgICAiY2xvc2Ugc2VydmUgcGhhc2Ugb24gY29uZmlybWVkIHNlcnZlLWluIiwKKQoKcmVwbGFjZV9vbmNlKAogICAgIiAgICBkZWYgX21hcmtfc2VydmVfbmV0X2NvbnRhY3RfY2FuZGlkYXRlKHNlbGYsIGJhbGxfcG9zaXRpb24sIGZyYW1lKTpcbiIKICAgICIgICAgICAgIGlmIGJhbGxfcG9zaXRpb24gaXMgTm9uZSBvciBmcmFtZSBpcyBOb25lOlxuIgogICAgIiAgICAgICAgICAgIHJldHVybiBGYWxzZVxuIgogICAgIiAgICAgICAgaWYgbm90IGdldGF0dHIoc2VsZiwgJ19hd2FpdGluZ19zZXJ2ZV9ib3VuY2UnLCBGYWxzZSk6XG4iLAogICAgIiAgICBkZWYgX21hcmtfc2VydmVfbmV0X2NvbnRhY3RfY2FuZGlkYXRlKHNlbGYsIGJhbGxfcG9zaXRpb24sIGZyYW1lKTpcbiIKICAgICIgICAgICAgIGlmIGJhbGxfcG9zaXRpb24gaXMgTm9uZSBvciBmcmFtZSBpcyBOb25lOlxuIgogICAgIiAgICAgICAgICAgIHJldHVybiBGYWxzZVxuIgogICAgIiAgICAgICAgaWYgbm90IChcbiIKICAgICIgICAgICAgICAgICBnZXRhdHRyKHNlbGYsICdfc2VydmVfcGhhc2VfYWN0aXZlJywgRmFsc2UpIGFuZFxuIgogICAgIiAgICAgICAgICAgIGdldGF0dHIoc2VsZiwgJ19hd2FpdGluZ19zZXJ2ZV9ib3VuY2UnLCBGYWxzZSlcbiIKICAgICIgICAgICAgICk6XG4iLAogICAgImdhdGUgc2VydmUgbmV0IGRldGVjdG9yIiwKKQoKcmVwbGFjZV9vbmNlKAogICAgIiAgICAgICAgaWYgZ2V0YXR0cihzZWxmLCAnX2F3YWl0aW5nX3NlcnZlX2JvdW5jZScsIEZhbHNlKTpcbiIKICAgICIgICAgICAgICAgICBzZXJ2ZV9ib3VuY2Vfd2luZG93X2FjdGl2ZSA9IChcbiIsCiAgICAiICAgICAgICBpZiAoXG4iCiAgICAiICAgICAgICAgICAgZ2V0YXR0cihzZWxmLCAnX3NlcnZlX3BoYXNlX2FjdGl2ZScsIEZhbHNlKSBhbmRcbiIKICAgICIgICAgICAgICAgICBnZXRhdHRyKHNlbGYsICdfYXdhaXRpbmdfc2VydmVfYm91bmNlJywgRmFsc2UpXG4iCiAgICAiICAgICAgICApOlxuIgogICAgIiAgICAgICAgICAgIHNlcnZlX2JvdW5jZV93aW5kb3dfYWN0aXZlID0gKFxuIiwKICAgICJnYXRlIHNlcnZpY2UtYm94IGJvdW5jZSBjbGFzc2lmaWNhdGlvbiIsCikKCnJlcGxhY2Vfb25jZSgKICAgICIgICAgICAgIHNlcnZlX2JvdW5jZV9hY3RpdmUgPSBnZXRhdHRyKHNlbGYsICdfYXdhaXRpbmdfc2VydmVfYm91bmNlJywgRmFsc2UpXG4iCiAgICAiICAgICAgICBib3VuY2Vfa2luZCA9IFwic2VydmVfYm91bmNlXCIgaWYgZ2V0YXR0cihzZWxmLCAnX2F3YWl0aW5nX3NlcnZlX2JvdW5jZScsIEZhbHNlKSBlbHNlIFwiZ3JvdW5kX2JvdW5jZVwiXG4iCiAgICAiICAgICAgICBzZWxmLl9hZGRfaW1wYWN0X21hcmtlcihwb2ludCwga2luZD1ib3VuY2Vfa2luZCwgY29sb3I9Y29sb3IsIGxhYmVsPXJlYXNvbilcbiIKICAgICIgICAgICAgIGlmIGdldGF0dHIoc2VsZiwgJ19hd2FpdGluZ19zZXJ2ZV9ib3VuY2UnLCBGYWxzZSk6XG4iCiAgICAiICAgICAgICAgICAgc2VsZi5fYXdhaXRpbmdfc2VydmVfYm91bmNlID0gRmFsc2VcbiIsCiAgICAiICAgICAgICBzZXJ2ZV9ib3VuY2VfYWN0aXZlID0gYm9vbChcbiIKICAgICIgICAgICAgICAgICBnZXRhdHRyKHNlbGYsICdfc2VydmVfcGhhc2VfYWN0aXZlJywgRmFsc2UpIGFuZFxuIgogICAgIiAgICAgICAgICAgIGdldGF0dHIoc2VsZiwgJ19hd2FpdGluZ19zZXJ2ZV9ib3VuY2UnLCBGYWxzZSlcbiIKICAgICIgICAgICAgIClcbiIKICAgICIgICAgICAgIGJvdW5jZV9raW5kID0gXCJzZXJ2ZV9ib3VuY2VcIiBpZiBzZXJ2ZV9ib3VuY2VfYWN0aXZlIGVsc2UgXCJncm91bmRfYm91bmNlXCJcbiIKICAgICIgICAgICAgIHNlbGYuX2FkZF9pbXBhY3RfbWFya2VyKHBvaW50LCBraW5kPWJvdW5jZV9raW5kLCBjb2xvcj1jb2xvciwgbGFiZWw9cmVhc29uKVxuIgogICAgIiAgICAgICAgaWYgc2VydmVfYm91bmNlX2FjdGl2ZTpcbiIKICAgICIgICAgICAgICAgICBzZWxmLl9hd2FpdGluZ19zZXJ2ZV9ib3VuY2UgPSBGYWxzZVxuIiwKICAgICJnYXRlIHNlcnZlIGJvdW5jZSBldmVudCBoYW5kbGluZyIsCikKCnJlcGxhY2Vfb25jZSgKICAgICIgICAgICAgICMgVW5kbyBvbmx5IHRoZSBwcm92aXNpb25hbCBzaWRlIGVmZmVjdHMgY3JlYXRlZCB3aGVuIHRoZSBmYWxzZVxuIgogICAgIiAgICAgICAgIyBzZXJ2ZS1ib3VuY2UgZXZlbnQgd2FzIHF1ZXVlZCBpbnNpZGUgdHJhY2tfYmFsbF9pbl9mcmFtZSgpLlxuIgogICAgIiAgICAgICAgaWYgaW50KGdldGF0dHIoc2VsZiwgJ2xhc3RfZ3JvdW5kX2JvdW5jZV9mcmFtZScsIC0xMDAwMDAwKSkgPT0gaW50KHNlbGYuZnJhbWVfY291bnQpOlxuIgogICAgIiAgICAgICAgICAgIHNlbGYuZ3JvdW5kX2JvdW5jZV9jb3VudCA9IG1heCgwLCBpbnQoZ2V0YXR0cihzZWxmLCAnZ3JvdW5kX2JvdW5jZV9jb3VudCcsIDApKSAtIDEpXG4iCiAgICAiICAgICAgICAgICAgaWYgc2VsZi5ncm91bmRfYm91bmNlX2NvdW50ID09IDA6XG4iCiAgICAiICAgICAgICAgICAgICAgIHNlbGYubGFzdF9ncm91bmRfYm91bmNlX2ZyYW1lID0gLTEwMDAwMDBcbiIKICAgICIgICAgICAgIHNlbGYuX2F3YWl0aW5nX3NlcnZlX2JvdW5jZSA9IFRydWVcbiIsCiAgICAiICAgICAgICAjIFVuZG8gb25seSB0aGUgcHJvdmlzaW9uYWwgc2lkZSBlZmZlY3RzIGNyZWF0ZWQgd2hlbiB0aGUgZmFsc2VcbiIKICAgICIgICAgICAgICMgc2VydmUtYm91bmNlIGV2ZW50IHdhcyBxdWV1ZWQgaW5zaWRlIHRyYWNrX2JhbGxfaW5fZnJhbWUoKS5cbiIKICAgICIgICAgICAgIGlmIGludChnZXRhdHRyKHNlbGYsICdsYXN0X2dyb3VuZF9ib3VuY2VfZnJhbWUnLCAtMTAwMDAwMCkpID09IGludChzZWxmLmZyYW1lX2NvdW50KTpcbiIKICAgICIgICAgICAgICAgICBzZWxmLmdyb3VuZF9ib3VuY2VfY291bnQgPSBtYXgoMCwgaW50KGdldGF0dHIoc2VsZiwgJ2dyb3VuZF9ib3VuY2VfY291bnQnLCAwKSkgLSAxKVxuIgogICAgIiAgICAgICAgICAgIGlmIHNlbGYuZ3JvdW5kX2JvdW5jZV9jb3VudCA9PSAwOlxuIgogICAgIiAgICAgICAgICAgICAgICBzZWxmLmxhc3RfZ3JvdW5kX2JvdW5jZV9mcmFtZSA9IC0xMDAwMDAwXG4iCiAgICAiXG4iCiAgICAiICAgICAgICAjIEEgc2FtZS1mcmFtZSByZWNvdmVyeSBtYXkgcmVvcGVuIGEgcHJvdmlzaW9uYWwgc2VydmUgYm91bmNlIHRoYXQgd2FzXG4iCiAgICAiICAgICAgICAjIGp1c3QgcmVqZWN0ZWQuIEl0IG11c3QgbmV2ZXIgcmVzdXJyZWN0IHNlcnZlIG1vZGUgbGF0ZXIgaW4gYSByYWxseS5cbiIKICAgICIgICAgICAgIG1heV9yZXN0b3JlX3NlcnZlX3BoYXNlID0gKFxuIgogICAgIiAgICAgICAgICAgIGdldGF0dHIoc2VsZiwgJ19zZXJ2ZV9waGFzZV9hY3RpdmUnLCBGYWxzZSkgb3JcbiIKICAgICIgICAgICAgICAgICBpbnQoZ2V0YXR0cihzZWxmLCAnX3NlcnZlX3BoYXNlX2Nsb3NlZF9mcmFtZScsIC0xMDAwMDAwKSkgPT0gaW50KHNlbGYuZnJhbWVfY291bnQpXG4iCiAgICAiICAgICAgICApXG4iCiAgICAiICAgICAgICBpZiBtYXlfcmVzdG9yZV9zZXJ2ZV9waGFzZTpcbiIKICAgICIgICAgICAgICAgICBzZWxmLl9zZXJ2ZV9waGFzZV9hY3RpdmUgPSBUcnVlXG4iCiAgICAiICAgICAgICAgICAgc2VsZi5fc2VydmVfcGhhc2VfY2xvc2VkX2ZyYW1lID0gLTEwMDAwMDBcbiIKICAgICIgICAgICAgICAgICBzZWxmLl9hd2FpdGluZ19zZXJ2ZV9ib3VuY2UgPSBUcnVlXG4iLAogICAgInByZXZlbnQgcmFsbHkgcmVjb3ZlcnkgZnJvbSByZWFybWluZyBzZXJ2ZSBzdGF0ZSIsCikKCnBhdGgud3JpdGVfdGV4dCh0ZXh0LCBlbmNvZGluZz0idXRmLTgiKQo=' | base64 -d > /tmp/patch_serve_phase.py
+          python /tmp/patch_serve_phase.py
           python -m py_compile interactive_ball_analyzer.py
           git diff --check
-
-          grep -q "self._serve_phase_active = False" interactive_ball_analyzer.py
-          grep -q "may_restore_serve_phase" interactive_ball_analyzer.py
-
-      - name: Commit fix and remove one-shot workflow
+      - name: Commit fix
         shell: bash
         run: |
           git config user.name "github-actions[bot]"
