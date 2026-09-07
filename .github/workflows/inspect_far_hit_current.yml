@@ -7,50 +7,29 @@ permissions:
   contents: write
 jobs:
   inspect:
-    if: startsWith(github.event.head_commit.message, 'Extract far hit current sections')
+    if: startsWith(github.event.head_commit.message, 'Extract exact far hit logic')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           ref: revert_1
           fetch-depth: 1
-      - name: Extract current far hit logic
+      - name: Extract exact source ranges
         run: |
           python - <<'PY'
           from pathlib import Path
-          src = Path('interactive_ball_analyzer.py').read_text(encoding='utf-8').splitlines()
-          needles = [
-              'def _upper_racket_contact_turn_candidate_ok',
-              '_upper_racket_contact_turn_candidate_ok(',
-              'def _record_player_shot',
-              'def _register_rally_hit',
-              '[RALLY_HIT]',
-              'upper slow-arc continuation',
-              'upper slow arc',
-              '_last_racket_contact_player',
-          ]
-          hits = []
-          for i, line in enumerate(src, 1):
-              if any(n in line for n in needles):
-                  hits.append(i)
-          windows=[]
-          for i in hits:
-              a=max(1,i-28); b=min(len(src),i+45)
-              if windows and a <= windows[-1][1] + 2:
-                  windows[-1]=(windows[-1][0],max(windows[-1][1],b))
-              else:
-                  windows.append((a,b))
-          out=['HITS ' + repr(hits)]
-          for a,b in windows:
+          src=Path('interactive_ball_analyzer.py').read_text(encoding='utf-8').splitlines()
+          ranges=[(12390,12590),(20520,20690),(20970,21180),(9320,9470)]
+          out=[]
+          for a,b in ranges:
               out.append(f'===== LINES {a}-{b} =====')
-              out.extend(f'{n:06d}: {src[n-1]}' for n in range(a,b+1))
-          Path('.github/far_hit_current_sections.txt').write_text('\n'.join(out)+'\n', encoding='utf-8')
-          print('hits', hits, 'windows', windows)
+              out.extend(f'{n:06d}: {src[n-1]}' for n in range(a,min(b,len(src))+1))
+          Path('.github/far_hit_current_sections.txt').write_text('\n'.join(out)+'\n',encoding='utf-8')
           PY
       - name: Commit extraction
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add .github/far_hit_current_sections.txt
-          git commit -m "Save far hit current sections"
+          git commit -m "Save exact far hit logic"
           git push origin HEAD:revert_1
