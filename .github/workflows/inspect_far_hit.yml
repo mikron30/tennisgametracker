@@ -12,17 +12,15 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: revert_1
-      - name: Show hit/contact code
+      - name: Show upper/far contact gates
         run: |
-          echo '=== PLAYER_SHOT ==='
-          grep -n -C 120 "PLAYER_SHOT" interactive_ball_analyzer.py || true
-          echo '=== RALLY_HIT ==='
-          grep -n -C 120 "RALLY_HIT" interactive_ball_analyzer.py || true
-          echo '=== LOWER LAUNCH ==='
-          grep -n -C 100 "large lower-court launch" interactive_ball_analyzer.py || true
-          echo '=== UPPER SLOW ARC ==='
-          grep -n -C 120 "upper slow-arc continuation" interactive_ball_analyzer.py || true
-          echo '=== NEAR RACKET PREP ==='
-          grep -n -C 80 "NEAR-SIDE RACKET PREP" interactive_ball_analyzer.py || true
-          echo '=== CONTACT INFO ==='
-          grep -n -C 100 "def _point_contact_info" interactive_ball_analyzer.py || true
+          echo '=== CORE 20550-20970 ==='
+          sed -n '20550,20970p' interactive_ball_analyzer.py
+          echo '=== UPPER RACKET DEFINITIONS ==='
+          grep -n -C 100 "upper_racket_contact_turn_candidate" interactive_ball_analyzer.py || true
+          echo '=== UPPER SLOW ARC DEFINITIONS ==='
+          grep -n -C 100 "upper_slow_arc_candidate" interactive_ball_analyzer.py || true
+          echo '=== SIDE RECROSS CALLERS ==='
+          grep -n -C 40 "_maybe_infer_return_contact_from_side_recross" interactive_ball_analyzer.py || true
+          echo '=== PLAYER ZONE HELPERS ==='
+          grep -n -C 60 "def _player_point_zone" interactive_ball_analyzer.py || true
