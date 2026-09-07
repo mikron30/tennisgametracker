@@ -1,10 +1,10 @@
-name: Inspect far-side hit detection
+name: Capture far-side hit inspection
 on:
   push:
     branches: [revert_1]
     paths: ['.github/workflows/inspect_far_hit.yml']
 permissions:
-  contents: read
+  contents: write
 jobs:
   inspect:
     runs-on: ubuntu-latest
@@ -12,13 +12,40 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: revert_1
-      - name: Inspect hit code
+          fetch-depth: 0
+      - name: Capture relevant source
         run: |
-          echo '--- PLAYER_SHOT contexts ---'
-          grep -n -C 45 "\[PLAYER_SHOT\]" interactive_ball_analyzer.py || true
-          echo '--- RALLY_HIT contexts ---'
-          grep -n -C 55 "\[RALLY_HIT\]" interactive_ball_analyzer.py || true
-          echo '--- upper/far hit logic ---'
-          grep -n -E -C 35 "far.*hit|upper.*hit|receiver.*hit|racket.*turn|large lower-court launch|LOWER-HIT|UPPER-HIT" interactive_ball_analyzer.py || true
-          echo '--- contact registration helpers ---'
-          grep -n -E -C 30 "point_contact|last_racket_contact|shot_events|register.*hit|record.*hit|rally_hit" interactive_ball_analyzer.py || true
+          python - <<'PY'
+          from pathlib import Path
+          src = Path('interactive_ball_analyzer.py').read_text(encoding='utf-8').splitlines()
+          markers = [
+              '[PLAYER_SHOT]', '[RALLY_HIT]', 'Allowing upper slow-arc continuation',
+              'large lower-court launch', 'def _point_contact_info', 'def _recent_contact_info',
+              'last_racket_contact', '_last_racket_contact', 'shot_events',
+              'NEAR-CAMERA RACKET TURN', 'NEAR-SIDE RACKET PREP',
+          ]
+          hits=[]
+          for i,line in enumerate(src):
+              if any(m in line for m in markers):
+                  hits.append(i)
+          ranges=[]
+          for i in hits:
+              a=max(0,i-80); b=min(len(src),i+101)
+              if ranges and a <= ranges[-1][1]+10:
+                  ranges[-1]=(ranges[-1][0], max(ranges[-1][1], b))
+              else:
+                  ranges.append((a,b))
+          out=[]
+          for a,b in ranges:
+              out.append(f'===== LINES {a+1}-{b} =====')
+              out.extend(f'{j+1:06d}: {src[j]}' for j in range(a,b))
+          Path('.github/inspect_far_hit_output.txt').write_text('\n'.join(out), encoding='utf-8')
+          print(f'captured {len(ranges)} ranges, {len(out)} lines')
+          PY
+      - name: Commit inspection output
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .github/inspect_far_hit_output.txt
+          git commit -m "Capture far hit inspection"
+          git push origin HEAD:revert_1
