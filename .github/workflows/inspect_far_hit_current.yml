@@ -1,0 +1,51 @@
+name: Inspect far hit current
+on:
+  push:
+    branches:
+      - revert_1
+permissions:
+  contents: read
+jobs:
+  inspect:
+    if: startsWith(github.event.head_commit.message, 'Inspect far hit current')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: revert_1
+          fetch-depth: 1
+      - name: Show far hit logic
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p=Path('interactive_ball_analyzer.py')
+          lines=p.read_text(encoding='utf-8').splitlines()
+          needles=[
+              'def _upper_racket_contact_turn_candidate_ok',
+              '_upper_racket_contact_turn_candidate_ok(',
+              '[RALLY_HIT]',
+              'def _record_player_shot',
+              'def _register_rally_hit',
+              '_last_racket_contact_player',
+              'upper slow-arc',
+              'upper slow arc',
+              'upper-racket',
+              'racket_contact',
+          ]
+          hits=[]
+          for i,line in enumerate(lines,1):
+              if any(n in line for n in needles):
+                  hits.append(i)
+          merged=[]
+          for i in hits:
+              a=max(1,i-55); b=min(len(lines),i+85)
+              if merged and a<=merged[-1][1]+5:
+                  merged[-1]=(merged[-1][0],max(merged[-1][1],b))
+              else:
+                  merged.append((a,b))
+          print('HITS',hits)
+          for a,b in merged:
+              print(f'===== LINES {a}-{b} =====')
+              for n in range(a,b+1):
+                  print(f'{n:06d}: {lines[n-1]}')
+          PY
