@@ -23596,10 +23596,24 @@ class InteractiveBallAnalyzer:
         cx, cy = new_pos
         upward_progress = bounce_point[1] - cy
         incoming_dy = float(self.last_motion.get('dy', 0.0) or 0.0)
-        if velocity < 10.0 or dy > -8.0 or upward_progress < 8.0:
-            return None
-        if angle_jump < 45.0 and not (incoming_dy >= 1.0 and dy <= -12.0):
-            return None
+        net_touch_active = self._serve_net_touch_active(window_frames=120)
+
+        # A serve that clips the net often loses most of its vertical speed.
+        # Its first ground bounce can therefore be a shallow turn rather than
+        # the >=8px upward rebound required for an untouched serve.  Tennis
+        # scoring still depends only on where that first bounce lands:
+        # inside the correct service box -> let; outside -> service fault.
+        # Relax the motion threshold only after a confirmed serve-net touch.
+        if net_touch_active:
+            if velocity < 7.0 or dy > -2.0 or upward_progress < 2.0:
+                return None
+            if angle_jump < 35.0 and not (incoming_dy >= 1.0 and dy <= -3.0):
+                return None
+        else:
+            if velocity < 10.0 or dy > -8.0 or upward_progress < 8.0:
+                return None
+            if angle_jump < 45.0 and not (incoming_dy >= 1.0 and dy <= -12.0):
+                return None
 
         # A service-box fault/out can only be declared after the serve has
         # reached the receiver's half.  Near-player/racket fragments often
@@ -23607,7 +23621,7 @@ class InteractiveBallAnalyzer:
         # side (the old point-9 a prior frame failure).  Net-touch serves are the one
         # deliberate exception: they may bounce on the hitter's side and are
         # handled by the existing net-fault path below.
-        if not self._serve_net_touch_active(window_frames=120) and not self._serve_net_pass_active(window_frames=36):
+        if not net_touch_active and not self._serve_net_pass_active(window_frames=36):
             net_geometry = self._net_contact_geometry(bounce_point)
             net_y = float(
                 net_geometry.get('net_y', (self.net_area_y_min + self.net_area_y_max) * 0.5)
@@ -23634,7 +23648,11 @@ class InteractiveBallAnalyzer:
         if service_ok is not False:
             return None
 
-        if self._serve_net_touch_active(window_frames=120):
+        if net_touch_active:
+            print(
+                f"Frame {self.frame_count}: [SERVE NET OUT BOUNCE] "
+                f"first bounce after net touch is outside target service box at {bounce_point}"
+            )
             return {
                 'point': bounce_point,
                 'reason': self._serve_net_fault_reason(
