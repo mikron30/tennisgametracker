@@ -9651,11 +9651,28 @@ class InteractiveBallAnalyzer:
         return 0 <= (self.frame_count - pass_frame) <= int(window_frames)
 
     def _serve_bounce_frame_limit(self):
-        if self._serve_net_touch_active(window_frames=120):
+        base_limit = 45
+        if self.point_start_frame_internal is None:
+            return base_limit
+
+        start_frame = int(self.point_start_frame_internal)
+        touch_frame = int(getattr(self, '_serve_net_contact_frame', -1000000))
+        pass_frame = int(getattr(self, '_serve_net_pass_frame', -1000000))
+
+        touch_from_initial_serve = (
+            touch_frame > -100000 and
+            0 <= (touch_frame - start_frame) <= base_limit
+        )
+        pass_from_initial_serve = (
+            pass_frame > -100000 and
+            0 <= (pass_frame - start_frame) <= base_limit
+        )
+
+        if touch_from_initial_serve and self._serve_net_touch_active(window_frames=120):
             return 105
-        if self._serve_net_pass_active(window_frames=36):
+        if pass_from_initial_serve and self._serve_net_pass_active(window_frames=36):
             return 75
-        return 45
+        return base_limit
 
     def _serve_net_fault_reason(self, reason):
         reason_text = reason or "Serve bounce outside service box"
@@ -9697,6 +9714,11 @@ class InteractiveBallAnalyzer:
         return self._serve_net_fault_reason(base_reason)
 
     def _mark_serve_net_contact_candidate(self, ball_position, frame):
+        if self.point_start_frame_internal is None:
+            return False
+        frames_since_point_start = self.frame_count - self.point_start_frame_internal
+        if frames_since_point_start < 0 or frames_since_point_start > 45:
+            return False
         if ball_position is None or frame is None:
             return False
         if not (
@@ -10804,9 +10826,8 @@ class InteractiveBallAnalyzer:
             self.ground_bounce_count = max(0, int(getattr(self, 'ground_bounce_count', 0)) - 1)
             if self.ground_bounce_count == 0:
                 self.last_ground_bounce_frame = -1000000
-        may_restore_serve_phase = (
-            getattr(self, '_serve_phase_active', False) or
-            int(getattr(self, '_serve_phase_closed_frame', -1000000)) == int(self.frame_count)
+        may_restore_serve_phase = bool(
+            getattr(self, '_serve_phase_active', False)
         )
         if may_restore_serve_phase:
             self._serve_phase_active = True
