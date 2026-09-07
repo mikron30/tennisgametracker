@@ -19,10 +19,14 @@ jobs:
           from pathlib import Path
           src = Path('interactive_ball_analyzer.py').read_text(encoding='utf-8').splitlines()
           markers = [
-              '[PLAYER_SHOT]', '[RALLY_HIT]', 'Allowing upper slow-arc continuation',
-              'large lower-court launch', 'def _point_contact_info', 'def _recent_contact_info',
-              'last_racket_contact', '_last_racket_contact', 'shot_events',
-              'NEAR-CAMERA RACKET TURN', 'NEAR-SIDE RACKET PREP',
+              'def _classify_direction_change_impact',
+              'upper_racket_contact_turn_candidate',
+              'def _upper_racket_contact',
+              'def _night_far_player_contact_motion_debug',
+              'def _player_index_on_court_end',
+              'def _court_end_for_point',
+              'direction_only_shot_change',
+              'def _maybe_infer_return_contact_from_side_recross',
           ]
           hits=[]
           for i,line in enumerate(src):
@@ -30,7 +34,7 @@ jobs:
                   hits.append(i)
           ranges=[]
           for i in hits:
-              a=max(0,i-80); b=min(len(src),i+101)
+              a=max(0,i-120); b=min(len(src),i+161)
               if ranges and a <= ranges[-1][1]+10:
                   ranges[-1]=(ranges[-1][0], max(ranges[-1][1], b))
               else:
@@ -39,13 +43,13 @@ jobs:
           for a,b in ranges:
               out.append(f'===== LINES {a+1}-{b} =====')
               out.extend(f'{j+1:06d}: {src[j]}' for j in range(a,b))
-          Path('.github/inspect_far_hit_output.txt').write_text('\n'.join(out), encoding='utf-8')
+          Path('.github/inspect_far_hit_output2.txt').write_text('\n'.join(out), encoding='utf-8')
           print(f'captured {len(ranges)} ranges, {len(out)} lines')
           PY
       - name: Commit inspection output
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add .github/inspect_far_hit_output.txt
-          git commit -m "Capture far hit inspection"
+          git add .github/inspect_far_hit_output2.txt
+          git commit -m "Capture far hit classifier inspection"
           git push origin HEAD:revert_1
