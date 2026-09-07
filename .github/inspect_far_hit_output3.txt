@@ -1,0 +1,592 @@
+===== LINES 12261-12620 =====
+012261:         pos,
+012262:         area,
+012263:         frame_shape,
+012264:         dx,
+012265:         dy,
+012266:         angle_jump,
+012267:         motion_mean=None,
+012268:         motion_max=None,
+012269:     ):
+012270:         """Recognize the close lower-court turn at the racket before launch opens up."""
+012271:         if self.ball_center is None or self.last_motion is None or self.ball_size is None:
+012272:             return False
+012273:         if self.stuck_frame_count < 1:
+012274:             return False
+012275: 
+012276:         frame_height, frame_width = frame_shape[:2]
+012277:         origin_x, origin_y = self.ball_center
+012278:         prev_size = float(self.ball_size)
+012279:         prev_dx = float(self.last_motion.get('dx', 0.0))
+012280:         prev_dy = float(self.last_motion.get('dy', 0.0))
+012281:         prev_speed = float(self.last_motion.get('distance', 0.0))
+012282:         cx, cy = pos
+012283:         turn_dist = math.hypot(dx, dy)
+012284:         upward_progress = origin_y - cy
+012285: 
+012286:         if origin_y < int(frame_height * 0.56) or cy < int(frame_height * 0.50):
+012287:             return False
+012288:         if prev_dy < max(28.0, frame_height * 0.013) or prev_speed < 35.0:
+012289:             return False
+012290:         if prev_size > 300.0:
+012291:             return False
+012292:         if prev_size < 170.0 and area < 85.0:
+012293:             return False
+012294:         if area < max(35.0, min(prev_size * 0.25, 90.0)):
+012295:             return False
+012296:         if upward_progress < max(32.0, frame_height * 0.015):
+012297:             return False
+012298:         if dy > -max(30.0, frame_height * 0.014):
+012299:             return False
+012300:         if angle_jump < 95.0:
+012301:             return False
+012302:         if turn_dist > max(135.0, prev_speed * 1.45):
+012303:             return False
+012304:         if abs(dx) > max(105.0, frame_width * 0.035):
+012305:             return False
+012306:         if motion_mean is not None and motion_max is not None:
+012307:             if motion_mean < 30.0 and motion_max < 100.0:
+012308:                 return False
+012309:         if prev_dx * dx < -80.0 and abs(dx) > 55.0:
+012310:             return False
+012311:         return True
+012312: 
+012313:     def _mid_court_racket_rebound_candidate_ok(
+012314:         self,
+012315:         pos,
+012316:         area,
+012317:         frame_shape,
+012318:         dx,
+012319:         dy,
+012320:         angle_jump,
+012321:         motion_mean=None,
+012322:         motion_max=None,
+012323:     ):
+012324:         """Accept the first mid-court ball rebound off the near player's racket."""
+012325:         if self.ball_center is None or self.last_motion is None or self.ball_size is None:
+012326:             return False
+012327:         if getattr(self, '_awaiting_serve_bounce', False):
+012328:             return False
+012329:         if self.stuck_frame_count > 1:
+012330:             return False
+012331: 
+012332:         frame_height, frame_width = frame_shape[:2]
+012333:         origin_x, origin_y = self.ball_center
+012334:         prev_size = float(self.ball_size)
+012335:         prev_dx = float(self.last_motion.get('dx', 0.0))
+012336:         prev_dy = float(self.last_motion.get('dy', 0.0))
+012337:         prev_speed = float(self.last_motion.get('distance', 0.0))
+012338:         cx, cy = pos
+012339:         turn_dist = math.hypot(dx, dy)
+012340:         upward_progress = origin_y - cy
+012341: 
+012342:         if not (45.0 <= prev_size <= 160.0):
+012343:             return False
+012344:         if not (int(frame_height * 0.30) <= origin_y <= int(frame_height * 0.48)):
+012345:             return False
+012346:         if not (int(frame_height * 0.27) <= cy <= int(frame_height * 0.43)):
+012347:             return False
+012348:         if prev_dy < max(38.0, frame_height * 0.017) or prev_speed < 42.0:
+012349:             return False
+012350:         if prev_dx * dx >= -40.0:
+012351:             return False
+012352:         if angle_jump < 105.0:
+012353:             return False
+012354:         if dy > -max(30.0, frame_height * 0.014):
+012355:             return False
+012356:         if upward_progress < max(30.0, frame_height * 0.014):
+012357:             return False
+012358:         if turn_dist > max(125.0, prev_speed * 1.45):
+012359:             return False
+012360:         if abs(dx) > max(100.0, frame_width * 0.030):
+012361:             return False
+012362:         if area < max(45.0, min(prev_size * 0.50, 85.0)):
+012363:             return False
+012364:         if area > max(180.0, prev_size * 2.10):
+012365:             return False
+012366:         if motion_mean is not None and motion_max is not None:
+012367:             if motion_mean < 22.0 and motion_max < 85.0:
+012368:                 return False
+012369:         return True
+012370: 
+012371:     def _immediate_lower_racket_contact_turn_candidate_ok(
+012372:         self,
+012373:         pos,
+012374:         area,
+012375:         frame_shape,
+012376:         dx,
+012377:         dy,
+012378:         angle_jump,
+012379:         motion_mean=None,
+012380:         motion_max=None,
+012381:     ):
+012382:         """Catch the first post-impact frame when a large near-court ball reverses at the racket."""
+012383:         if self.ball_center is None or self.last_motion is None or self.ball_size is None:
+012384:             return False
+012385: 
+012386:         frame_height, frame_width = frame_shape[:2]
+012387:         origin_x, origin_y = self.ball_center
+012388:         prev_size = float(self.ball_size)
+012389:         prev_dx = float(self.last_motion.get('dx', 0.0))
+012390:         prev_dy = float(self.last_motion.get('dy', 0.0))
+012391:         prev_speed = float(self.last_motion.get('distance', 0.0))
+012392:         cx, cy = pos
+012393:         turn_dist = math.hypot(dx, dy)
+012394:         upward_progress = origin_y - cy
+012395: 
+012396:         if self.stuck_frame_count > 1:
+012397:             return False
+012398:         if not (240.0 <= prev_size <= 330.0):
+012399:             return False
+012400:         if origin_y < int(frame_height * 0.535) or cy < int(frame_height * 0.495):
+012401:             return False
+012402:         if prev_dy < max(26.0, frame_height * 0.012) or prev_speed < 35.0:
+012403:             return False
+012404:         if angle_jump < 135.0:
+012405:             return False
+012406:         if prev_dx * dx >= -200.0:
+012407:             return False
+012408:         if area < max(35.0, min(prev_size * 0.14, 60.0)):
+012409:             return False
+012410:         if upward_progress < max(30.0, frame_height * 0.013):
+012411:             return False
+012412:         if dy > -max(28.0, frame_height * 0.013):
+012413:             return False
+012414:         if turn_dist > max(120.0, prev_speed * 1.60):
+012415:             return False
+012416:         if abs(dx) > max(115.0, frame_width * 0.040):
+012417:             return False
+012418:         if motion_mean is not None and motion_max is not None:
+012419:             if motion_mean < 25.0 and motion_max < 100.0:
+012420:                 return False
+012421:         return True
+012422: 
+012423:     def _upper_racket_contact_turn_candidate_ok(
+012424:         self,
+012425:         pos,
+012426:         area,
+012427:         frame_shape,
+012428:         dx,
+012429:         dy,
+012430:         angle_jump,
+012431:         speed_ratio,
+012432:         motion_mean=None,
+012433:         motion_max=None,
+012434:     ):
+012435:         """Recognize the far-player hit after the ball stalls near its upper apex."""
+012436:         if self.ball_center is None or self.last_motion is None or self.ball_size is None:
+012437:             return False
+012438:         if getattr(self, '_awaiting_serve_bounce', False):
+012439:             return False
+012440:         if self.ground_bounce_count <= 0:
+012441:             return False
+012442:         if getattr(self, 'direction_change_streak', 0) < 2:
+012443:             return False
+012444: 
+012445:         frame_height, frame_width = frame_shape[:2]
+012446:         origin_x, origin_y = self.ball_center
+012447:         prev_size = float(self.ball_size)
+012448:         prev_dy = float(self.last_motion.get('dy', 0.0))
+012449:         prev_speed = float(self.last_motion.get('distance', 0.0))
+012450:         cx, cy = pos
+012451:         turn_dist = math.hypot(dx, dy)
+012452: 
+012453:         if origin_y < max(150, int(frame_height * 0.07)):
+012454:             return False
+012455:         if origin_y > max(360, int(frame_height * 0.18)):
+012456:             return False
+012457:         if cy > max(430, int(frame_height * 0.22)):
+012458:             return False
+012459:         if prev_size > 45.0 or area > 60.0:
+012460:             return False
+012461:         if prev_dy > 2.0 or prev_speed > 10.0:
+012462:             return False
+012463:         if dy < max(6.0, frame_height * 0.0035):
+012464:             return False
+012465:         recent_serve_return_window = (
+012466:             self.ground_bounce_count == 1 and
+012467:             (self.frame_count - getattr(self, '_last_serve_bounce_frame', -1000000)) <= 45
+012468:         )
+012469:         min_turn_angle = 65.0 if recent_serve_return_window else 70.0
+012470:         if angle_jump < min_turn_angle:
+012471:             return False
+012472:         if speed_ratio < 1.55:
+012473:             return False
+012474:         if turn_dist < 8.0 or turn_dist > max(60.0, prev_speed * 5.0):
+012475:             return False
+012476:         if abs(dx) > max(90.0, frame_width * 0.03):
+012477:             return False
+012478:         if motion_mean is not None and motion_max is not None:
+012479:             if motion_mean < 12.0 and motion_max < 70.0:
+012480:                 return False
+012481:         return True
+012482: 
+012483:     def _upper_slow_arc_active(self):
+012484:         return self.frame_count <= getattr(self, '_upper_slow_arc_until_frame', -1)
+012485: 
+012486:     def _upper_fence_fall_end_candidate(self, ball_position, frame_shape):
+012487:         if ball_position is None or self.last_motion is None:
+012488:             self._upper_fence_fall_frames = 0
+012489:             return False
+012490:         # A point inside a tracked player's body/head/racket is not evidence
+012491:         # of a fence contact.  During this bounded recovery window the ball is
+012492:         # intentionally held at its last trusted position, so never let the
+012493:         # stale fragment score as an upper-fence fall.
+012494:         if int(getattr(self, '_player_reacq_protect_until_frame', -1)) >= self.frame_count:
+012495:             self._upper_fence_fall_frames = 0
+012496:             return False
+012497:         if self._player_point_zone(ball_position) in (
+012498:                 'player_body', 'player_head_hat', 'player_shoes', 'racket_fragment'):
+012499:             self._upper_fence_fall_frames = 0
+012500:             return False
+012501:         if not self._upper_slow_arc_active():
+012502:             self._upper_fence_fall_frames = 0
+012503:             return False
+012504: 
+012505:         frame_height, frame_width = frame_shape[:2]
+012506:         x, y = ball_position
+012507:         upper_fence_y_min = max(150, int(frame_height * 0.070))
+012508:         upper_fence_y_max = max(205, int(frame_height * 0.095))
+012509:         lane_min_x = int(frame_width * 0.35)
+012510:         lane_max_x = int(frame_width * 0.70)
+012511: 
+012512:         ball_size = float(self.ball_size or 0.0)
+012513:         speed = float(self.last_motion.get('distance', 0.0) or 0.0)
+012514:         dy = float(self.last_motion.get('dy', 0.0) or 0.0)
+012515:         continuing_upper_flight = (
+012516:             self._upper_slow_arc_active() and
+012517:             speed > 10.0 and
+012518:             dy < -3.0
+012519:         )
+012520:         in_upper_fence_band = (
+012521:             lane_min_x <= x <= lane_max_x and
+012522:             upper_fence_y_min <= y <= upper_fence_y_max
+012523:         )
+012524:         tiny_visible_ball = 3.0 <= ball_size <= 16.0
+012525:         settled_or_falling = (speed <= 6.5 and dy >= -3.0) or getattr(self, 'stuck_frame_count', 0) >= 1
+012526: 
+012527:         if self._is_night_session_config():
+012528:             night_confirmed_fall = (
+012529:                 (speed <= 7.0 and dy >= 1.0) or
+012530:                 getattr(self, 'stuck_frame_count', 0) >= 4
+012531:             )
+012532:             if not night_confirmed_fall:
+012533:                 self._upper_fence_fall_frames = 0
+012534:                 return False
+012535: 
+012536:         if (not in_upper_fence_band or not tiny_visible_ball or
+012537:                 continuing_upper_flight or not settled_or_falling):
+012538:             self._upper_fence_fall_frames = 0
+012539:             return False
+012540: 
+012541:         self._upper_fence_fall_frames += 1
+012542:         if self._upper_fence_fall_frames < 2:
+012543:             return False
+012544: 
+012545:         self._add_impact_marker(
+012546:             ball_position,
+012547:             kind="fence_contact",
+012548:             ttl=12,
+012549:             label="upper fence / ball fell down",
+012550:         )
+012551:         print(
+012552:             f"Frame {self.frame_count}: [UPPER FENCE FALL] "
+012553:             f"pos={ball_position} size={ball_size:.1f}px speed={speed:.1f}px dy={dy:.1f}"
+012554:         )
+012555:         return True
+012556: 
+012557:     def _top_far_baseline_fall_out_candidate(self, ball_position, frame):
+012558:         """End upper returns that have clearly fallen out beyond the far baseline."""
+012559:         if ball_position is None or self.last_motion is None:
+012560:             return False, None
+012561:         if getattr(self, '_awaiting_serve_bounce', False):
+012562:             return False, None
+012563: 
+012564:         frame_height, _ = frame.shape[:2]
+012565:         x, y = ball_position
+012566:         if not (max(175, int(frame_height * 0.081)) <= y <= max(270, int(frame_height * 0.13))):
+012567:             return False, None
+012568: 
+012569:         ball_size = float(self.ball_size or 0.0)
+012570:         if self.ball_size is not None and ball_size > 22.0:
+012571:             return False, None
+012572: 
+012573:         dy = float(self.last_motion.get('dy', 0.0) or 0.0)
+012574:         speed = float(self.last_motion.get('distance', 0.0) or 0.0)
+012575:         deferred = getattr(self, '_top_far_out_deferred_candidate', None)
+012576:         outside_far_baseline, far_y = self._point_outside_top_singles_baseline(ball_position, frame)
+012577:         recent_top_origin_frame = int(getattr(self, '_top_return_origin_frame', -1000000))
+012578:         recent_top_wait_context = 0 <= (self.frame_count - recent_top_origin_frame) <= 110
+012579:         upper_arc_recently_active = (
+012580:             self.frame_count <= int(getattr(self, '_upper_slow_arc_until_frame', -1000000)) + 70
+012581:         )
+012582:         top_or_return_context = (
+012583:             self._top_return_wait_active() or
+012584:             getattr(self, '_top_return_reentry_grace_frames', 0) > 0 or
+012585:             self._recent_offscreen_return_hold_active(window_frames=48) or
+012586:             recent_top_wait_context or
+012587:             upper_arc_recently_active
+012588:         )
+012589:         recent_click_upper_recover = (
+012590:             self.frame_count - getattr(self, '_click_upper_hsv_recover_frame', -1000000) <= 2
+012591:         )
+012592:         if deferred is not None and recent_click_upper_recover:
+012593:             deferred_frame = int(deferred.get('frame', -1000000))
+012594:             deferred_pos = deferred.get('pos')
+012595:             if deferred_pos is not None and 0 < self.frame_count - deferred_frame <= 8:
+012596:                 deferred_x, deferred_y = deferred_pos
+012597:                 current_outside, current_far_y = self._point_outside_top_singles_baseline(ball_position, frame)
+012598:                 deferred_outside, deferred_far_y = self._point_outside_top_singles_baseline(deferred_pos, frame)
+012599:                 upper_line_context = (
+012600:                     1950 <= deferred_x <= 2118 and
+012601:                     175 <= deferred_y <= 255 and
+012602:                     1950 <= x <= 2118 and
+012603:                     130 <= y <= 225
+012604:                 )
+012605:                 upward_after_defer = y <= deferred_y - 10 and dy <= -6.0 and abs(x - deferred_x) <= 70
+012606:                 if upper_line_context and upward_after_defer and (current_outside or deferred_outside):
+012607:                     far_y = current_far_y if current_outside else deferred_far_y
+012608:                     print(
+012609:                         f"Frame {self.frame_count}: [TOP-FAR-OUT CONFIRMED] "
+012610:                         f"deferred_pos={deferred_pos} pos={ball_position} "
+012611:                         f"far_baseline_y={far_y:.1f} dy={dy:.1f} speed={speed:.1f}"
+012612:                     )
+012613:                     self._top_far_out_deferred_candidate = None
+012614:                     return True, "Ball bounced out of court (far baseline)"
+012615: 
+012616:         recent_descending_top_return = False
+012617:         for entry in getattr(self, 'motion_history', []):
+012618:             if not (0 <= self.frame_count - int(entry.get('frame', -1000000)) <= 6):
+012619:                 continue
+012620:             pos = entry.get('pos')
+===== LINES 20451-20680 =====
+020451:                 if hasattr(self, 'net_area_y_min') and hasattr(self, 'net_area_y_max'):
+020452:                     near_net = (self.net_area_y_min - 100 <= self.ball_center[1] <= self.net_area_y_max + 100)
+020453: 
+020454:                 angle_threshold = 90 if near_net else 70
+020455:                 speed_ratio = (velocity / lm_dist) if lm_dist else 1.0
+020456:                 prev_dx = float(self.last_motion.get('dx', 0.0)) if self.last_motion is not None else 0.0
+020457:                 prev_dy = float(self.last_motion.get('dy', 0.0)) if self.last_motion is not None else 0.0
+020458:                 angle_change_threshold = max(0.0, float(getattr(self, 'direction_change_min_degrees', 20.0)))
+020459:                 same_forward_x = abs(prev_dx) <= 3.0 or abs(dx) <= 3.0 or (prev_dx * dx) >= -6.0
+020460:                 forward_vertical_reversal = (
+020461:                     prev_dy >= 4.0 and
+020462:                     dy <= -4.0 and
+020463:                     same_forward_x
+020464:                 )
+020465:                 hold_change_detected = (
+020466:                     (angle_jump > angle_threshold) or
+020467:                     (speed_ratio > 2.0) or
+020468:                     (speed_ratio < 0.5)
+020469:                 )
+020470:                 change_detected = (
+020471:                     hold_change_detected or
+020472:                     forward_vertical_reversal or
+020473:                     angle_jump >= angle_change_threshold
+020474:                 )
+020475:                 predicted_turn_candidate = False
+020476:                 predicted_continuation_candidate = False
+020477:                 small_ball_upper_flight = (
+020478:                     prev_ball_size is not None and prev_ball_size <= 12 and bulb_size <= 12
+020479:                 )
+020480:                 recent_upper_return_local_turn = (
+020481:                     self._recent_offscreen_return_hold_active(window_frames=36) and
+020482:                     small_ball_upper_flight and
+020483:                     220 <= cy < max(420, int(frame_height * 0.20)) and
+020484:                     velocity <= max(110.0, lm_dist * 1.25) and
+020485:                     dy >= -8 and
+020486:                     (motion_max >= 80.0 or motion_mean >= 18.0)
+020487:                 )
+020488:                 if (predicted_point is not None and small_ball_upper_flight and
+020489:                         240 <= cy < max(420, int(frame_height * 0.20))):
+020490:                     predicted_turn_distance = math.hypot(cx - predicted_point[0], cy - predicted_point[1])
+020491:                     predicted_turn_cap = max(90, int(frame_width * 0.025))
+020492:                     if (
+020493:                             self._recent_offscreen_return_hold_active(window_frames=36) and
+020494:                             (motion_max >= 80.0 or motion_mean >= 18.0) and
+020495:                             velocity <= max(95.0, lm_dist * 1.15)):
+020496:                         predicted_turn_cap = max(predicted_turn_cap, 135.0)
+020497:                     predicted_turn_candidate = predicted_turn_distance <= predicted_turn_cap
+020498:                 if recent_upper_return_local_turn:
+020499:                     predicted_turn_candidate = True
+020500:                 lower_contact_launch_candidate = False
+020501:                 if lower_contact_launch_context is not None and self.ball_center is not None:
+020502:                     lower_contact_launch_candidate = self._lower_contact_launch_candidate_ok(
+020503:                         (cx, cy),
+020504:                         bulb_size,
+020505:                         lower_contact_launch_context,
+020506:                         frame.shape,
+020507:                     )
+020508:                 lower_racket_contact_turn_candidate = self._lower_racket_contact_turn_candidate_ok(
+020509:                     (cx, cy),
+020510:                     bulb_size,
+020511:                     frame.shape,
+020512:                     dx,
+020513:                     dy,
+020514:                     angle_jump,
+020515:                     motion_mean=motion_mean,
+020516:                     motion_max=motion_max,
+020517:                 )
+020518:                 immediate_lower_racket_contact_turn_candidate = self._immediate_lower_racket_contact_turn_candidate_ok(
+020519:                     (cx, cy),
+020520:                     bulb_size,
+020521:                     frame.shape,
+020522:                     dx,
+020523:                     dy,
+020524:                     angle_jump,
+020525:                     motion_mean=motion_mean,
+020526:                     motion_max=motion_max,
+020527:                 )
+020528:                 mid_court_racket_rebound_candidate = self._mid_court_racket_rebound_candidate_ok(
+020529:                     (cx, cy),
+020530:                     bulb_size,
+020531:                     frame.shape,
+020532:                     dx,
+020533:                     dy,
+020534:                     angle_jump,
+020535:                     motion_mean=motion_mean,
+020536:                     motion_max=motion_max,
+020537:                 )
+020538:                 immediate_lower_racket_contact_turn_candidate = (
+020539:                     immediate_lower_racket_contact_turn_candidate or
+020540:                     mid_court_racket_rebound_candidate
+020541:                 )
+020542:                 lower_racket_contact_turn_candidate = (
+020543:                     lower_racket_contact_turn_candidate or
+020544:                     immediate_lower_racket_contact_turn_candidate
+020545:                 )
+020546:                 upper_racket_contact_turn_candidate = self._upper_racket_contact_turn_candidate_ok(
+020547:                     (cx, cy),
+020548:                     bulb_size,
+020549:                     frame.shape,
+020550:                     dx,
+020551:                     dy,
+020552:                     angle_jump,
+020553:                     speed_ratio,
+020554:                     motion_mean=motion_mean,
+020555:                     motion_max=motion_max,
+020556:                 )
+020557:                 near_side_soft_racket_launch_candidate = self._near_side_soft_racket_launch_candidate_ok(
+020558:                     (cx, cy),
+020559:                     bulb_size,
+020560:                     frame.shape,
+020561:                     motion_mean=motion_mean,
+020562:                     motion_max=motion_max,
+020563:                 )
+020564:                 large_lower_launch_candidate = self._large_lower_launch_candidate_ok(
+020565:                     (cx, cy), bulb_size, frame.shape
+020566:                 ) or large_lower_launch_override or near_side_soft_racket_launch_candidate
+020567:                 upper_slow_arc_candidate = self._upper_slow_arc_candidate_ok(
+020568:                     (cx, cy), bulb_size, velocity, predicted_point, frame.shape, frame_gray=frame_gray
+020569:                 )
+020570:                 upper_focus_loss_guard_candidate = (
+020571:                     self.frame_count <= int(getattr(self, '_focus_loss_guard_until_frame', -1000000)) and
+020572:                     getattr(self, 'ground_bounce_count', 0) == 0 and
+020573:                     small_ball_upper_flight and
+020574:                     self.ball_center is not None and
+020575:                     self.ball_center[1] <= max(260, int(frame_height * 0.13)) and
+020576:                     cy <= max(320, int(frame_height * 0.16)) and
+020577:                     dy >= max(18.0, frame_height * 0.009) and
+020578:                     angle_jump >= 55.0
+020579:                 )
+020580:                 if upper_focus_loss_guard_candidate:
+020581:                     predicted_turn_candidate = False
+020582:                     predicted_continuation_candidate = False
+020583:                     upper_racket_contact_turn_candidate = False
+020584:                     upper_slow_arc_candidate = False
+020585:                 night_top_band_continuation_candidate = (
+020586:                     self._is_night_session_config() and
+020587:                     self.ball_center is not None and
+020588:                     self.ball_center[1] <= max(135, int(frame_height * 0.063)) and
+020589:                     cy <= max(150, int(frame_height * 0.070)) and
+020590:                     -4.0 <= dx <= max(35.0, frame_width * 0.012) and
+020591:                     abs(dy) <= max(14.0, frame_height * 0.007) and
+020592:                     velocity <= max(36.0, lm_dist * 4.0) and
+020593:                     (motion_max >= 18.0 or motion_mean >= 5.0 or bulb_size >= 2.0)
+020594:                 )
+020595:                 ground_bounce_candidate = False
+020596:                 ground_bounce_rebound_candidate = False
+020597:                 upper_soft_ground_bounce_candidate = False
+020598:                 if ground_bounce_context is not None and self.ball_center is not None:
+020599:                     origin_x, origin_y = ground_bounce_context['origin']
+020600:                     expected_x, expected_y = ground_bounce_context['expected']
+020601:                     bounce_dist = math.hypot(cx - origin_x, cy - origin_y)
+020602:                     upward_progress = origin_y - cy
+020603:                     expected_distance = math.hypot(cx - expected_x, cy - expected_y)
+020604:                     lateral_dx = cx - origin_x
+020605:                     incoming_dx = ground_bounce_context['incoming_dx']
+020606:                     incoming_dy = ground_bounce_context['incoming_dy']
+020607:                     same_direction_x = abs(incoming_dx) <= 2.0 or (lateral_dx * incoming_dx) >= -8.0
+020608:                     candidate_not_tiny = bulb_size >= max(1, min(int(ground_bounce_context['ref_size'] * 0.08), 4))
+020609:                     rebound_x_reverse = (lateral_dx * incoming_dx) < -8.0
+020610:                     strong_rebound_motion = (
+020611:                         motion_max >= 90.0 or
+020612:                         motion_mean >= 25.0 or
+020613:                         bulb_size >= max(45.0, ground_bounce_context['ref_size'] * 0.55)
+020614:                     )
+020615:                     ground_bounce_rebound_candidate = (
+020616:                         rebound_x_reverse and
+020617:                         angle_jump >= 115.0 and
+020618:                         origin_y <= max(1150, int(frame_height * 0.55)) and
+020619:                         abs(lateral_dx) <= max(95.0, frame_width * 0.035) and
+020620:                         upward_progress >= max(ground_bounce_context['min_upward'], frame_height * 0.020) and
+020621:                         expected_distance <= max(ground_bounce_context['expected_cap'], 95.0) and
+020622:                         bulb_size >= max(35.0, ground_bounce_context['ref_size'] * 0.50) and
+020623:                         strong_rebound_motion
+020624:                     )
+020625:                     ground_bounce_candidate = (
+020626:                         (same_direction_x or ground_bounce_rebound_candidate) and
+020627:                         candidate_not_tiny and
+020628:                         upward_progress >= ground_bounce_context['min_upward'] and
+020629:                         bounce_dist >= ground_bounce_context['min_launch_dist'] and
+020630:                         bounce_dist <= ground_bounce_context['max_launch_dist'] and
+020631:                         expected_distance <= ground_bounce_context['expected_cap']
+020632:                     )
+020633:                     near_net_shallow_bounce = False
+020634:                     if hasattr(self, 'net_area_y_min') and hasattr(self, 'net_area_y_max'):
+020635:                         near_net_shallow_bounce = (
+020636:                             not ground_bounce_candidate and
+020637:                             self._late_contact_prior_bounce_active() and
+020638:                             (self.net_area_y_min - 90) <= origin_y <= (self.net_area_y_max + 130) and
+020639:                             incoming_dy >= max(18.0, frame_height * 0.010) and
+020640:                             dy <= 2.0 and
+020641:                             angle_jump >= 45.0 and
+020642:                             same_direction_x and
+020643:                             candidate_not_tiny and
+020644:                             bounce_dist >= max(12.0, ground_bounce_context['min_launch_dist'] * 0.70) and
+020645:                             bounce_dist <= ground_bounce_context['max_launch_dist'] and
+020646:                             expected_distance <= max(ground_bounce_context['expected_cap'], 95.0) and
+020647:                             bulb_size >= max(35.0, ground_bounce_context['ref_size'] * 0.50) and
+020648:                             motion_max >= 60.0
+020649:                         )
+020650:                     if near_net_shallow_bounce:
+020651:                         ground_bounce_candidate = True
+020652:                         print(
+020653:                             f"Frame {self.frame_count}: [NEAR-NET SHALLOW BOUNCE] "
+020654:                             f"origin=({origin_x},{origin_y}) candidate=({cx},{cy}) "
+020655:                             f"incoming=({incoming_dx:.1f},{incoming_dy:.1f}) "
+020656:                             f"motion={motion_mean:.1f}/{motion_max:.1f}"
+020657:                         )
+020658:                     if large_lower_bounce_launch_override:
+020659:                         ground_bounce_candidate = True
+020660:                     upper_soft_ground_bounce_candidate = (
+020661:                         not ground_bounce_candidate and
+020662:                         self._late_contact_prior_bounce_active() and
+020663:                         self._upper_slow_arc_active() and
+020664:                         origin_y <= max(360, int(frame_height * 0.18)) and
+020665:                         prev_dy >= 2.0 and
+020666:                         dy <= -3.0 and
+020667:                         candidate_not_tiny and
+020668:                         upward_progress >= max(3.0, ground_bounce_context['min_upward'] * 0.80) and
+020669:                         bounce_dist >= max(2.0, ground_bounce_context['min_launch_dist'] * 0.75) and
+020670:                         bounce_dist <= ground_bounce_context['max_launch_dist'] and
+020671:                         expected_distance <= max(ground_bounce_context['expected_cap'], 42.0)
+020672:                     )
+020673:                     post_miss_racket_debug = None
+020674:                     post_miss_racket_hint = False
+020675:                     if (
+020676:                             self.stuck_frame_count > 0 and
+020677:                             origin_y <= max(360, int(frame_height * 0.18)) and
+020678:                             incoming_dy >= max(6.0, frame_height * 0.0035)):
+020679:                         post_miss_racket_debug = self._racket_below_ball_motion_debug(
+020680:                             (origin_x, origin_y), frame
