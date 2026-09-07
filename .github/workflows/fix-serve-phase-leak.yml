@@ -1,0 +1,178 @@
+name: One-shot serve phase state fix
+
+on:
+  push:
+    branches: [revert_1]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: revert_1
+          fetch-depth: 0
+
+      - name: Patch serve phase state
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('interactive_ball_analyzer.py')
+          text = path.read_text(encoding='utf-8')
+
+          def replace_once(old, new, label):
+              global text
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f'{label}: expected exactly 1 match, found {count}')
+              text = text.replace(old, new, 1)
+
+          replace_once(
+              """    def _start_point_context(self, origin_pos, serve_start_frame=None, history_origin_pos=None):
+        self._pending_rally_end_reason = None
+        self._pending_rally_end_frame = -1
+        self._awaiting_serve_bounce = False
+        self._point_serve_start_side = None
+""",
+              """    def _start_point_context(self, origin_pos, serve_start_frame=None, history_origin_pos=None):
+        self._pending_rally_end_reason = None
+        self._pending_rally_end_frame = -1
+        self._awaiting_serve_bounce = False
+        self._serve_phase_active = False
+        self._serve_phase_closed_frame = -1000000
+        self._point_serve_start_side = None
+""",
+              'initialize serve phase state',
+          )
+
+          replace_once(
+              """        self._point_serve_start_side = start_side
+        self._point_target_service_side = target_side
+        self._awaiting_serve_bounce = True
+""",
+              """        self._point_serve_start_side = start_side
+        self._point_target_service_side = target_side
+        self._serve_phase_active = True
+        self._serve_phase_closed_frame = -1000000
+        self._awaiting_serve_bounce = True
+""",
+              'activate serve phase',
+          )
+
+          replace_once(
+              """    def _record_serve_in(self):
+        server_idx = self._current_server_index()
+""",
+              """    def _record_serve_in(self):
+        # A confirmed in-serve is the one-way transition from serve handling
+        # to rally handling for this point. Serve-only detectors must remain
+        # disabled until _start_point_context() begins the next serve attempt.
+        self._serve_phase_active = False
+        self._serve_phase_closed_frame = int(getattr(self, 'frame_count', -1000000))
+        server_idx = self._current_server_index()
+""",
+              'close serve phase on confirmed serve-in',
+          )
+
+          replace_once(
+              """    def _mark_serve_net_contact_candidate(self, ball_position, frame):
+        if ball_position is None or frame is None:
+            return False
+        if not getattr(self, '_awaiting_serve_bounce', False):
+""",
+              """    def _mark_serve_net_contact_candidate(self, ball_position, frame):
+        if ball_position is None or frame is None:
+            return False
+        if not (
+            getattr(self, '_serve_phase_active', False) and
+            getattr(self, '_awaiting_serve_bounce', False)
+        ):
+""",
+              'gate serve net detector',
+          )
+
+          replace_once(
+              """        if getattr(self, '_awaiting_serve_bounce', False):
+            serve_bounce_window_active = (
+""",
+              """        if (
+            getattr(self, '_serve_phase_active', False) and
+            getattr(self, '_awaiting_serve_bounce', False)
+        ):
+            serve_bounce_window_active = (
+""",
+              'gate service-box bounce classification',
+          )
+
+          replace_once(
+              """        serve_bounce_active = getattr(self, '_awaiting_serve_bounce', False)
+        bounce_kind = \"serve_bounce\" if getattr(self, '_awaiting_serve_bounce', False) else \"ground_bounce\"
+        self._add_impact_marker(point, kind=bounce_kind, color=color, label=reason)
+        if getattr(self, '_awaiting_serve_bounce', False):
+            self._awaiting_serve_bounce = False
+""",
+              """        serve_bounce_active = bool(
+            getattr(self, '_serve_phase_active', False) and
+            getattr(self, '_awaiting_serve_bounce', False)
+        )
+        bounce_kind = \"serve_bounce\" if serve_bounce_active else \"ground_bounce\"
+        self._add_impact_marker(point, kind=bounce_kind, color=color, label=reason)
+        if serve_bounce_active:
+            self._awaiting_serve_bounce = False
+""",
+              'gate serve bounce event handling',
+          )
+
+          replace_once(
+              """        # Undo only the provisional side effects created when the false
+        # serve-bounce event was queued inside track_ball_in_frame().
+        if int(getattr(self, 'last_ground_bounce_frame', -1000000)) == int(self.frame_count):
+            self.ground_bounce_count = max(0, int(getattr(self, 'ground_bounce_count', 0)) - 1)
+            if self.ground_bounce_count == 0:
+                self.last_ground_bounce_frame = -1000000
+        self._awaiting_serve_bounce = True
+""",
+              """        # Undo only the provisional side effects created when the false
+        # serve-bounce event was queued inside track_ball_in_frame().
+        if int(getattr(self, 'last_ground_bounce_frame', -1000000)) == int(self.frame_count):
+            self.ground_bounce_count = max(0, int(getattr(self, 'ground_bounce_count', 0)) - 1)
+            if self.ground_bounce_count == 0:
+                self.last_ground_bounce_frame = -1000000
+
+        # A same-frame recovery may reopen a provisional serve bounce that was
+        # just rejected.  It must never resurrect serve mode later in a rally.
+        may_restore_serve_phase = (
+            getattr(self, '_serve_phase_active', False) or
+            int(getattr(self, '_serve_phase_closed_frame', -1000000)) == int(self.frame_count)
+        )
+        if may_restore_serve_phase:
+            self._serve_phase_active = True
+            self._serve_phase_closed_frame = -1000000
+            self._awaiting_serve_bounce = True
+""",
+              'prevent rally recovery from rearming serve state',
+          )
+
+          path.write_text(text, encoding='utf-8')
+          PY
+
+          python -m py_compile interactive_ball_analyzer.py
+          git diff --check
+
+          grep -q "self._serve_phase_active = False" interactive_ball_analyzer.py
+          grep -q "may_restore_serve_phase" interactive_ball_analyzer.py
+
+      - name: Commit fix and remove one-shot workflow
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm .github/workflows/fix-serve-phase-leak.yml
+          git add interactive_ball_analyzer.py
+          git commit -m "Fix serve state leaking into rally"
+          git push origin HEAD:revert_1
