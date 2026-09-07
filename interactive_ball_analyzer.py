@@ -12442,10 +12442,6 @@ class InteractiveBallAnalyzer:
         """
         if self.ball_center is None or self.last_motion is None or self.ball_size is None:
             return False
-        if getattr(self, '_awaiting_serve_bounce', False):
-            return False
-        if getattr(self, 'direction_change_streak', 0) < 2:
-            return False
 
         frame_height, frame_width = frame_shape[:2]
         origin_x, origin_y = self.ball_center
@@ -12482,6 +12478,15 @@ class InteractiveBallAnalyzer:
             candidate_player != last_contact_player
         )
 
+        # Missing the service-box bounce must not leave the tracker permanently
+        # in serve-bounce mode once a verified racket hit from this active point
+        # already exists.  That stale state used to suppress every far-player
+        # return even when the ball stalled on the opponent side and launched
+        # away with a clear horizontal reversal.  Keep the serve guard only
+        # before any rally contact has been established.
+        if getattr(self, '_awaiting_serve_bounce', False) and not active_previous_hit:
+            return False
+
         # Gravity can reverse vertical motion at an apex, but cannot reverse
         # meaningful horizontal motion and multiply speed at the same instant.
         # Restrict that signature to the opponent's court end so it represents
@@ -12508,6 +12513,13 @@ class InteractiveBallAnalyzer:
                 f"speed={prev_speed:.1f}x{speed_ratio:.1f} angle={angle_jump:.1f}"
             )
             return True
+
+        # The strict lateral reversal above is self-confirming and must not
+        # depend on how many provisional direction-change hold frames happened
+        # before it.  Keep the hold requirement only for the older, softer
+        # apex/downward-return signature.
+        if getattr(self, 'direction_change_streak', 0) < 2:
+            return False
 
         # Preserve the older, softer apex/downward-return signature. Because it
         # lacks the strong horizontal reversal above, retain its bounce gate.
