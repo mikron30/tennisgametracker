@@ -1,0 +1,28 @@
+name: Inspect far hit detector
+on:
+  push:
+    branches: [revert_1]
+    paths: ['.github/workflows/inspect_far_hit.yml']
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: revert_1
+      - name: Show hit/contact code
+        run: |
+          echo '=== PLAYER_SHOT ==='
+          grep -n -C 120 "PLAYER_SHOT" interactive_ball_analyzer.py || true
+          echo '=== RALLY_HIT ==='
+          grep -n -C 120 "RALLY_HIT" interactive_ball_analyzer.py || true
+          echo '=== LOWER LAUNCH ==='
+          grep -n -C 100 "large lower-court launch" interactive_ball_analyzer.py || true
+          echo '=== UPPER SLOW ARC ==='
+          grep -n -C 120 "upper slow-arc continuation" interactive_ball_analyzer.py || true
+          echo '=== NEAR RACKET PREP ==='
+          grep -n -C 80 "NEAR-SIDE RACKET PREP" interactive_ball_analyzer.py || true
+          echo '=== CONTACT INFO ==='
+          grep -n -C 100 "def _point_contact_info" interactive_ball_analyzer.py || true
