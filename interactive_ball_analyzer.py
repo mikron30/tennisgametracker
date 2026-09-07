@@ -8789,6 +8789,8 @@ class InteractiveBallAnalyzer:
         self._pending_rally_end_reason = None
         self._pending_rally_end_frame = -1
         self._awaiting_serve_bounce = False
+        self._serve_phase_active = False
+        self._serve_phase_closed_frame = -1000000
         self._point_serve_start_side = None
         self._point_target_service_side = None
         self._last_serve_bounce_frame = -1000000
@@ -8843,6 +8845,8 @@ class InteractiveBallAnalyzer:
         target_side = "right" if start_side == "left" else "left"
         self._point_serve_start_side = start_side
         self._point_target_service_side = target_side
+        self._serve_phase_active = True
+        self._serve_phase_closed_frame = -1000000
         self._awaiting_serve_bounce = True
 
     def _point_history_headers(self):
@@ -9695,7 +9699,10 @@ class InteractiveBallAnalyzer:
     def _mark_serve_net_contact_candidate(self, ball_position, frame):
         if ball_position is None or frame is None:
             return False
-        if not getattr(self, '_awaiting_serve_bounce', False):
+        if not (
+            getattr(self, '_serve_phase_active', False) and
+            getattr(self, '_awaiting_serve_bounce', False)
+        ):
             self._serve_net_zone_frames = 0
             return False
         if not self._is_night_session_config():
@@ -9781,6 +9788,8 @@ class InteractiveBallAnalyzer:
         return True
 
     def _record_serve_in(self):
+        self._serve_phase_active = False
+        self._serve_phase_closed_frame = int(getattr(self, 'frame_count', -1000000))
         server_idx = self._current_server_index()
         stats = self.serve_stats[server_idx]
         if int(getattr(self, 'current_serve_attempt', 1)) <= 1:
@@ -10794,7 +10803,14 @@ class InteractiveBallAnalyzer:
             self.ground_bounce_count = max(0, int(getattr(self, 'ground_bounce_count', 0)) - 1)
             if self.ground_bounce_count == 0:
                 self.last_ground_bounce_frame = -1000000
-        self._awaiting_serve_bounce = True
+        may_restore_serve_phase = (
+            getattr(self, '_serve_phase_active', False) or
+            int(getattr(self, '_serve_phase_closed_frame', -1000000)) == int(self.frame_count)
+        )
+        if may_restore_serve_phase:
+            self._serve_phase_active = True
+            self._serve_phase_closed_frame = -1000000
+            self._awaiting_serve_bounce = True
         self.recent_bounce_markers = [
             marker for marker in getattr(self, 'recent_bounce_markers', [])
             if not (
@@ -11100,7 +11116,10 @@ class InteractiveBallAnalyzer:
                 )
                 return False, "Ball bounce outside singles court (far baseline)", (0, 0, 255)
 
-        if getattr(self, '_awaiting_serve_bounce', False):
+        if (
+            getattr(self, '_serve_phase_active', False) and
+            getattr(self, '_awaiting_serve_bounce', False)
+        ):
             serve_bounce_window_active = (
                 self.point_start_frame_internal is not None and
                 (self.frame_count - self.point_start_frame_internal) <= self._serve_bounce_frame_limit()
@@ -11131,10 +11150,13 @@ class InteractiveBallAnalyzer:
                 frame,
                 conservative_sideline_override=conservative_sideline_override,
             )
-        serve_bounce_active = getattr(self, '_awaiting_serve_bounce', False)
-        bounce_kind = "serve_bounce" if getattr(self, '_awaiting_serve_bounce', False) else "ground_bounce"
+        serve_bounce_active = bool(
+            getattr(self, '_serve_phase_active', False) and
+            getattr(self, '_awaiting_serve_bounce', False)
+        )
+        bounce_kind = "serve_bounce" if serve_bounce_active else "ground_bounce"
         self._add_impact_marker(point, kind=bounce_kind, color=color, label=reason)
-        if getattr(self, '_awaiting_serve_bounce', False):
+        if serve_bounce_active:
             self._awaiting_serve_bounce = False
         if in_bounds:
             if serve_bounce_active and self._serve_net_touch_active(window_frames=120):
