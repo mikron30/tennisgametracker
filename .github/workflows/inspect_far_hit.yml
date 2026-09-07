@@ -12,15 +12,14 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: revert_1
-      - name: Show upper/far contact gates
+      - name: Show ownership and contact state
         run: |
-          echo '=== CORE 20550-20970 ==='
-          sed -n '20550,20970p' interactive_ball_analyzer.py
-          echo '=== UPPER RACKET DEFINITIONS ==='
-          grep -n -C 100 "upper_racket_contact_turn_candidate" interactive_ball_analyzer.py || true
-          echo '=== UPPER SLOW ARC DEFINITIONS ==='
-          grep -n -C 100 "upper_slow_arc_candidate" interactive_ball_analyzer.py || true
-          echo '=== SIDE RECROSS CALLERS ==='
-          grep -n -C 40 "_maybe_infer_return_contact_from_side_recross" interactive_ball_analyzer.py || true
-          echo '=== PLAYER ZONE HELPERS ==='
-          grep -n -C 60 "def _player_point_zone" interactive_ball_analyzer.py || true
+          echo '=== COURT END MAPPING ==='
+          grep -n -C 70 "def _player_index_on_court_end" interactive_ball_analyzer.py || true
+          grep -n -C 70 "def _court_end_for_point" interactive_ball_analyzer.py || true
+          echo '=== RECORD CONTACT ==='
+          grep -n -C 100 "def _record_racket_contact" interactive_ball_analyzer.py || true
+          echo '=== AWAIT SERVE BOUNCE ==='
+          grep -n -C 30 "_awaiting_serve_bounce = False" interactive_ball_analyzer.py | head -n 500 || true
+          echo '=== DIRECTION STREAK ==='
+          grep -n -C 15 "direction_change_streak = 0" interactive_ball_analyzer.py | head -n 300 || true
