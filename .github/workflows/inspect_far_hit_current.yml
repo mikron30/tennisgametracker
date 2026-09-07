@@ -4,48 +4,53 @@ on:
     branches:
       - revert_1
 permissions:
-  contents: read
+  contents: write
 jobs:
   inspect:
-    if: startsWith(github.event.head_commit.message, 'Inspect far hit current')
+    if: startsWith(github.event.head_commit.message, 'Extract far hit current sections')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           ref: revert_1
           fetch-depth: 1
-      - name: Show far hit logic
+      - name: Extract current far hit logic
         run: |
           python - <<'PY'
           from pathlib import Path
-          p=Path('interactive_ball_analyzer.py')
-          lines=p.read_text(encoding='utf-8').splitlines()
-          needles=[
+          src = Path('interactive_ball_analyzer.py').read_text(encoding='utf-8').splitlines()
+          needles = [
               'def _upper_racket_contact_turn_candidate_ok',
               '_upper_racket_contact_turn_candidate_ok(',
-              '[RALLY_HIT]',
               'def _record_player_shot',
               'def _register_rally_hit',
-              '_last_racket_contact_player',
-              'upper slow-arc',
+              '[RALLY_HIT]',
+              'upper slow-arc continuation',
               'upper slow arc',
-              'upper-racket',
-              'racket_contact',
+              '_last_racket_contact_player',
           ]
-          hits=[]
-          for i,line in enumerate(lines,1):
+          hits = []
+          for i, line in enumerate(src, 1):
               if any(n in line for n in needles):
                   hits.append(i)
-          merged=[]
+          windows=[]
           for i in hits:
-              a=max(1,i-55); b=min(len(lines),i+85)
-              if merged and a<=merged[-1][1]+5:
-                  merged[-1]=(merged[-1][0],max(merged[-1][1],b))
+              a=max(1,i-28); b=min(len(src),i+45)
+              if windows and a <= windows[-1][1] + 2:
+                  windows[-1]=(windows[-1][0],max(windows[-1][1],b))
               else:
-                  merged.append((a,b))
-          print('HITS',hits)
-          for a,b in merged:
-              print(f'===== LINES {a}-{b} =====')
-              for n in range(a,b+1):
-                  print(f'{n:06d}: {lines[n-1]}')
+                  windows.append((a,b))
+          out=['HITS ' + repr(hits)]
+          for a,b in windows:
+              out.append(f'===== LINES {a}-{b} =====')
+              out.extend(f'{n:06d}: {src[n-1]}' for n in range(a,b+1))
+          Path('.github/far_hit_current_sections.txt').write_text('\n'.join(out)+'\n', encoding='utf-8')
+          print('hits', hits, 'windows', windows)
           PY
+      - name: Commit extraction
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .github/far_hit_current_sections.txt
+          git commit -m "Save far hit current sections"
+          git push origin HEAD:revert_1
