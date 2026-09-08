@@ -604,16 +604,16 @@ def _patch_tracker_class(cls):
                 f"label={event.get('label', '?')}"
             )
 
-        # Every apparent point is already scored by original_record above.
-        # We only arm a reversible candidate.  Same-side replay on the next
-        # physical serve is the confirmation; otherwise this score stands.
-        if awarded and nonfault and short and isinstance(observation, dict):
+        # Same-side replay also follows a first-serve fault. An absent OUT
+        # classification is not evidence of an IN serve: require a recorded
+        # legal landing or a positively identified receiver return before a
+        # later same-side serve may roll back this point as a let.
+        positive_serve_in = serve_stat_counted or (short and rally_shots == 1)
+        if awarded and nonfault and short and positive_serve_in and isinstance(observation, dict):
             if rally_shots >= 1:
                 in_evidence = "receiver-returned-serve"
-            elif serve_stat_counted:
-                in_evidence = "serve-in-state"
             else:
-                in_evidence = "tracker-treated-short-serve-as-live"
+                in_evidence = "serve-in-state"
 
             self._retro_let_pending = {
                 "snapshot": snapshot,

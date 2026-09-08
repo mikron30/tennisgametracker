@@ -9,6 +9,7 @@ from interactive_ball_analyzer import InteractiveBallAnalyzer
 class ServeLaunchHandoffTests(unittest.TestCase):
     def setUp(self):
         self.analyzer = InteractiveBallAnalyzer.__new__(InteractiveBallAnalyzer)
+        self.analyzer.frame_count = 100
         self.analyzer.config_file = "hsv_config_04_left_night.json"
         self.analyzer.ball_center = (1515, 906)
         self.analyzer.ball_size = 393.0

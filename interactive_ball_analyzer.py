@@ -22446,9 +22446,6 @@ class InteractiveBallAnalyzer:
             return False, None
         if self.prev_motion is None or self.last_motion is None:
             return False, None
-        if getattr(self, '_awaiting_serve_bounce', False):
-            return False, None
-
         prev_dy = float(self.prev_motion.get('dy', 0.0) or 0.0)
         curr_dy = float(self.last_motion.get('dy', 0.0) or 0.0)
         prev_speed = float(self.prev_motion.get('distance', 0.0) or 0.0)
@@ -22462,6 +22459,41 @@ class InteractiveBallAnalyzer:
         last_racket = int(getattr(self, '_last_racket_contact_frame', -1000000))
         if 0 <= int(self.frame_count) - last_racket <= 1:
             return False, None
+
+        serve_bounce = bool(getattr(self, '_awaiting_serve_bounce', False))
+        if serve_bounce:
+            start = getattr(self, 'point_start_frame_internal', None)
+            context = getattr(self, '_point_history_current', None) or {}
+            # A recovered first bounce must remain a service fault even when
+            # the toss consumed part of the ordinary 45-frame serve window.
+            # Never extend this exception through an in-serve or rally hit.
+            if (
+                start is None or
+                not getattr(self, '_serve_phase_active', False) or
+                getattr(self, '_serve_landed_in_current_attempt', False) or
+                int(getattr(self, '_point_hit_count', 0)) > 0 or
+                context.get('shot_events') or
+                last_racket >= int(start) or
+                not 3 <= self.frame_count - int(start) <= max(75, self._serve_bounce_frame_limit())
+            ):
+                return False, None
+            # A turn near the server can be a racket/body fragment. Require
+            # the tracked flight to have reached the receiver's half first.
+            net_min = getattr(self, 'net_area_y_min', None)
+            net_max = getattr(self, 'net_area_y_max', None)
+            direction = int(getattr(self, 'serve_direction_dy', 0))
+            if net_min is None or net_max is None or direction == 0:
+                return False, None
+            net_y = (float(net_min) + float(net_max)) * 0.5
+            margin = max(55.0, frame.shape[0] * 0.025)
+            crossed = any(
+                int(start) <= int(entry.get('frame', -1)) < self.frame_count and
+                entry.get('pos') is not None and
+                (float(entry['pos'][1]) - net_y) * direction >= margin
+                for entry in getattr(self, 'motion_history', [])
+            )
+            if not crossed:
+                return False, None
 
         _, width = frame.shape[:2]
         ball_size = float(getattr(self, 'ball_size', 0.0) or 0.0)
@@ -22500,6 +22532,12 @@ class InteractiveBallAnalyzer:
             reason_text = str(reason or '').lower()
             if reason is None or ('outside' not in reason_text and 'out' not in reason_text):
                 reason = f"Ball bounced out of court ({boundary})"
+            if serve_bounce:
+                # The same boundary evidence has different scoring semantics
+                # before the first legal serve bounce: first fault, then DF.
+                reason = f"Serve bounce outside singles court ({boundary})"
+                if self._serve_net_touch_active(window_frames=120):
+                    reason = self._serve_net_fault_reason(reason)
 
             print(
                 f"Frame {self.frame_count}: [BOUNDARY-REVERSAL OUT] "

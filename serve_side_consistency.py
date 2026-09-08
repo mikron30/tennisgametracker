@@ -132,9 +132,9 @@ def _serve_in_evidence(row: dict) -> Tuple[bool, str]:
     """Return whether the previous serve can reasonably be treated as in.
 
     Future CSVs may expose a direct serve-in field; use it first. For older
-    histories, a receiver return is strong evidence. With zero returns, a short
-    non-fault sequence that the tracker treated as live is weaker behavioural
-    evidence and is used only together with immediate same-side replay.
+    histories, a receiver return is evidence. With zero returns, a generic
+    point award does not prove the serve landed in: it can be a missed fault.
+    Serving again from the same side cannot resolve that ambiguity.
     """
     if _is_serve_let_row(row):
         return True, "explicit-let"
@@ -150,13 +150,6 @@ def _serve_in_evidence(row: dict) -> Tuple[bool, str]:
     rally_shots = _safe_int(row.get("rally_shots"), 0)
     if rally_shots >= 1:
         return True, "receiver-returned-serve"
-
-    awarded = _norm(row.get("point_awarded")) in _TRUE
-    if rally_shots == 0 and awarded:
-        return True, "tracker-treated-short-serve-as-live"
-
-    if rally_shots == 0 and not _service_fault_row(row):
-        return True, "short-nonfault-serve"
 
     return False, "no-serve-in-evidence"
 

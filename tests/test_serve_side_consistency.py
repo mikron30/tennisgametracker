@@ -43,7 +43,8 @@ def test_repeated_service_side_is_flagged():
         _row("0:1 0:0", 4, 1680),
     ]
     checks = ServeSideConsistencyGuard().audit_rows(rows)
-    assert any(c.status == "MISMATCH" for c in checks)
+    assert any(c.score_side_mismatch or c.alternation_mismatch for c in checks)
+    assert not any(c.inferred_let_replay for c in checks)
 
 
 def test_second_serve_stays_on_same_side():
