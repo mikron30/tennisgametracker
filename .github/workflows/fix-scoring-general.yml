@@ -1,0 +1,41 @@
+name: Inspect general point scoring paths
+
+on:
+  push:
+    branches:
+      - revert_1
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: revert_1
+      - name: Print scoring functions
+        shell: bash
+        run: |
+          python - <<'PY'
+          import ast
+          from pathlib import Path
+
+          def print_func(path, names):
+              text = Path(path).read_text(encoding='utf-8')
+              tree = ast.parse(text)
+              lines = text.splitlines()
+              wanted = set(names)
+              for node in ast.walk(tree):
+                  if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in wanted:
+                      print(f'===== {path}:{node.name} lines {node.lineno}-{node.end_lineno} =====')
+                      print('\n'.join(lines[node.lineno-1:node.end_lineno]))
+
+          print_func('interactive_ball_analyzer.py', [
+              '_infer_point_outcome', '_recent_contact_info', '_point_contact_info',
+              '_player_index_at_point', '_record_point_result', '_register_rally_hit',
+              '_record_rally_hit', '_infer_return',
+          ])
+          print_func('retro_let_scoring.py', [
+              'record_point_result', '_let_window_open', '_evaluate_pending',
+              '_confirm_pending', '_patch_tracker_class',
+          ])
+          PY
