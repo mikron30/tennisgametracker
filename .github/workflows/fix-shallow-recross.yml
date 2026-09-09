@@ -1,0 +1,83 @@
+name: Reject shallow net recross ownership
+on:
+  push:
+    branches: [revert_1]
+permissions:
+  contents: write
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: revert_1
+          fetch-depth: 0
+      - name: Install focused test dependencies
+        run: python -m pip install --disable-pip-version-check -q pytest numpy opencv-python-headless
+      - name: Patch shallow recross ownership
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('interactive_ball_analyzer.py')
+          text = path.read_text(encoding='utf-8')
+
+          old_reset = '''        self._side_recross_opponent_last_frame = -1\n        self._side_recross_opponent_last_point = None\n        self._side_recross_return_frames = 0\n'''
+          new_reset = '''        self._side_recross_opponent_last_frame = -1\n        self._side_recross_opponent_last_point = None\n        self._side_recross_opponent_max_depth = 0.0\n        self._side_recross_return_frames = 0\n'''
+          if text.count(old_reset) != 1:
+              raise SystemExit(f'expected one recross reset anchor, found {text.count(old_reset)}')
+          text = text.replace(old_reset, new_reset, 1)
+
+          old_opponent = '''            self._side_recross_opponent_last_frame = now\n            self._side_recross_opponent_last_point = tuple(point)\n            self._side_recross_return_frames = 0\n            self._side_recross_return_last_frame = -1\n            return False\n\n        opponent_frames = int(getattr(self, '_side_recross_opponent_frames', 0))\n'''
+          new_opponent = '''            self._side_recross_opponent_last_frame = now\n            self._side_recross_opponent_last_point = tuple(point)\n\n            # Merely crossing the mathematical net center is not evidence that\n            # the opponent returned the ball.  A ball can skim into the net band\n            # and drift back without ever reaching the opponent.  Remember how\n            # deeply the tracked path actually entered the opponent half; the\n            # return inference below requires it to clear the physical net band.\n            if hasattr(self, 'net_area_y_min') and hasattr(self, 'net_area_y_max'):\n                net_y = (float(self.net_area_y_min) + float(self.net_area_y_max)) / 2.0\n            elif frame is not None:\n                net_y = float(frame.shape[0]) * 0.5\n            else:\n                net_y = None\n            if net_y is not None:\n                opponent_depth = abs(float(point[1]) - net_y)\n                self._side_recross_opponent_max_depth = max(\n                    float(getattr(self, '_side_recross_opponent_max_depth', 0.0) or 0.0),\n                    opponent_depth,\n                )\n\n            self._side_recross_return_frames = 0\n            self._side_recross_return_last_frame = -1\n            return False\n\n        opponent_frames = int(getattr(self, '_side_recross_opponent_frames', 0))\n'''
+          if text.count(old_opponent) != 1:
+              raise SystemExit(f'expected one opponent-side anchor, found {text.count(old_opponent)}')
+          text = text.replace(old_opponent, new_opponent, 1)
+
+          old_gate = '''        if opponent_frames < 3 or opponent_last_frame < 0:\n            return False\n        if now - opponent_last_frame > 18:\n            self._reset_side_recross_watch(last_hitter)\n            return False\n\n        # A side change is ownership evidence only when the tracked ball can\n'''
+          new_gate = '''        if opponent_frames < 3 or opponent_last_frame < 0:\n            return False\n        if now - opponent_last_frame > 18:\n            self._reset_side_recross_watch(last_hitter)\n            return False\n\n        # Require genuine penetration into the opponent court, not a shallow\n        # excursion around the net center.  On calibrated courts the half-width\n        # of the configured net band is the natural minimum.  This rejects the\n        # user's f298-f312 path (deepest only about 48px beyond a 492.5px net)\n        # while preserving real returns that travel well beyond the net area.\n        if hasattr(self, 'net_area_y_min') and hasattr(self, 'net_area_y_max'):\n            required_opponent_depth = max(60.0, abs(\n                float(self.net_area_y_max) - float(self.net_area_y_min)\n            ) / 2.0)\n        elif frame is not None:\n            required_opponent_depth = max(60.0, float(frame.shape[0]) * 0.04)\n        else:\n            required_opponent_depth = 80.0\n        opponent_max_depth = float(\n            getattr(self, '_side_recross_opponent_max_depth', 0.0) or 0.0\n        )\n        if opponent_max_depth < required_opponent_depth:\n            print(\n                f"[INFERRED_RETURN_REJECT] f{self.frame_count}: "\n                f"shallow opponent-side recross depth={opponent_max_depth:.1f}px "\n                f"required={required_opponent_depth:.1f}px; "\n                f"keeping last_hitter={self.player_names[last_hitter]}"\n            )\n            self._reset_side_recross_watch(last_hitter)\n            return False\n\n        # A side change is ownership evidence only when the tracked ball can\n'''
+          if text.count(old_gate) != 1:
+              raise SystemExit(f'expected one recross gate anchor, found {text.count(old_gate)}')
+          text = text.replace(old_gate, new_gate, 1)
+          path.write_text(text, encoding='utf-8')
+
+          test_path = Path('tests/test_recovered_serve_scoring.py')
+          tests = test_path.read_text(encoding='utf-8')
+
+          old_first = '''    for f, point in ((110, (700, 450)), (111, (700, 470)), (112, (700, 490))):\n        analyzer.frame_count = f\n        assert not analyzer._maybe_infer_return_contact_from_side_recross(point, frame)\n    analyzer.frame_count = 113\n    assert not analyzer._maybe_infer_return_contact_from_side_recross((700, 510), frame)\n    analyzer.frame_count = 114\n    assert analyzer._maybe_infer_return_contact_from_side_recross((700, 530), frame)\n'''
+          new_first = '''    for f, point in ((110, (700, 350)), (111, (700, 390)), (112, (700, 430))):\n        analyzer.frame_count = f\n        assert not analyzer._maybe_infer_return_contact_from_side_recross(point, frame)\n    analyzer.frame_count = 113\n    assert not analyzer._maybe_infer_return_contact_from_side_recross((700, 510), frame)\n    analyzer.frame_count = 114\n    assert analyzer._maybe_infer_return_contact_from_side_recross((700, 540), frame)\n'''
+          if tests.count(old_first) != 1:
+              raise SystemExit(f'expected one deciding-game first recross sequence, found {tests.count(old_first)}')
+          tests = tests.replace(old_first, new_first, 1)
+
+          old_second = '''    for f, point in ((120, (720, 540)), (121, (720, 530)), (122, (720, 520))):\n        analyzer.frame_count = f\n        assert not analyzer._maybe_infer_return_contact_from_side_recross(point, frame)\n    analyzer.frame_count = 123\n    assert not analyzer._maybe_infer_return_contact_from_side_recross((730, 490), frame)\n    analyzer.frame_count = 124\n    assert analyzer._maybe_infer_return_contact_from_side_recross((740, 470), frame)\n'''
+          new_second = '''    for f, point in ((120, (720, 650)), (121, (720, 620)), (122, (720, 590))):\n        analyzer.frame_count = f\n        assert not analyzer._maybe_infer_return_contact_from_side_recross(point, frame)\n    analyzer.frame_count = 123\n    assert not analyzer._maybe_infer_return_contact_from_side_recross((730, 480), frame)\n    analyzer.frame_count = 124\n    assert analyzer._maybe_infer_return_contact_from_side_recross((740, 450), frame)\n'''
+          if tests.count(old_second) != 1:
+              raise SystemExit(f'expected one deciding-game second recross sequence, found {tests.count(old_second)}')
+          tests = tests.replace(old_second, new_second, 1)
+
+          old_continuous = '''    for f, point in ((110, (1800, 420)), (111, (1805, 440)), (112, (1810, 470))):\n        analyzer.frame_count = f\n        assert not analyzer._maybe_infer_return_contact_from_side_recross(point, frame)\n    analyzer.frame_count = 113\n    assert not analyzer._maybe_infer_return_contact_from_side_recross((1815, 510), frame)\n    analyzer.frame_count = 114\n    assert analyzer._maybe_infer_return_contact_from_side_recross((1820, 540), frame)\n'''
+          new_continuous = '''    for f, point in ((110, (1800, 350)), (111, (1805, 390)), (112, (1810, 430))):\n        analyzer.frame_count = f\n        assert not analyzer._maybe_infer_return_contact_from_side_recross(point, frame)\n    analyzer.frame_count = 113\n    assert not analyzer._maybe_infer_return_contact_from_side_recross((1815, 510), frame)\n    analyzer.frame_count = 114\n    assert analyzer._maybe_infer_return_contact_from_side_recross((1820, 540), frame)\n'''
+          if tests.count(old_continuous) != 1:
+              raise SystemExit(f'expected one continuous recross sequence, found {tests.count(old_continuous)}')
+          tests = tests.replace(old_continuous, new_continuous, 1)
+
+          marker = 'def test_shallow_net_recross_does_not_infer_return'
+          if marker not in tests:
+              tests += '''\n\ndef test_shallow_net_recross_does_not_infer_return(analyzer):\n    start(analyzer, 290, (1150, 825))\n    analyzer.max_ball_speed = 400\n    analyzer._serve_phase_active = False\n    analyzer._awaiting_serve_bounce = False\n    analyzer._last_racket_contact_player = 0\n    analyzer._last_racket_contact_frame = 290\n    analyzer._last_racket_contact_point = (1150, 825)\n    analyzer._point_hit_count = 6\n    analyzer._point_history_current['shot_events'] = []\n    analyzer._player_index_at_point = lambda point, frame=None: 1 if point[1] < 500 else 0\n    frame = np.zeros((2160, 3840, 3), dtype=np.uint8)\n\n    # Replay the user's f298-f312 path: it crosses the net center smoothly,\n    # but never leaves the configured 400..585 net band on the far side.\n    path = [\n        (298, (1663, 479)), (299, (1703, 470)), (300, (1739, 460)),\n        (301, (1772, 454)), (302, (1805, 450)), (303, (1835, 445)),\n        (304, (1866, 446)), (305, (1894, 449)), (306, (1920, 453)),\n        (307, (1946, 458)), (308, (1972, 465)), (309, (1983, 475)),\n        (310, (1989, 489)), (311, (1992, 504)), (312, (1996, 520)),\n    ]\n    for f, point in path:\n        analyzer.frame_count = f\n        assert not analyzer._maybe_infer_return_contact_from_side_recross(point, frame)\n\n    assert analyzer._last_racket_contact_player == 0\n    assert analyzer._last_racket_contact_frame == 290\n    assert analyzer._point_hit_count == 6\n'''
+          test_path.write_text(tests, encoding='utf-8')
+          PY
+          python -m py_compile interactive_ball_analyzer.py tests/test_recovered_serve_scoring.py
+          git diff --check
+      - name: Run focused regression tests
+        run: python -m pytest tests/test_recovered_serve_scoring.py -q
+      - name: Commit fix
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm .github/workflows/fix-shallow-recross.yml
+          git add interactive_ball_analyzer.py tests/test_recovered_serve_scoring.py
+          git commit -m "Reject shallow net recross returns"
+          git push origin HEAD:revert_1
