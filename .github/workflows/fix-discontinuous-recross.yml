@@ -1,0 +1,50 @@
+name: Fix discontinuous recross ownership
+on:
+  push:
+    branches: [revert_1]
+permissions:
+  contents: write
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: revert_1
+          fetch-depth: 0
+      - name: Install focused test dependencies
+        run: python -m pip install --disable-pip-version-check -q pytest numpy opencv-python-headless
+      - name: Patch discontinuous side recross
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('interactive_ball_analyzer.py')
+          text = path.read_text(encoding='utf-8')
+          old = '''        if now - opponent_last_frame > 18:\n            self._reset_side_recross_watch(last_hitter)\n            return False\n\n        previous_return_frame = int(getattr(self, '_side_recross_return_last_frame', -1))\n'''
+          new = '''        if now - opponent_last_frame > 18:\n            self._reset_side_recross_watch(last_hitter)\n            return False\n\n        # A side change is ownership evidence only when the tracked ball can\n        # physically travel from the last opponent-side sample to this sample.\n        # A full-frame/player-occlusion reacquisition can otherwise teleport a\n        # stale player fragment hundreds of pixels across the net and fabricate\n        # a return.  Scale by the number of missing frames, but keep the same\n        # configured per-frame ball-speed ceiling used by the tracker.\n        if int(getattr(self, '_side_recross_return_frames', 0)) == 0:\n            opponent_point = getattr(self, '_side_recross_opponent_last_point', None)\n            if opponent_point is not None:\n                frame_gap = max(1, now - opponent_last_frame)\n                jump = math.hypot(\n                    float(point[0]) - float(opponent_point[0]),\n                    float(point[1]) - float(opponent_point[1]),\n                )\n                configured_speed = float(getattr(self, 'max_ball_speed', 0.0) or 0.0)\n                per_frame_limit = max(160.0, configured_speed * 1.15)\n                continuity_limit = per_frame_limit * frame_gap\n                if jump > continuity_limit:\n                    print(\n                        f"[INFERRED_RETURN_REJECT] f{self.frame_count}: "\n                        f"discontinuous side recross jump={jump:.1f}px "\n                        f"gap={frame_gap}f limit={continuity_limit:.1f}px; "\n                        f"keeping last_hitter={self.player_names[last_hitter]}"\n                    )\n                    self._reset_side_recross_watch(last_hitter)\n                    return False\n\n        previous_return_frame = int(getattr(self, '_side_recross_return_last_frame', -1))\n'''
+          if text.count(old) != 1:
+              raise SystemExit(f'expected one recross anchor, found {text.count(old)}')
+          path.write_text(text.replace(old, new, 1), encoding='utf-8')
+
+          test_path = Path('tests/test_recovered_serve_scoring.py')
+          tests = test_path.read_text(encoding='utf-8')
+          marker = 'def test_discontinuous_side_reacquisition_does_not_infer_return'
+          if marker not in tests:
+              tests += '''\n\ndef test_discontinuous_side_reacquisition_does_not_infer_return(analyzer):\n    start(analyzer, 100, (1800, 900))\n    analyzer.max_ball_speed = 400\n    analyzer._last_racket_contact_player = 0\n    analyzer._last_racket_contact_frame = 105\n    analyzer._last_racket_contact_point = (1800, 800)\n    analyzer._point_hit_count = 0\n    analyzer._point_history_current['shot_events'] = []\n    analyzer._player_index_at_point = lambda point, frame=None: 1 if point[1] < 500 else 0\n    frame = np.zeros((2160, 3840, 3), dtype=np.uint8)\n\n    for f in (110, 111, 112):\n        analyzer.frame_count = f\n        assert not analyzer._maybe_infer_return_contact_from_side_recross((2156, 262), frame)\n\n    # Mirrors the user's f3024 -> f3025 player-occlusion reacquisition:\n    # 689px in one frame is beyond the configured 400px/frame ball speed.\n    analyzer.frame_count = 113\n    assert not analyzer._maybe_infer_return_contact_from_side_recross((1756, 823), frame)\n    analyzer.frame_count = 114\n    assert not analyzer._maybe_infer_return_contact_from_side_recross((1754, 821), frame)\n\n    assert analyzer._last_racket_contact_player == 0\n    assert analyzer._point_hit_count == 0\n\n\ndef test_continuous_side_recross_still_infers_return(analyzer):\n    start(analyzer, 100, (1800, 900))\n    analyzer.max_ball_speed = 400\n    analyzer._last_racket_contact_player = 0\n    analyzer._last_racket_contact_frame = 105\n    analyzer._last_racket_contact_point = (1800, 800)\n    analyzer._point_hit_count = 0\n    analyzer._point_history_current['shot_events'] = []\n    analyzer._player_index_at_point = lambda point, frame=None: 1 if point[1] < 500 else 0\n    frame = np.zeros((2160, 3840, 3), dtype=np.uint8)\n\n    for f, point in ((110, (1800, 420)), (111, (1805, 440)), (112, (1810, 470))):\n        analyzer.frame_count = f\n        assert not analyzer._maybe_infer_return_contact_from_side_recross(point, frame)\n    analyzer.frame_count = 113\n    assert not analyzer._maybe_infer_return_contact_from_side_recross((1815, 510), frame)\n    analyzer.frame_count = 114\n    assert analyzer._maybe_infer_return_contact_from_side_recross((1820, 540), frame)\n    assert analyzer._last_racket_contact_player == 1\n    assert analyzer._point_hit_count == 1\n'''
+              test_path.write_text(tests, encoding='utf-8')
+          PY
+          python -m py_compile interactive_ball_analyzer.py tests/test_recovered_serve_scoring.py
+          git diff --check
+      - name: Run focused regression tests
+        run: python -m pytest tests/test_recovered_serve_scoring.py -q
+      - name: Commit fix
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm .github/workflows/fix-discontinuous-recross.yml .github/workflows/inspect-final-point.yml
+          git add interactive_ball_analyzer.py tests/test_recovered_serve_scoring.py
+          git commit -m "Reject discontinuous inferred returns"
+          git push origin HEAD:revert_1
