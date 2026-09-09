@@ -9329,6 +9329,7 @@ class InteractiveBallAnalyzer:
         self._side_recross_opponent_first_frame = -1
         self._side_recross_opponent_last_frame = -1
         self._side_recross_opponent_last_point = None
+        self._side_recross_opponent_max_depth = 0.0
         self._side_recross_return_frames = 0
         self._side_recross_return_last_frame = -1
 
@@ -9463,6 +9464,25 @@ class InteractiveBallAnalyzer:
             ) + 1
             self._side_recross_opponent_last_frame = now
             self._side_recross_opponent_last_point = tuple(point)
+
+            # Merely crossing the mathematical net center is not evidence that
+            # the opponent returned the ball.  A ball can skim into the net band
+            # and drift back without ever reaching the opponent.  Remember how
+            # deeply the tracked path actually entered the opponent half; the
+            # return inference below requires it to clear the physical net band.
+            if hasattr(self, 'net_area_y_min') and hasattr(self, 'net_area_y_max'):
+                net_y = (float(self.net_area_y_min) + float(self.net_area_y_max)) / 2.0
+            elif frame is not None:
+                net_y = float(frame.shape[0]) * 0.5
+            else:
+                net_y = None
+            if net_y is not None:
+                opponent_depth = abs(float(point[1]) - net_y)
+                self._side_recross_opponent_max_depth = max(
+                    float(getattr(self, '_side_recross_opponent_max_depth', 0.0) or 0.0),
+                    opponent_depth,
+                )
+
             self._side_recross_return_frames = 0
             self._side_recross_return_last_frame = -1
             return False
@@ -9472,6 +9492,32 @@ class InteractiveBallAnalyzer:
         if opponent_frames < 3 or opponent_last_frame < 0:
             return False
         if now - opponent_last_frame > 18:
+            self._reset_side_recross_watch(last_hitter)
+            return False
+
+        # Require genuine penetration into the opponent court, not a shallow
+        # excursion around the net center.  On calibrated courts the half-width
+        # of the configured net band is the natural minimum.  This rejects the
+        # user's f298-f312 path (deepest only about 48px beyond a 492.5px net)
+        # while preserving real returns that travel well beyond the net area.
+        if hasattr(self, 'net_area_y_min') and hasattr(self, 'net_area_y_max'):
+            required_opponent_depth = max(60.0, abs(
+                float(self.net_area_y_max) - float(self.net_area_y_min)
+            ) / 2.0)
+        elif frame is not None:
+            required_opponent_depth = max(60.0, float(frame.shape[0]) * 0.04)
+        else:
+            required_opponent_depth = 80.0
+        opponent_max_depth = float(
+            getattr(self, '_side_recross_opponent_max_depth', 0.0) or 0.0
+        )
+        if opponent_max_depth < required_opponent_depth:
+            print(
+                f"[INFERRED_RETURN_REJECT] f{self.frame_count}: "
+                f"shallow opponent-side recross depth={opponent_max_depth:.1f}px "
+                f"required={required_opponent_depth:.1f}px; "
+                f"keeping last_hitter={self.player_names[last_hitter]}"
+            )
             self._reset_side_recross_watch(last_hitter)
             return False
 

@@ -241,23 +241,23 @@ def test_serve_seed_recovers_missed_returns_and_deciding_game(analyzer):
     analyzer._player_index_at_point = lambda point, frame=None: 0 if point[1] > 500 else 1
     frame = np.zeros((1000, 1600, 3), dtype=np.uint8)
 
-    for f, point in ((110, (700, 450)), (111, (700, 470)), (112, (700, 490))):
+    for f, point in ((110, (700, 350)), (111, (700, 390)), (112, (700, 430))):
         analyzer.frame_count = f
         assert not analyzer._maybe_infer_return_contact_from_side_recross(point, frame)
     analyzer.frame_count = 113
     assert not analyzer._maybe_infer_return_contact_from_side_recross((700, 510), frame)
     analyzer.frame_count = 114
-    assert analyzer._maybe_infer_return_contact_from_side_recross((700, 530), frame)
+    assert analyzer._maybe_infer_return_contact_from_side_recross((700, 540), frame)
     assert analyzer._last_racket_contact_player == 1
     assert analyzer._point_hit_count == 1
 
-    for f, point in ((120, (720, 540)), (121, (720, 530)), (122, (720, 520))):
+    for f, point in ((120, (720, 650)), (121, (720, 620)), (122, (720, 590))):
         analyzer.frame_count = f
         assert not analyzer._maybe_infer_return_contact_from_side_recross(point, frame)
     analyzer.frame_count = 123
-    assert not analyzer._maybe_infer_return_contact_from_side_recross((730, 490), frame)
+    assert not analyzer._maybe_infer_return_contact_from_side_recross((730, 480), frame)
     analyzer.frame_count = 124
-    assert analyzer._maybe_infer_return_contact_from_side_recross((740, 470), frame)
+    assert analyzer._maybe_infer_return_contact_from_side_recross((740, 450), frame)
     assert analyzer._last_racket_contact_player == 0
     assert analyzer._point_hit_count == 2
 
@@ -306,7 +306,7 @@ def test_continuous_side_recross_still_infers_return(analyzer):
     analyzer._player_index_at_point = lambda point, frame=None: 1 if point[1] < 500 else 0
     frame = np.zeros((2160, 3840, 3), dtype=np.uint8)
 
-    for f, point in ((110, (1800, 420)), (111, (1805, 440)), (112, (1810, 470))):
+    for f, point in ((110, (1800, 350)), (111, (1805, 390)), (112, (1810, 430))):
         analyzer.frame_count = f
         assert not analyzer._maybe_infer_return_contact_from_side_recross(point, frame)
     analyzer.frame_count = 113
@@ -315,3 +315,34 @@ def test_continuous_side_recross_still_infers_return(analyzer):
     assert analyzer._maybe_infer_return_contact_from_side_recross((1820, 540), frame)
     assert analyzer._last_racket_contact_player == 1
     assert analyzer._point_hit_count == 1
+
+
+def test_shallow_net_recross_does_not_infer_return(analyzer):
+    start(analyzer, 290, (1150, 825))
+    analyzer.max_ball_speed = 400
+    analyzer._serve_phase_active = False
+    analyzer._awaiting_serve_bounce = False
+    analyzer._last_racket_contact_player = 0
+    analyzer._last_racket_contact_frame = 290
+    analyzer._last_racket_contact_point = (1150, 825)
+    analyzer._point_hit_count = 6
+    analyzer._point_history_current['shot_events'] = []
+    analyzer._player_index_at_point = lambda point, frame=None: 1 if point[1] < 500 else 0
+    frame = np.zeros((2160, 3840, 3), dtype=np.uint8)
+
+    # Replay the user's f298-f312 path: it crosses the net center smoothly,
+    # but never leaves the configured 400..585 net band on the far side.
+    path = [
+        (298, (1663, 479)), (299, (1703, 470)), (300, (1739, 460)),
+        (301, (1772, 454)), (302, (1805, 450)), (303, (1835, 445)),
+        (304, (1866, 446)), (305, (1894, 449)), (306, (1920, 453)),
+        (307, (1946, 458)), (308, (1972, 465)), (309, (1983, 475)),
+        (310, (1989, 489)), (311, (1992, 504)), (312, (1996, 520)),
+    ]
+    for f, point in path:
+        analyzer.frame_count = f
+        assert not analyzer._maybe_infer_return_contact_from_side_recross(point, frame)
+
+    assert analyzer._last_racket_contact_player == 0
+    assert analyzer._last_racket_contact_frame == 290
+    assert analyzer._point_hit_count == 6
