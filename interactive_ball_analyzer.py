@@ -9475,6 +9475,33 @@ class InteractiveBallAnalyzer:
             self._reset_side_recross_watch(last_hitter)
             return False
 
+        # A side change is ownership evidence only when the tracked ball can
+        # physically travel from the last opponent-side sample to this sample.
+        # A full-frame/player-occlusion reacquisition can otherwise teleport a
+        # stale player fragment hundreds of pixels across the net and fabricate
+        # a return. Scale the allowance by missing frames and by the same
+        # per-frame speed ceiling already configured for this court.
+        if int(getattr(self, '_side_recross_return_frames', 0)) == 0:
+            opponent_point = getattr(self, '_side_recross_opponent_last_point', None)
+            if opponent_point is not None:
+                frame_gap = max(1, now - opponent_last_frame)
+                jump = math.hypot(
+                    float(point[0]) - float(opponent_point[0]),
+                    float(point[1]) - float(opponent_point[1]),
+                )
+                configured_speed = float(getattr(self, 'max_ball_speed', 0.0) or 0.0)
+                per_frame_limit = max(160.0, configured_speed * 1.15)
+                continuity_limit = per_frame_limit * frame_gap
+                if jump > continuity_limit:
+                    print(
+                        f"[INFERRED_RETURN_REJECT] f{self.frame_count}: "
+                        f"discontinuous side recross jump={jump:.1f}px "
+                        f"gap={frame_gap}f limit={continuity_limit:.1f}px; "
+                        f"keeping last_hitter={self.player_names[last_hitter]}"
+                    )
+                    self._reset_side_recross_watch(last_hitter)
+                    return False
+
         previous_return_frame = int(getattr(self, '_side_recross_return_last_frame', -1))
         if previous_return_frame >= 0 and now - previous_return_frame > 3:
             self._side_recross_return_frames = 0

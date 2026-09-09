@@ -241,23 +241,23 @@ def test_serve_seed_recovers_missed_returns_and_deciding_game(analyzer):
     analyzer._player_index_at_point = lambda point, frame=None: 0 if point[1] > 500 else 1
     frame = np.zeros((1000, 1600, 3), dtype=np.uint8)
 
-    for f in (110, 111, 112):
+    for f, point in ((110, (700, 450)), (111, (700, 470)), (112, (700, 490))):
         analyzer.frame_count = f
-        assert not analyzer._maybe_infer_return_contact_from_side_recross((700, 250), frame)
+        assert not analyzer._maybe_infer_return_contact_from_side_recross(point, frame)
     analyzer.frame_count = 113
-    assert not analyzer._maybe_infer_return_contact_from_side_recross((700, 750), frame)
+    assert not analyzer._maybe_infer_return_contact_from_side_recross((700, 510), frame)
     analyzer.frame_count = 114
-    assert analyzer._maybe_infer_return_contact_from_side_recross((700, 750), frame)
+    assert analyzer._maybe_infer_return_contact_from_side_recross((700, 530), frame)
     assert analyzer._last_racket_contact_player == 1
     assert analyzer._point_hit_count == 1
 
-    for f in (120, 121, 122):
+    for f, point in ((120, (720, 540)), (121, (720, 530)), (122, (720, 520))):
         analyzer.frame_count = f
-        assert not analyzer._maybe_infer_return_contact_from_side_recross((720, 760), frame)
+        assert not analyzer._maybe_infer_return_contact_from_side_recross(point, frame)
     analyzer.frame_count = 123
-    assert not analyzer._maybe_infer_return_contact_from_side_recross((730, 260), frame)
+    assert not analyzer._maybe_infer_return_contact_from_side_recross((730, 490), frame)
     analyzer.frame_count = 124
-    assert analyzer._maybe_infer_return_contact_from_side_recross((740, 250), frame)
+    assert analyzer._maybe_infer_return_contact_from_side_recross((740, 470), frame)
     assert analyzer._last_racket_contact_player == 0
     assert analyzer._point_hit_count == 2
 
@@ -270,3 +270,48 @@ def test_serve_seed_recovers_missed_returns_and_deciding_game(analyzer):
     assert analyzer.score_games == [0, 1]
     assert analyzer.score_points == [0, 0]
     assert analyzer._score_summary() == '0:1 0:0'
+
+
+def test_discontinuous_side_reacquisition_does_not_infer_return(analyzer):
+    start(analyzer, 100, (1800, 900))
+    analyzer.max_ball_speed = 400
+    analyzer._last_racket_contact_player = 0
+    analyzer._last_racket_contact_frame = 100
+    analyzer._last_racket_contact_point = (1800, 800)
+    analyzer._point_hit_count = 0
+    analyzer._point_history_current['shot_events'] = []
+    analyzer._player_index_at_point = lambda point, frame=None: 1 if point[1] < 500 else 0
+    frame = np.zeros((2160, 3840, 3), dtype=np.uint8)
+
+    for f in (110, 111, 112):
+        analyzer.frame_count = f
+        assert not analyzer._maybe_infer_return_contact_from_side_recross((2156, 262), frame)
+
+    analyzer.frame_count = 113
+    assert not analyzer._maybe_infer_return_contact_from_side_recross((1756, 823), frame)
+    analyzer.frame_count = 114
+    assert not analyzer._maybe_infer_return_contact_from_side_recross((1754, 821), frame)
+    assert analyzer._last_racket_contact_player == 0
+    assert analyzer._point_hit_count == 0
+
+
+def test_continuous_side_recross_still_infers_return(analyzer):
+    start(analyzer, 100, (1800, 900))
+    analyzer.max_ball_speed = 400
+    analyzer._last_racket_contact_player = 0
+    analyzer._last_racket_contact_frame = 100
+    analyzer._last_racket_contact_point = (1800, 800)
+    analyzer._point_hit_count = 0
+    analyzer._point_history_current['shot_events'] = []
+    analyzer._player_index_at_point = lambda point, frame=None: 1 if point[1] < 500 else 0
+    frame = np.zeros((2160, 3840, 3), dtype=np.uint8)
+
+    for f, point in ((110, (1800, 420)), (111, (1805, 440)), (112, (1810, 470))):
+        analyzer.frame_count = f
+        assert not analyzer._maybe_infer_return_contact_from_side_recross(point, frame)
+    analyzer.frame_count = 113
+    assert not analyzer._maybe_infer_return_contact_from_side_recross((1815, 510), frame)
+    analyzer.frame_count = 114
+    assert analyzer._maybe_infer_return_contact_from_side_recross((1820, 540), frame)
+    assert analyzer._last_racket_contact_player == 1
+    assert analyzer._point_hit_count == 1
