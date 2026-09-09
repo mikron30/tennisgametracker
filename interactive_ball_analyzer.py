@@ -9414,15 +9414,30 @@ class InteractiveBallAnalyzer:
         players and deliberately does not depend on a particular frame number.
         """
         point_start = getattr(self, 'point_start_frame_internal', None)
+        if point is None or point_start is None:
+            return False
+
         last_hitter = getattr(self, '_last_racket_contact_player', None)
         last_contact_frame = int(getattr(self, '_last_racket_contact_frame', -1000000))
-        if (
-            point is None or
-            point_start is None or
-            last_hitter not in (0, 1) or
-            last_contact_frame < int(point_start) or
-            (int(self.frame_count) - last_contact_frame) < 6
-        ):
+
+        # The serve is a real stroke, but it is intentionally not counted as a
+        # rally hit. Use the server only as the trajectory owner when the
+        # first receiver contact was visually missed. A complete side recross
+        # (several frames on the receiver side, then back to the server side)
+        # is required before it becomes a real inferred rally contact.
+        if last_hitter not in (0, 1) or last_contact_frame < int(point_start):
+            context = getattr(self, '_point_history_current', None) or {}
+            if int(getattr(self, '_point_hit_count', 0)) > 0 or context.get('shot_events'):
+                return False
+            try:
+                last_hitter = int(context.get('server_idx', self._current_server_index()))
+            except Exception:
+                last_hitter = self._current_server_index()
+            if last_hitter not in (0, 1):
+                return False
+            last_contact_frame = int(point_start)
+
+        if (int(self.frame_count) - last_contact_frame) < 6:
             return False
 
         if getattr(self, '_side_recross_hitter', None) != last_hitter:
@@ -22520,6 +22535,20 @@ class InteractiveBallAnalyzer:
         change_point = getattr(self, '_last_direction_change_point', None)
         if change_point is not None:
             points.append(tuple(change_point))
+
+        # At a bounce the current sample is already on the outgoing leg. The
+        # previous tracked position (current minus the outgoing motion vector)
+        # is normally closer to the actual ground-contact point, so include it
+        # in the same authoritative court-geometry check. This is especially
+        # important at a baseline where one frame after the bounce can already
+        # be well back inside the image. Racket-contact and line-contact gates
+        # remain authoritative, so this does not invent a new OUT geometry rule.
+        try:
+            impact_x = float(ball_position[0]) - float(self.last_motion.get('dx', 0.0) or 0.0)
+            impact_y = float(ball_position[1]) - float(self.last_motion.get('dy', 0.0) or 0.0)
+            points.append((int(round(impact_x)), int(round(impact_y))))
+        except Exception:
+            pass
         points.append(tuple(ball_position))
 
         seen = set()

@@ -201,3 +201,72 @@ def test_offline_audit_does_not_treat_unknown_serve_as_in():
     assert _serve_in_evidence(row)[0] is False
     assert _serve_in_evidence(dict(row, serve_in='yes'))[0] is True
     assert _serve_in_evidence(dict(row, category='serve_let'))[0] is True
+
+
+def test_pre_reversal_contact_point_is_checked_for_boundary_out(analyzer):
+    start(analyzer, 100, (1800, 1000))
+    analyzer._serve_phase_active = False
+    analyzer._awaiting_serve_bounce = False
+    analyzer.frame_count = 140
+    analyzer.ball_center = (220, 180)
+    analyzer.ball_size = 12.0
+    analyzer.prev_motion = {'dx': 2, 'dy': 34, 'distance': math.hypot(2, 34)}
+    analyzer.last_motion = {'dx': 20, 'dy': -40, 'distance': math.hypot(20, 40)}
+    analyzer._last_direction_change_frame = analyzer.frame_count
+    analyzer._last_direction_change_vertical_reversal = True
+    analyzer._last_direction_change_point = (220, 180)
+    analyzer._point_outside_singles_court = lambda point, frame: (
+        (True, 'far baseline', None, None, None, None)
+        if tuple(point) == (200, 220)
+        else (False, None, None, None, None, None)
+    )
+    analyzer._classify_ground_bounce = lambda point, frame: (
+        (False, 'Ball bounce outside singles court (far baseline)', (0, 0, 255))
+        if tuple(point) == (200, 220)
+        else (True, 'Bounce in singles court', (255, 0, 0))
+    )
+    frame = np.zeros((1000, 1600, 3), dtype=np.uint8)
+    ended, reason = analyzer._confirmed_boundary_reversal_out_candidate(analyzer.ball_center, frame)
+    assert ended
+    assert reason == 'Ball bounce outside singles court (far baseline)'
+
+
+def test_serve_seed_recovers_missed_returns_and_deciding_game(analyzer):
+    analyzer.score_games = [0, 0]
+    analyzer.score_points = [1, 3]
+    analyzer._current_server_index = lambda: 0
+    start(analyzer, 100, (1800, 1000))
+    analyzer._serve_phase_active = False
+    analyzer._awaiting_serve_bounce = False
+    analyzer._player_index_at_point = lambda point, frame=None: 0 if point[1] > 500 else 1
+    frame = np.zeros((1000, 1600, 3), dtype=np.uint8)
+
+    for f in (110, 111, 112):
+        analyzer.frame_count = f
+        assert not analyzer._maybe_infer_return_contact_from_side_recross((700, 250), frame)
+    analyzer.frame_count = 113
+    assert not analyzer._maybe_infer_return_contact_from_side_recross((700, 750), frame)
+    analyzer.frame_count = 114
+    assert analyzer._maybe_infer_return_contact_from_side_recross((700, 750), frame)
+    assert analyzer._last_racket_contact_player == 1
+    assert analyzer._point_hit_count == 1
+
+    for f in (120, 121, 122):
+        analyzer.frame_count = f
+        assert not analyzer._maybe_infer_return_contact_from_side_recross((720, 760), frame)
+    analyzer.frame_count = 123
+    assert not analyzer._maybe_infer_return_contact_from_side_recross((730, 260), frame)
+    analyzer.frame_count = 124
+    assert analyzer._maybe_infer_return_contact_from_side_recross((740, 250), frame)
+    assert analyzer._last_racket_contact_player == 0
+    assert analyzer._point_hit_count == 2
+
+    analyzer.frame_count = 125
+    analyzer._record_point_result(
+        'Ball bounce outside singles court (far baseline)',
+        (740, 220),
+        frame=frame,
+    )
+    assert analyzer.score_games == [0, 1]
+    assert analyzer.score_points == [0, 0]
+    assert analyzer._score_summary() == '0:1 0:0'
