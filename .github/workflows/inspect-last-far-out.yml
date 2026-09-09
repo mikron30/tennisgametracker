@@ -1,0 +1,34 @@
+name: Inspect last far out path
+
+on:
+  push:
+    branches: [revert_1]
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: revert_1
+      - name: Print relevant functions
+        shell: bash
+        run: |
+          python - <<'PY'
+          import ast
+          from pathlib import Path
+          path = Path('interactive_ball_analyzer.py')
+          text = path.read_text(encoding='utf-8')
+          lines = text.splitlines()
+          tree = ast.parse(text)
+          wanted = {
+              '_confirmed_boundary_reversal_out_candidate',
+              '_top_far_baseline_fall_out_candidate',
+              '_detect_point_end',
+              '_detect_ground_bounce',
+          }
+          for node in ast.walk(tree):
+              if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in wanted:
+                  print(f'===== {node.name} lines {node.lineno}-{node.end_lineno} =====')
+                  print('\n'.join(lines[node.lineno-1:node.end_lineno]))
+          PY
