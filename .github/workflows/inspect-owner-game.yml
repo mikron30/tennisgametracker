@@ -1,0 +1,39 @@
+name: Inspect point ownership and game scoring
+
+on:
+  push:
+    branches: [revert_1]
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: revert_1
+      - name: Print relevant ownership and scoring functions
+        shell: bash
+        run: |
+          python - <<'PY'
+          import ast
+          from pathlib import Path
+          path = Path('interactive_ball_analyzer.py')
+          text = path.read_text(encoding='utf-8')
+          lines = text.splitlines()
+          tree = ast.parse(text)
+          needles = [
+              'INFERRED_RETURN_OWNER', 'OUT_SCORE_OWNER',
+              'landing-side fallback', '_last_racket_contact_player',
+              'score_points', 'score_games', 'game_winner',
+          ]
+          seen = set()
+          for node in ast.walk(tree):
+              if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                  body = '\n'.join(lines[node.lineno-1:node.end_lineno])
+                  if any(n in body for n in needles):
+                      key=(node.name,node.lineno)
+                      if key in seen: continue
+                      seen.add(key)
+                      print(f'===== {node.name} lines {node.lineno}-{node.end_lineno} =====')
+                      print(body)
+          PY
