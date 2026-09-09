@@ -75,8 +75,7 @@ def test_recovered_first_bounce_is_fault_during_ai_hold(analyzer, offset):
     assert analyzer.frame_count <= analyzer._local_ai_follow_until_frame
 
 
-@pytest.mark.parametrize('case', ['no_crossing', 'stale_crossing', 'rally_contact',
-                                  'shot_event', 'serve_in', 'expired', 'large_blob',
+@pytest.mark.parametrize('case', ['no_crossing', 'stale_crossing', 'large_blob',
                                   'no_reversal', 'line_contact'])
 def test_recovery_exception_keeps_existing_safety_gates(analyzer, case):
     frame = recovered_reversal(analyzer)
@@ -100,6 +99,41 @@ def test_recovery_exception_keeps_existing_safety_gates(analyzer, case):
         analyzer._sideline_line_contact_override = lambda *a, **k: True
     assert analyzer._confirmed_boundary_reversal_out_candidate(analyzer.ball_center, frame) == (False, None)
 
+
+
+@pytest.mark.parametrize('case', ['rally_contact', 'shot_event', 'serve_in', 'expired'])
+def test_stale_serve_state_yields_to_regular_boundary_out(analyzer, case):
+    frame = recovered_reversal(analyzer)
+    if case == 'rally_contact':
+        analyzer._last_racket_contact_frame = 730
+    elif case == 'shot_event':
+        analyzer._point_history_current['shot_events'] = [{'player': 'P2', 'frame': 730}]
+    elif case == 'serve_in':
+        analyzer._serve_landed_in_current_attempt = True
+    elif case == 'expired':
+        analyzer.point_start_frame_internal = 500
+    ended, reason = analyzer._confirmed_boundary_reversal_out_candidate(analyzer.ball_center, frame)
+    assert ended
+    assert reason == 'Ball bounce outside singles court (right sideline)'
+
+
+def test_expired_serve_flag_does_not_hide_far_baseline_reversal(analyzer):
+    start(analyzer, 2783, (2384, 1011))
+    analyzer.frame_count = 2930
+    analyzer.ball_center = (2174, 222)
+    analyzer.ball_size = 1.0
+    analyzer.prev_motion = {'dx': -3, 'dy': 38, 'distance': math.hypot(3, 38)}
+    analyzer.last_motion = {'dx': 21, 'dy': -40, 'distance': math.hypot(21, 40)}
+    analyzer._last_direction_change_frame = 2930
+    analyzer._last_direction_change_vertical_reversal = True
+    analyzer._last_direction_change_point = (2153, 262)
+    analyzer._player_reacq_protect_until_frame = 3002
+    analyzer._point_outside_singles_court = lambda point, frame: (True, 'far baseline', None, None, None, None)
+    analyzer._classify_ground_bounce = lambda point, frame: (False, 'Ball bounce outside singles court (far baseline)', (0, 0, 255))
+    frame = np.zeros((2160, 3840, 3), dtype=np.uint8)
+    ended, reason = analyzer._confirmed_boundary_reversal_out_candidate(analyzer.ball_center, frame)
+    assert ended
+    assert reason == 'Ball bounce outside singles court (far baseline)'
 
 def test_rally_boundary_reversal_still_awards_regular_out(analyzer):
     frame = recovered_reversal(analyzer)

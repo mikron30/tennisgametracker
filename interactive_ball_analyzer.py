@@ -9674,6 +9674,31 @@ class InteractiveBallAnalyzer:
             return 75
         return base_limit
 
+    def _serve_bounce_context_live(self):
+        """Return True only while the pending first service bounce is still live."""
+        if not (
+            getattr(self, '_serve_phase_active', False) and
+            getattr(self, '_awaiting_serve_bounce', False)
+        ):
+            return False
+
+        start = getattr(self, 'point_start_frame_internal', None)
+        if start is None:
+            return False
+
+        context = getattr(self, '_point_history_current', None) or {}
+        if getattr(self, '_serve_landed_in_current_attempt', False):
+            return False
+        if int(getattr(self, '_point_hit_count', 0)) > 0 or context.get('shot_events'):
+            return False
+
+        last_racket = int(getattr(self, '_last_racket_contact_frame', -1000000))
+        if last_racket >= int(start):
+            return False
+
+        age = int(self.frame_count) - int(start)
+        return 0 <= age <= max(75, int(self._serve_bounce_frame_limit()))
+
     def _serve_net_fault_reason(self, reason):
         reason_text = reason or "Serve bounce outside service box"
         reason_lower = reason_text.lower()
@@ -12667,7 +12692,7 @@ class InteractiveBallAnalyzer:
         """End upper returns that have clearly fallen out beyond the far baseline."""
         if ball_position is None or self.last_motion is None:
             return False, None
-        if getattr(self, '_awaiting_serve_bounce', False):
+        if self._serve_bounce_context_live():
             return False, None
 
         frame_height, _ = frame.shape[:2]
@@ -22460,22 +22485,12 @@ class InteractiveBallAnalyzer:
         if 0 <= int(self.frame_count) - last_racket <= 1:
             return False, None
 
-        serve_bounce = bool(getattr(self, '_awaiting_serve_bounce', False))
+        serve_bounce = self._serve_bounce_context_live()
         if serve_bounce:
             start = getattr(self, 'point_start_frame_internal', None)
-            context = getattr(self, '_point_history_current', None) or {}
-            # A recovered first bounce must remain a service fault even when
-            # the toss consumed part of the ordinary 45-frame serve window.
-            # Never extend this exception through an in-serve or rally hit.
-            if (
-                start is None or
-                not getattr(self, '_serve_phase_active', False) or
-                getattr(self, '_serve_landed_in_current_attempt', False) or
-                int(getattr(self, '_point_hit_count', 0)) > 0 or
-                context.get('shot_events') or
-                last_racket >= int(start) or
-                not 3 <= self.frame_count - int(start) <= max(75, self._serve_bounce_frame_limit())
-            ):
+            # Preserve the old minimum-age safety gate for genuine service
+            # bounces, but do not let an expired serve flag suppress rally OUT.
+            if start is None or int(self.frame_count) - int(start) < 3:
                 return False, None
             # A turn near the server can be a racket/body fragment. Require
             # the tracked flight to have reached the receiver's half first.
