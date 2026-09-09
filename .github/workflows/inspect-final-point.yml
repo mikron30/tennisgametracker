@@ -1,0 +1,25 @@
+name: Inspect final rally ownership path
+on:
+  push:
+    branches: [revert_1]
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: revert_1
+      - name: Print relevant functions
+        shell: bash
+        run: |
+          python - <<'PY'
+          import ast
+          from pathlib import Path
+          p=Path('interactive_ball_analyzer.py')
+          text=p.read_text(encoding='utf-8'); lines=text.splitlines(); tree=ast.parse(text)
+          wanted={'_maybe_infer_return_contact_from_side_recross','_confirmed_boundary_reversal_out_candidate','_point_outside_singles_court','_build_singles_court_model'}
+          for n in ast.walk(tree):
+            if isinstance(n, ast.FunctionDef) and n.name in wanted:
+              print(f'===== {n.name} {n.lineno}-{n.end_lineno} =====')
+              print('\n'.join(lines[n.lineno-1:n.end_lineno]))
+          PY
