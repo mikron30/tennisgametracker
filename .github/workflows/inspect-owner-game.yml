@@ -1,4 +1,4 @@
-name: Inspect point ownership and game scoring
+name: Inspect recross and boundary internals
 
 on:
   push:
@@ -11,29 +11,23 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: revert_1
-      - name: Print relevant ownership and scoring functions
+      - name: Print exact functions
         shell: bash
         run: |
           python - <<'PY'
           import ast
           from pathlib import Path
-          path = Path('interactive_ball_analyzer.py')
-          text = path.read_text(encoding='utf-8')
+          text = Path('interactive_ball_analyzer.py').read_text(encoding='utf-8')
           lines = text.splitlines()
-          tree = ast.parse(text)
-          needles = [
-              'INFERRED_RETURN_OWNER', 'OUT_SCORE_OWNER',
-              'landing-side fallback', '_last_racket_contact_player',
-              'score_points', 'score_games', 'game_winner',
-          ]
-          seen = set()
-          for node in ast.walk(tree):
-              if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                  body = '\n'.join(lines[node.lineno-1:node.end_lineno])
-                  if any(n in body for n in needles):
-                      key=(node.name,node.lineno)
-                      if key in seen: continue
-                      seen.add(key)
-                      print(f'===== {node.name} lines {node.lineno}-{node.end_lineno} =====')
-                      print(body)
+          wanted = {
+              '_reset_side_recross_watch',
+              '_start_point_context',
+              '_maybe_infer_return_contact_from_side_recross',
+              '_confirmed_boundary_reversal_out_candidate',
+              '_record_serve_in',
+          }
+          for node in ast.walk(ast.parse(text)):
+              if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in wanted:
+                  print(f'===== {node.name} lines {node.lineno}-{node.end_lineno} =====')
+                  print('\n'.join(lines[node.lineno-1:node.end_lineno]))
           PY
