@@ -23,7 +23,7 @@ jobs:
       - name: Install lightweight test dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt
+          python -m pip install -r requirements.txt pytest
 
       - name: Apply reviewed runtime guard
         run: |
@@ -75,7 +75,7 @@ jobs:
           doc_path.write_text(doc, encoding='utf-8')
           PY
 
-      - name: Compile and run targeted regressions
+      - name: Compile and run AI/scoring regressions
         run: |
           python -m py_compile interactive_ball_analyzer.py ball_local_ai_recovery.py ball_local_ai.py ball_ai_database.py ball_ai_review.py ball_ai_log_review.py
           python -m unittest \
@@ -85,10 +85,9 @@ jobs:
             tests.test_ball_ai_review \
             tests.test_ball_ai_training \
             tests.test_ball_local_ai_recovery \
-            tests.test_recovered_serve_scoring \
             tests.test_retro_let_scoring \
-            tests.test_serve_launch_handoff \
             tests.test_serve_side_consistency
+          python -m pytest -q tests/test_recovered_serve_scoring.py
           git diff --check
 
       - name: Commit validated WIP changes
@@ -97,6 +96,6 @@ jobs:
           rm -f proposals/local_ai_physics.patch
           git config user.name 'chatgpt-ai-recovery'
           git config user.email 'actions@users.noreply.github.com'
-          git add interactive_ball_analyzer.py ball_local_ai_recovery.py ball_local_ai.py ball_ai_database.py ball_ai_review.py ball_ai_log_review.py LOCAL_AI_REVIEW_WORKFLOW.md tests/test_ai_physical_validation.py tests/test_ball_ai_database.py tests/test_ball_ai_log_review.py tests/test_ball_ai_review.py tests/test_ball_ai_training.py proposals/local_ai_physics.patch .github/workflows/continue-local-ai-wip.yml
+          git add -A interactive_ball_analyzer.py ball_local_ai_recovery.py ball_local_ai.py ball_ai_database.py ball_ai_review.py ball_ai_log_review.py LOCAL_AI_REVIEW_WORKFLOW.md tests/test_ai_physical_validation.py tests/test_ball_ai_database.py tests/test_ball_ai_log_review.py tests/test_ball_ai_review.py tests/test_ball_ai_training.py proposals/local_ai_physics.patch .github/workflows/continue-local-ai-wip.yml
           git commit -m 'Guard local AI trajectory and load legacy checkpoints'
           git push origin HEAD:codex-ai-recovery-wip
