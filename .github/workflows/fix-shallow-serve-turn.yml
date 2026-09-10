@@ -26,3 +26,4 @@ jobs:
           tests/test_recovered_serve_scoring.py
           tests/test_ai_physical_validation.py
           tests/test_tracking_audit.py
+          tests/test_out_bounce_motion_consistency.py

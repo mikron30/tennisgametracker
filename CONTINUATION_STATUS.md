@@ -51,3 +51,26 @@ artifact and excess service-line distance.
 
 Candidate only: do not merge into an active runtime until video comparison
 passes. Production branches and model selection remain unchanged.
+
+
+## Clean-frame follow-up
+
+Sequentially extracted source images support the service bounce near f4116
+and show the far player's return around f4132. The runtime trace subsequently
+holds stale coordinates despite continued play. At f4290–4292 the selected
+marker overlaps the near player's head while the ball remains lower down.
+These observations do not validate the complete point winner or full match.
+
+The f4292 log also contains inconsistent motion records: displacement
+(26,16) paired with direction -129.7 degrees, followed by (24,8) paired with
+-12.5 degrees. Replaying these values reproduces the baseline's false OUT
+classification. A candidate guard rejects sideline-bounce inference whenever
+a stored motion direction differs from its displacement direction by more
+than 5 degrees. It leaves trajectory and score state untouched and logs
+OUT-BOUNCE MOTION CONFLICT. Real consistent outward rebounds remain eligible.
+This is a containment fix, not a repair of candidate selection or a proof of
+the correct winner. Full-video regression and tracking recovery remain open.
+
+Focused tests: 50 passed, including the replay that fails on the old method,
+a consistent real out bounce and equivalent angles wrapped by 360 degrees.
+Audit sheets now decode sequentially with corrected frame mapping as well.

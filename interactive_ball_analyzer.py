@@ -24133,6 +24133,26 @@ class InteractiveBallAnalyzer:
         curr_speed = float(self.last_motion.get('distance', 0.0) or 0.0)
         prev_speed = float(self.prev_motion.get('distance', 0.0) or 0.0)
 
+        # Candidate replacement can leave a direction from one HSV hypothesis
+        # beside the displacement of another. Such a mixed record cannot
+        # establish a bounce, even if the cached angles form a sharp turn.
+        # Do not rewrite the track or infer a winner from that ambiguity.
+        for motion, step_x, step_y in (
+                (self.prev_motion, prev_dx, prev_dy),
+                (self.last_motion, curr_dx, curr_dy)):
+            direction = motion.get('direction_deg')
+            if direction is None or math.hypot(step_x, step_y) < 1.0:
+                continue
+            measured = math.degrees(math.atan2(step_y, step_x))
+            mismatch = abs((float(direction) - measured + 180.0) % 360.0 - 180.0)
+            if not math.isfinite(mismatch) or mismatch > 5.0:
+                print(
+                    f"Frame {self.frame_count}: [OUT-BOUNCE MOTION CONFLICT] "
+                    f"direction={direction} displacement=({step_x:.1f},{step_y:.1f}) "
+                    f"measured={measured:.1f}; waiting for consistent ball motion"
+                )
+                return False, None
+
         # During the initial serve flight, a rejected HSV fragment can jump
         # hundreds of pixels in one frame (point 9 a prior frame: the marker leapt to
         # (2598,553), then the real ball disappeared).  A physical tennis ball
