@@ -23854,6 +23854,9 @@ class InteractiveBallAnalyzer:
             return None
         if self.point_start_frame_internal is None:
             return None
+        # Match the OUT path: a confirmed rally hit ends serve-only inference.
+        if int(getattr(self, '_last_racket_contact_frame', -1000000)) >= int(self.point_start_frame_internal):
+            return None
         frames_since_start = self.frame_count - self.point_start_frame_internal
         if frames_since_start < 3 or frames_since_start > self._serve_bounce_frame_limit():
             return None
@@ -23869,6 +23872,14 @@ class InteractiveBallAnalyzer:
         recent_descent = incoming_dy >= 2.0 and (previous_dy >= 1.0 or incoming_dy >= 4.0)
         soft_vertical_reversal = recent_descent and dy <= -3.0 and upward_progress >= 3.0
         sharp_turn = angle_jump >= 45.0 and incoming_dy >= 1.0 and dy <= -3.0
+        # Use the same shallow-turn evidence as the OUT classifier. This must
+        # be defined locally; the OUT method's local variable is not shared.
+        shallow_serve_turn = (
+            self._is_night_session_config() and
+            incoming_dy >= 4.0 and dy <= -2.0 and
+            upward_progress >= 2.0 and velocity >= 7.0 and
+            angle_jump >= 60.0
+        )
         # At the far service box, perspective can keep screen-space Y moving upward
         # through the bounce. In that case the impact appears as a sharp speed minimum
         # followed by acceleration in the same courtward direction.
@@ -23888,7 +23899,7 @@ class InteractiveBallAnalyzer:
         # not immediately promote the same pixel patch to a serve bounce on a
         # later frame.  This is deliberately scoped to the short retry window
         # and to a nearby point, preserving genuine shallow serve turns.
-        if shallow_perspective_bounce:
+        if shallow_perspective_bounce or shallow_serve_turn:
             suppressed_frame = int(
                 getattr(self, '_last_out_bounce_suppressed_frame', -1000000)
             )
@@ -23907,6 +23918,7 @@ class InteractiveBallAnalyzer:
                     f"recent static side artifact at {bounce_point}"
                 )
                 shallow_perspective_bounce = False
+                shallow_serve_turn = False
         if shallow_perspective_bounce:
             print(
                 f"Frame {self.frame_count}: [SHALLOW SERVE BOUNCE] candidate={bounce_point} "
@@ -23914,7 +23926,8 @@ class InteractiveBallAnalyzer:
                 f"outgoing=({dx:.1f},{dy:.1f},{velocity:.1f}) angle={angle_jump:.1f}"
             )
         if velocity < 5.0 or not (
-                soft_vertical_reversal or sharp_turn or shallow_perspective_bounce):
+                soft_vertical_reversal or sharp_turn or shallow_serve_turn or
+                shallow_perspective_bounce):
             return None
 
         target_side = getattr(self, '_point_target_service_side', None)
@@ -23935,7 +23948,7 @@ class InteractiveBallAnalyzer:
         service_y = geometry.get('service_y')
         shallow_service_box_slack = False
         if (
-                shallow_perspective_bounce and
+                (shallow_perspective_bounce or shallow_serve_turn) and
                 same_target_half and
                 net_y is not None and
                 service_y is not None):
@@ -23979,6 +23992,7 @@ class InteractiveBallAnalyzer:
             'soft_vertical_reversal': soft_vertical_reversal,
             'sharp_turn': sharp_turn,
             'shallow_perspective_bounce': shallow_perspective_bounce,
+            'shallow_serve_turn': shallow_serve_turn,
         }
 
     def _commit_serve_bounce_in_event(self, event, frame):
