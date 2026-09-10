@@ -92,14 +92,22 @@ class TrainingRow:
     image_path: str
     x: float
     y: float
+    group: str = ""
 
 
 def _training_rows(database: Path, limit: int, seed: int) -> list[TrainingRow]:
     connection = sqlite3.connect(database)
     try:
         rows = [TrainingRow(*row) for row in connection.execute(
-            "SELECT image_path, ball_x, ball_y FROM training_frames "
-            "ORDER BY run_id, source_frame"
+            "SELECT f.image_path, "
+            "CASE WHEN r.review_status='corrected' THEN r.corrected_x ELSE f.ball_x END, "
+            "CASE WHEN r.review_status='corrected' THEN r.corrected_y ELSE f.ball_y END, "
+            "COALESCE(f.video_path, f.video_id, f.run_id) "
+            "FROM ball_frames f JOIN label_reviews r USING(run_id, source_frame) "
+            "WHERE r.review_status IN ('accepted','corrected') "
+            "AND (r.review_status != 'corrected' OR "
+            "(r.corrected_x IS NOT NULL AND r.corrected_y IS NOT NULL)) "
+            "ORDER BY f.run_id, f.source_frame"
         )]
     finally:
         connection.close()
@@ -118,11 +126,41 @@ def _reviewed_patch_rows(database: Path, table: str) -> list[TrainingRow]:
         if not exists:
             return []
         return [TrainingRow(*row) for row in connection.execute(
-            f"SELECT image_path, candidate_x, candidate_y FROM {table} "
-            "ORDER BY added_at, source_frame"
+            f"SELECT p.image_path, p.candidate_x, p.candidate_y, "
+            "COALESCE((SELECT f.video_path FROM ball_frames f WHERE f.image_path=p.image_path LIMIT 1), "
+            "(SELECT g.video_path FROM reviewed_image_sources g WHERE g.image_path=p.image_path)) "
+            f"FROM {table} p ORDER BY p.added_at, p.source_frame"
         )]
     finally:
         connection.close()
+
+
+def reviewed_split(database: Path, samples: int, seed: int):
+    """Keep entire source videos together across labels and hard patches.
+
+    Fail closed for patches without source provenance. Row limits and random
+    augmentation never decide held-out membership.
+    """
+    parts = [_training_rows(database, 10**9, seed),
+             _reviewed_patch_rows(database, "hard_negative_patches"),
+             _reviewed_patch_rows(database, "hard_positive_patches")]
+    key = lambda row: (row.image_path, row.x, row.y)
+    negative_keys = {key(row) for row in parts[1]}
+    if any(key(row) in negative_keys for row in parts[0] + parts[2]):
+        raise RuntimeError("Conflicting positive/negative reviews must be corrected before training")
+    difficult_keys = {key(row) for row in parts[2]}
+    parts[0] = [row for row in parts[0] if key(row) not in difficult_keys]
+    if any(not row.group for part in parts for row in part):
+        raise RuntimeError("Reviewed patches need video provenance in reviewed_image_sources")
+    groups = sorted({row.group for part in parts for row in part})
+    if len(groups) < 2:
+        raise RuntimeError("Need reviewed examples from at least two source videos for held-out evaluation")
+    random.Random(seed).shuffle(groups)
+    held_out = set(groups[max(1, int(len(groups) * .8)):])
+    train = [[row for row in part if row.group not in held_out] for part in parts]
+    validation = [[row for row in part if row.group in held_out] for part in parts]
+    train[0] = train[0][:max(1, samples)]
+    return train, validation
 
 
 def _make_dataset(rows: list[TrainingRow], hard_negatives: list[TrainingRow],
@@ -142,7 +180,7 @@ def _make_dataset(rows: list[TrainingRow], hard_negatives: list[TrainingRow],
 
     # A manually/visually reviewed false candidate is much more valuable than
     # an arbitrary background crop.  Repeat it with a tiny jitter so a few
-    # corrections have enough influence to counter thousands of pseudo labels.
+    # corrections have enough influence among the reviewed examples.
     for row in hard_negatives:
         for _ in range(24):
             examples.append((
@@ -177,23 +215,19 @@ def _make_dataset(rows: list[TrainingRow], hard_negatives: list[TrainingRow],
 
 def train(database: Path, model_path: Path, *, epochs: int, samples: int,
           batch_size: int, seed: int) -> dict:
+    if model_path.exists():
+        raise FileExistsError("Refusing to overwrite an existing model; choose a candidate path")
+    train_parts, validation_parts = reviewed_split(database, samples, seed)
+    train_rows, train_hard_negatives, train_hard_positives = train_parts
+    validation_rows, validation_hard_negatives, validation_hard_positives = validation_parts
+    rows = train_rows + validation_rows
+    hard_negatives = train_hard_negatives + validation_hard_negatives
+    hard_positives = train_hard_positives + validation_hard_positives
+    if len(train_rows) + len(train_hard_positives) < 100:
+        raise RuntimeError("Need at least 100 reviewed training positives; tracker labels are not ground truth")
+    if not validation_rows + validation_hard_positives or not validation_hard_negatives:
+        raise RuntimeError("Held-out evaluation requires reviewed positives and hard negatives")
     torch, _, functional, DataLoader, _ = _torch()
-    rows = _training_rows(database, samples, seed)
-    if len(rows) < 100:
-        raise RuntimeError("Need at least 100 accepted/tracked database rows to train")
-    random.Random(seed).shuffle(rows)
-    split = max(1, int(len(rows) * 0.85))
-    train_rows, validation_rows = rows[:split], rows[split:]
-    hard_negatives = _reviewed_patch_rows(database, "hard_negative_patches")
-    hard_positives = _reviewed_patch_rows(database, "hard_positive_patches")
-    random.Random(seed + 17).shuffle(hard_negatives)
-    random.Random(seed + 23).shuffle(hard_positives)
-    hard_split = int(len(hard_negatives) * 0.85)
-    positive_split = int(len(hard_positives) * 0.85)
-    train_hard_negatives = hard_negatives[:hard_split]
-    validation_hard_negatives = hard_negatives[hard_split:]
-    train_hard_positives = hard_positives[:positive_split]
-    validation_hard_positives = hard_positives[positive_split:]
     device, device_name = _device(torch)
     model = _model_class()().to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
@@ -229,10 +263,15 @@ def train(database: Path, model_path: Path, *, epochs: int, samples: int,
                         "validation_accuracy": correct / max(1, total)})
         print(json.dumps(history[-1], sort_keys=True))
     model_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({"state_dict": model.cpu().state_dict(), "patch_size": PATCH_SIZE,
+    checkpoint = {"state_dict": model.cpu().state_dict(), "patch_size": PATCH_SIZE,
                 "device_trained": device_name, "rows": len(rows),
                 "hard_negatives": len(hard_negatives), "hard_positives": len(hard_positives),
-                "history": history}, model_path)
+                "review_policy": "explicit-review-only/source-video-split",
+                "split_seed": seed,
+                "held_out_videos": sorted({r.group for part in validation_parts for r in part}),
+                "history": history}
+    with model_path.open('xb') as output:
+        torch.save(checkpoint, output)
     return {"model": str(model_path), "device": device_name, "rows": len(rows),
             "hard_negatives": len(hard_negatives), "hard_positives": len(hard_positives),
             "history": history}
@@ -292,7 +331,7 @@ def score_batch(model_path: Path, requests: Iterable[dict], batch_size: int) -> 
     return results
 
 
-def _load_model(model_path: Path, torch):
+def _load_model(model_path: Path, torch, *, return_metadata=False):
     """Load once for scoring/evaluation; never run an untrusted checkpoint."""
     device, _ = _device(torch)
     try:
@@ -301,26 +340,33 @@ def _load_model(model_path: Path, torch):
         checkpoint = torch.load(model_path, map_location="cpu")
     model = _model_class()()
     model.load_state_dict(checkpoint["state_dict"])
-    return device, model.to(device).eval()
+    loaded = (device, model.to(device).eval())
+    return (*loaded, checkpoint) if return_metadata else loaded
 
 
 def evaluate(database: Path, model_path: Path, *, samples: int, seed: int,
              batch_size: int) -> dict:
     """Measure whether the true centre beats near and far false candidates.
 
-    This uses the same deterministic held-out tail that ``train`` reserves,
+    This uses the same deterministic source-video split that ``train`` reserves,
     but evaluates the real recovery decision: choose the highest score among
     a true candidate and four nearby alternatives.
     """
     torch, _, _, _, _ = _torch()
-    rows = _training_rows(database, samples, seed)
-    split = max(1, int(len(rows) * 0.85))
-    validation_rows = rows[split:]
-    if not validation_rows:
-        raise RuntimeError("No held-out rows available for evaluation")
-    device, model = _load_model(model_path, torch)
+    _, validation = reviewed_split(database, samples, seed)
+    positive_rows, negative_rows, difficult_rows = validation
+    validation_rows = positive_rows + difficult_rows
+    if not validation_rows or not negative_rows:
+        raise RuntimeError("Held-out evaluation requires reviewed positives and hard negatives")
+    device, model, checkpoint = _load_model(model_path, torch, return_metadata=True)
+    held_out_videos = sorted({row.group for part in validation for row in part})
+    recorded_videos = checkpoint.get('held_out_videos')
+    if recorded_videos is not None and (
+            checkpoint.get('split_seed') != seed or recorded_videos != held_out_videos):
+        raise RuntimeError('Evaluation split differs from checkpoint; use its seed and frozen database')
     offsets = ((0, 0), (-64, 0), (64, 0), (0, -64), (0, 64))
     wins = 0
+    correct = total = false_positives = recovery_false_positives = difficult_wins = 0
     margins: list[float] = []
     with torch.no_grad():
         for row in validation_rows:
@@ -331,9 +377,30 @@ def evaluate(database: Path, model_path: Path, *, samples: int, seed: int,
                     for dx, dy in offsets
                 ])
             scores = torch.sigmoid(model(torch.from_numpy(patches).to(device))).cpu().tolist()
-            wins += int(int(np.argmax(scores)) == 0)
+            win = int(int(np.argmax(scores)) == 0)
+            wins += win
+            if row in difficult_rows:
+                difficult_wins += win
+            correct += int(scores[0] >= 0.5)
+            total += 1
             margins.append(float(scores[0] - max(scores[1:])))
+        for row in negative_rows:
+            with Image.open(row.image_path) as image:
+                patch = _crop_rgb(image.convert("RGB"), (row.x, row.y))
+            value = float(torch.sigmoid(model(torch.from_numpy(patch[None]).to(device))).cpu()[0])
+            false_positives += int(value >= 0.5)
+            recovery_false_positives += int(value >= 0.985)
+            correct += int(value < 0.5)
+            total += 1
     return {
+        "validation_accuracy": correct / total,
+        "held_out_provenance_verified": recorded_videos is not None,
+        "held_out_videos": held_out_videos,
+        "hard_negative_false_positive_rate": false_positives / len(negative_rows),
+        "hard_negative_false_positive_rate_at_0_985": recovery_false_positives / len(negative_rows),
+        "hard_negative_count": len(negative_rows),
+        "reviewed_difficult_top1_accuracy": difficult_wins / len(difficult_rows) if difficult_rows else None,
+        "reviewed_difficult_count": len(difficult_rows),
         "rows": len(validation_rows),
         "top1_true_center_accuracy": wins / len(validation_rows),
         "mean_true_center_margin": float(np.mean(margins)),
@@ -368,6 +435,14 @@ def main() -> None:
     evaluate_parser.add_argument("--samples", type=int, default=1500)
     evaluate_parser.add_argument("--seed", type=int, default=1337)
     evaluate_parser.add_argument("--batch-size", type=int, default=64)
+    compare_parser = commands.add_parser('compare')
+    compare_parser.add_argument('--database', required=True, help='Frozen reviewed SQLite snapshot')
+    compare_parser.add_argument('--old-model', required=True)
+    compare_parser.add_argument('--candidate-model', required=True)
+    compare_parser.add_argument('--report', required=True)
+    compare_parser.add_argument('--seed', type=int, default=1337)
+    compare_parser.add_argument('--samples', type=int, default=6000)
+    compare_parser.add_argument('--batch-size', type=int, default=64)
     args = parser.parse_args()
     if args.command == "train":
         print(json.dumps(train(Path(args.database).resolve(), Path(args.model).resolve(),
@@ -381,6 +456,25 @@ def main() -> None:
         requests = json.loads(Path(args.requests).read_text(encoding="utf-8"))
         print(json.dumps(score_batch(Path(args.model).resolve(), requests,
                                      max(1, args.batch_size))))
+    elif args.command == 'compare':
+        results = {
+            name: evaluate(Path(args.database).resolve(), Path(path).resolve(),
+                           samples=args.samples, seed=args.seed, batch_size=args.batch_size)
+            for name, path in [('old', args.old_model), ('candidate', args.candidate_model)]
+        }
+        higher = ['validation_accuracy', 'top1_true_center_accuracy', 'reviewed_difficult_top1_accuracy']
+        lower = ['hard_negative_false_positive_rate', 'hard_negative_false_positive_rate_at_0_985']
+        old, candidate = results['old'], results['candidate']
+        complete = all(old[key] is not None and candidate[key] is not None for key in higher + lower)
+        no_regression = complete and all(candidate[k] >= old[k] for k in higher) and all(
+            candidate[k] <= old[k] for k in lower)
+        results['measured_improvement_without_regression'] = bool(no_regression and (
+            any(candidate[k] > old[k] for k in higher) or any(candidate[k] < old[k] for k in lower)))
+        results['models_replaced'] = False
+        results['note'] = ('Comparison only. Promotion requires independent held-out provenance for both models, '
+                           'adequate reviewed sample coverage, and the complete tracker regression.')
+        Path(args.report).write_text(json.dumps(results, indent=2), encoding='utf-8')
+        print(json.dumps(results, indent=2))
     else:
         print(json.dumps(evaluate(Path(args.database).resolve(), Path(args.model).resolve(),
                                   samples=max(100, args.samples), seed=args.seed,

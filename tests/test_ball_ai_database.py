@@ -38,6 +38,9 @@ class BallAIDatabaseTests(unittest.TestCase):
                 "SELECT ball_x, ball_y FROM ball_frames WHERE run_id='run_1' AND source_frame=14"
             ).fetchone()
             self.assertEqual(frame, (20.0, 10.0))
+            self.assertEqual(database.connection.execute('SELECT COUNT(*) FROM training_frames').fetchone()[0], 0)
+            with self.assertRaises(ValueError):
+                database.set_review('run_1', 14, 'corrected', corrected_x=21)
             database.set_review("run_1", 14, "corrected", corrected_x=21, corrected_y=11)
             training = database.connection.execute(
                 "SELECT ball_x, ball_y, review_status FROM training_frames WHERE run_id='run_1'"
@@ -47,6 +50,11 @@ class BallAIDatabaseTests(unittest.TestCase):
                 "SELECT ball_x, ball_y FROM ball_frames WHERE run_id='run_1'"
             ).fetchone()
             self.assertEqual(original, (20.0, 10.0))
+            database.set_review('run_1', 14, 'accepted')
+            self.assertEqual(database.connection.execute('SELECT ball_x, ball_y FROM training_frames').fetchone(),
+                             (20., 10.))
+            database.set_review('run_1', 14, 'rejected')
+            self.assertEqual(database.connection.execute('SELECT COUNT(*) FROM training_frames').fetchone()[0], 0)
             database.close()
 
 

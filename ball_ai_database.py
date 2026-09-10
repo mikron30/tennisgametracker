@@ -19,7 +19,7 @@ from typing import Any, Iterable, Optional
 class BallAIDatabase:
     """Idempotently import ball-dataset JSONL manifests into SQLite."""
 
-    SCHEMA_VERSION = 1
+    SCHEMA_VERSION = 2
 
     def __init__(self, database_path: str | Path) -> None:
         self.database_path = Path(database_path).expanduser().resolve()
@@ -94,6 +94,12 @@ class BallAIDatabase:
             -- Hard negatives preserve reviewed *false detections* rather
             -- than merely dropping them from the positive tracker labels.
             -- The patch model reads these rows explicitly during training.
+            CREATE TABLE IF NOT EXISTS reviewed_image_sources (
+                image_path TEXT PRIMARY KEY,
+                video_path TEXT NOT NULL,
+                source_frame INTEGER NOT NULL,
+                frame_convention TEXT NOT NULL DEFAULT 'zero-based source frame'
+            );
             CREATE TABLE IF NOT EXISTS hard_negative_patches (
                 image_path TEXT NOT NULL,
                 source_frame INTEGER NOT NULL,
@@ -121,15 +127,16 @@ class BallAIDatabase:
             CREATE INDEX IF NOT EXISTS idx_ball_frames_point
                 ON ball_frames(run_id, point_index, source_frame);
 
-            CREATE VIEW IF NOT EXISTS training_frames AS
+            DROP VIEW IF EXISTS training_frames;
+            CREATE VIEW training_frames AS
                 SELECT
                     f.run_id,
                     f.source_frame,
                     f.image_path,
                     f.image_width,
                     f.image_height,
-                    COALESCE(r.corrected_x, f.ball_x) AS ball_x,
-                    COALESCE(r.corrected_y, f.ball_y) AS ball_y,
+                    CASE WHEN r.review_status = 'corrected' THEN r.corrected_x ELSE f.ball_x END AS ball_x,
+                    CASE WHEN r.review_status = 'corrected' THEN r.corrected_y ELSE f.ball_y END AS ball_y,
                     f.radius_hint,
                     f.bbox_x1,
                     f.bbox_y1,
@@ -141,9 +148,9 @@ class BallAIDatabase:
                 FROM ball_frames AS f
                 LEFT JOIN label_reviews AS r
                     ON r.run_id = f.run_id AND r.source_frame = f.source_frame
-                WHERE f.label_status = 'tracked'
-                  AND f.tracking_active = 1
-                  AND COALESCE(r.review_status, 'unreviewed') != 'rejected';
+                WHERE r.review_status IN ('accepted', 'corrected')
+                  AND (r.review_status != 'corrected' OR
+                       (r.corrected_x IS NOT NULL AND r.corrected_y IS NOT NULL));
             """
         )
         self.connection.execute(
@@ -310,6 +317,8 @@ class BallAIDatabase:
         """Store a review without ever changing the original tracker label."""
         if review_status not in {"unreviewed", "accepted", "rejected", "corrected"}:
             raise ValueError("Invalid review status")
+        if review_status == 'corrected' and (corrected_x is None or corrected_y is None):
+            raise ValueError("Corrected positives require both coordinates")
         self.connection.execute(
             """
             INSERT INTO label_reviews(
