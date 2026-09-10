@@ -300,9 +300,10 @@ class InteractiveBallAnalyzer:
         self._contact_local_ai_cooldown_until_frame = -1000000
         self._contact_local_ai_radius = 450.0
         self._contact_local_ai_min_score = 0.985
-        # Debug-only reference to the normal HSV/contact candidate that caused
-        # CONTACT_LOCAL_AI to arm. It is populated only while Local AI ranks
-        # that same frame and never participates in candidate selection.
+        # Reference to the normal HSV/contact candidate that caused
+        # CONTACT_LOCAL_AI to arm. It exists only while Local AI ranks that
+        # same first frame and may break a near-tie in favour of independent
+        # HSV+AI agreement; it never steers later AI-history frames.
         self._contact_local_ai_debug_normal_candidate = None
         self._local_ai_frame_buffer = frame_buffer(12)
         self._local_ai_recovery_count = 0
@@ -1654,14 +1655,13 @@ class InteractiveBallAnalyzer:
         else:
             eligible.sort(key=lambda item: (float(item["pred_dist"]), -item["score"]))
 
-        # CONTACT_LOCAL_AI_POST_SERVE_CONSENSUS_V1
-        # On the verified serve-launch frame the normal tracker has already
-        # produced an airborne candidate. If Local AI independently gives a
-        # candidate at essentially the same position a score tied with its
-        # best candidate, prefer that cross-detector agreement over the
-        # anchor-distance tie-break. This is intentionally limited to the
-        # short post-serve launch lock and only when no AI trajectory exists
-        # yet. Candidate size/area is not used here.
+        # CONTACT_LOCAL_AI_FIRST_FRAME_CONSENSUS_V2
+        # On the first Local-AI frame, the normal tracker has independently
+        # produced the contact hypothesis that armed AI. If AI also finds a
+        # near-identical candidate with a score tied with its best candidate,
+        # prefer that cross-detector agreement over anchor distance. This is
+        # intentionally limited to the first AI step (predicted is None), so a
+        # later bad HSV hypothesis cannot steer an established AI trajectory.
         debug_normal_candidate = getattr(
             self, "_contact_local_ai_debug_normal_candidate", None
         )
@@ -1669,8 +1669,7 @@ class InteractiveBallAnalyzer:
         if (
                 debug_normal_candidate is not None and
                 eligible and
-                predicted is None and
-                current <= int(getattr(self, "_post_serve_launch_lock_until_frame", -1))):
+                predicted is None):
             ai_tie_margin = 1.0e-4
             consensus_pool = [
                 item for item in eligible

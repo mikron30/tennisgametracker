@@ -61,6 +61,42 @@ class PhysicalValidationTests(unittest.TestCase):
         self.assertEqual(analyzer.ball_velocity_history, [10.] * 5)
         self.assertEqual(analyzer.last_motion['distance'], 10)
 
+    def test_first_contact_frame_prefers_ai_candidate_confirming_normal_tracker(self):
+        analyzer = InteractiveBallAnalyzer.__new__(InteractiveBallAnalyzer)
+        analyzer._force_local_ai_range = (4100, 4110)
+        analyzer._force_local_ai_history = []
+        analyzer.ball_center = (2214, 860)
+        analyzer.ball_size = 401.0
+        analyzer.ball_velocity_history = [31.3, 38.2, 39.2, 46.3, 35.8]
+        analyzer.last_motion = {'dx': -16, 'dy': 32, 'distance': 35.8}
+        analyzer.motion_history = []
+        analyzer._contact_local_ai_debug_normal_candidate = (2141, 743)
+        analyzer._player_point_zone = lambda point: None
+        analyzer._candidate_motion_metrics = lambda *a, **k: {'mean': 20., 'max': 100.}
+
+        class Scorer:
+            _config = {}
+            def _score(self, *args):
+                return [
+                    {'x': 2221, 'y': 924, 'area': 225., 'ai_score': 1.0},
+                    {'x': 2139, 'y': 740, 'area': 521., 'ai_score': 1.0},
+                    {'x': 2217, 'y': 924, 'area': 220., 'ai_score': 0.999996},
+                ]
+
+        analyzer.local_ai_recovery = Scorer()
+        analyzer.frame_count = 4100
+        candidates = [
+            {'x': 2221, 'y': 924},
+            {'x': 2139, 'y': 740},
+            {'x': 2217, 'y': 924},
+        ]
+        with patch('ball_ai_recovery_probe.collect_candidates', return_value=candidates):
+            selected = analyzer._force_local_ai_frame(
+                np.zeros((1200, 2400, 3), np.uint8), (2214, 860)
+            )
+        self.assertEqual(selected, (2139, 740))
+        self.assertEqual(analyzer._force_local_ai_history[-1]['pos'], (2139, 740))
+
 
 if __name__ == '__main__':
     unittest.main()
