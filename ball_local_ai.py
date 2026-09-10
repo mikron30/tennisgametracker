@@ -87,6 +87,45 @@ def _model_class():
     return BallPatchCNN
 
 
+def _legacy_model_class():
+    """Architecture used by early 48-feature local-AI checkpoints."""
+    torch, nn, _, _, _ = _torch()
+
+    class LegacyBallPatchCNN(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.features = nn.Sequential(
+                nn.Conv2d(3, 20, 5, padding=2), nn.ReLU(), nn.MaxPool2d(2),
+                nn.Conv2d(20, 36, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),
+                nn.Conv2d(36, 48, 3, padding=1), nn.ReLU(),
+                nn.AdaptiveAvgPool2d((1, 1)),
+            )
+            self.classifier = nn.Linear(48, 1)
+
+        def forward(self, batch):
+            return self.classifier(self.features(batch).flatten(1)).squeeze(1)
+
+    return LegacyBallPatchCNN
+
+
+def _checkpoint_architecture(checkpoint):
+    """Identify supported patch-CNN generations from classifier shape."""
+    state_dict = checkpoint.get('state_dict') or {}
+    weight = state_dict.get('classifier.weight')
+    shape = getattr(weight, 'shape', None)
+    if shape is None or len(shape) != 2:
+        raise RuntimeError('Unsupported local-AI checkpoint: missing classifier.weight shape')
+    in_features = int(shape[1])
+    if in_features == 48:
+        return 'legacy-global-average-pool'
+    current_features = 48 * (PATCH_SIZE // 4) * (PATCH_SIZE // 4)
+    if in_features == current_features:
+        return 'spatial-center-aware'
+    raise RuntimeError(
+        f'Unsupported local-AI checkpoint classifier width: {in_features}'
+    )
+
+
 @dataclass(frozen=True)
 class TrainingRow:
     image_path: str
@@ -338,8 +377,16 @@ def _load_model(model_path: Path, torch, *, return_metadata=False):
         checkpoint = torch.load(model_path, map_location="cpu", weights_only=True)
     except TypeError:  # torch versions before weights_only support
         checkpoint = torch.load(model_path, map_location="cpu")
-    model = _model_class()()
+    architecture = _checkpoint_architecture(checkpoint)
+    model_factory = (
+        _legacy_model_class()
+        if architecture == 'legacy-global-average-pool'
+        else _model_class()
+    )
+    model = model_factory()
     model.load_state_dict(checkpoint["state_dict"])
+    checkpoint = dict(checkpoint)
+    checkpoint.setdefault('model_architecture', architecture)
     loaded = (device, model.to(device).eval())
     return (*loaded, checkpoint) if return_metadata else loaded
 

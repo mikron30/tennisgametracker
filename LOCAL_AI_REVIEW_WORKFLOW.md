@@ -46,7 +46,8 @@ appearance example. Negatives must lack a ball at the candidate center.
 Training and patch evaluation use the dedicated Python 3.10 AI environment.
 Video extraction and tracker tests use the main Python environment with OpenCV.
 
-The draft runtime guard is in `proposals/local_ai_physics.patch`. It is not
-enabled in the tracker. `git apply --ignore-space-change --check` validates its
-applicability despite Windows line endings; full video regression is still
-required before enabling it.
+The runtime physical/temporal guard is implemented on the AI-recovery WIP
+branch. It is deliberately not promoted to the production branch until the
+complete video regression passes. AI confidence alone is not sufficient to
+change the trusted trajectory, and an AI miss preserves the pre-recovery track
+state instead of committing the rejected HSV hypothesis.

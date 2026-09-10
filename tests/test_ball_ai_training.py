@@ -3,10 +3,25 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from ball_local_ai import TrainingRow, reviewed_split, train
+from ball_local_ai import TrainingRow, _checkpoint_architecture, reviewed_split, train
+
+
+class _ShapeOnlyWeight:
+    def __init__(self, width):
+        self.shape = (1, width)
 
 
 class ReviewedTrainingTests(unittest.TestCase):
+    def test_checkpoint_architecture_supports_incumbent_and_current_models(self):
+        self.assertEqual(
+            _checkpoint_architecture({'state_dict': {'classifier.weight': _ShapeOnlyWeight(48)}}),
+            'legacy-global-average-pool',
+        )
+        self.assertEqual(
+            _checkpoint_architecture({'state_dict': {'classifier.weight': _ShapeOnlyWeight(48 * 24 * 24)}}),
+            'spatial-center-aware',
+        )
+
     def test_split_keeps_all_labels_from_same_video_together(self):
         rows = [TrainingRow(f'{g}.png', 10, 10, g) for g in ['a', 'b', 'c']]
         patches = lambda database, table: [TrainingRow(r.image_path, 80 if table == 'hard_negative_patches' else 12,

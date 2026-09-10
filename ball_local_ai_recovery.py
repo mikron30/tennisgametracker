@@ -23,6 +23,40 @@ import numpy as np
 from ball_ai_recovery_probe import DEFAULT_MODES, collect_candidates
 
 
+def validate_ai_step(point, frame, history, *, prior_speed=0.0, motion=None):
+    """Physical gate independent of appearance score; never mutates history.
+
+    Speed bounds allow turns in any direction, including racket contacts and
+    bounces. Image change supports a turn but cannot excuse a teleport. Missing
+    motion is uncertainty, not evidence that a patch moved.
+    """
+    if not history:
+        return "no-trusted-anchor"
+    last = history[-1]
+    gap = int(frame) - int(last['frame'])
+    if gap <= 0:
+        return "noncausal-step"
+    speed = max(0.0, float(prior_speed))
+    if len(history) >= 2:
+        prev = history[-2]
+        speed = max(speed, math.dist(last['pos'], prev['pos']) /
+                    max(1, int(last['frame']) - int(prev['frame'])))
+    step = math.dist(point, last['pos'])
+    # Bound uncertainty growth: an old anchor is not a licence to search the
+    # entire court and commit a high-scoring background patch.
+    cap = max(60.0, speed * 3.5 + 25.0) * min(gap, 4)
+    if step > cap:
+        return "unsupported-jump"
+    moving_image = motion is not None and motion['mean'] >= 1.0 and motion['max'] >= 12.0
+    if motion is not None and not moving_image:
+        return "no-image-motion"
+    if len(history) >= 2 and all(math.dist(point, item['pos']) < 3.0 for item in history[-2:]):
+        return "stationary-ai-path"
+    if speed >= 3.0 and step < 3.0 and not moving_image:
+        return "stationary-after-flight"
+    return None
+
+
 class LocalBallAIRecovery:
     """Recover a short, physically continuous ball path after a bad track."""
 
@@ -613,6 +647,22 @@ class LocalBallAIRecovery:
                     diagnostics[-1]["selected_rejected"] = (
                         f"path-step {step:.1f}px > {max_step:.1f}px"
                     )
+                    continue
+
+            trusted = [
+                {"frame": item["frame"], "pos": (item["x"], item["y"])}
+                for item in accepted
+            ]
+            if not trusted:
+                for earlier in samples:
+                    pos = self._sample_normal_position(earlier)
+                    if int(earlier["frame"]) < sample_frame and pos is not None:
+                        if corridor_info is None or int(earlier["frame"]) <= corridor_info["last_good_frame"]:
+                            trusted.append({"frame": int(earlier["frame"]), "pos": pos})
+            if len(trusted) >= 2 and any(self._sample_normal_position(item) is not None for item in samples):
+                rejection_reason = validate_ai_step(point, sample_frame, trusted)
+                if rejection_reason:
+                    diagnostics[-1]["selected_rejected"] = rejection_reason
                     continue
 
             accepted.append({**selected, "frame": sample_frame})

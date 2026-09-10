@@ -21,7 +21,7 @@ from typing import Tuple, Optional
 
 from player_racket_tracker import PlayerRacketTracker
 from ball_dataset_exporter import BallDatasetExporter
-from ball_local_ai_recovery import LocalBallAIRecovery, frame_buffer
+from ball_local_ai_recovery import LocalBallAIRecovery, frame_buffer, validate_ai_step
 
 if hasattr(cv2, "setLogLevel"):
     cv2.setLogLevel(0)
@@ -1523,25 +1523,11 @@ class InteractiveBallAnalyzer:
         from ball_ai_recovery_probe import collect_candidates
 
         history = list(getattr(self, "_force_local_ai_history", []) or [])
-        if history and int(history[-1].get("frame", -1000000)) != current - 1:
-            if bool(getattr(self, "_force_local_ai_allow_history_gap", False)) and previous_position is not None:
-                # The previous frame was handled by the normal tracker.  Use that
-                # trusted result to bridge AI history so prediction survives misses.
-                bridge_frame = current - 1
-                bridge_pos = tuple(previous_position)
-                history.append({
-                    "frame": bridge_frame,
-                    "pos": bridge_pos,
-                    "score": 1.0,
-                    "normal_bridge": True,
-                })
-                history = history[-4:]
-                print(
-                    f"[CONTACT_AI_HISTORY_BRIDGE] f{current}: "
-                    f"using normal f{bridge_frame} pos={bridge_pos}"
-                )
-            else:
-                history = []
+        # Keep the last validated history across misses. Normal HSV positions
+        # during recovery are hypotheses and must not bridge this history.
+        if not history and previous_position is not None:
+            history = [{"frame": current - 1, "pos": tuple(previous_position)}]
+        self._force_local_ai_history = history
 
         anchor = tuple(history[-1]["pos"]) if history else (
             tuple(previous_position) if previous_position is not None else None
@@ -1607,19 +1593,12 @@ class InteractiveBallAnalyzer:
         if predicted is not None:
             tolerance = max(120.0, min(300.0, previous_speed * 1.8 + 60.0))
 
-        continuity_cap = None
-        if predicted is None and bool(getattr(self, "_force_local_ai_continuity_guard", False)):
-            prior_motion = dict(getattr(self, "last_motion", {}) or {})
-            tracker_speed = float(prior_motion.get("distance", 0.0) or 0.0)
-            recent = [
-                float(v) for v in list(getattr(self, "ball_velocity_history", []) or [])[-5:]
-                if v is not None
-            ]
-            recent_median = float(np.median(recent)) if recent else tracker_speed
-            continuity_cap = min(
-                float(radius),
-                max(180.0, tracker_speed * 3.0 + 60.0, recent_median * 3.5 + 40.0),
-            )
+        recent = list(getattr(self, "ball_velocity_history", []) or [])[-5:]
+        prior_speed = float(np.median(recent)) if recent else 0.0
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        previous_gray = getattr(self, '_local_ai_tight_roi_previous_gray', None)
+        if previous_gray is None:
+            previous_gray = getattr(self, '_prev_frame_gray', None)
 
         eligible = []
         continuity_rejected = 0
@@ -1632,15 +1611,13 @@ class InteractiveBallAnalyzer:
                 continue
 
             anchor_dist = math.hypot(point[0] - anchor[0], point[1] - anchor[1])
-            if continuity_cap is not None:
-                # No established AI trajectory yet: stay local to the trusted
-                # ball.  Large first-step jumps require near-certain AI confidence.
-                if anchor_dist > float(continuity_cap):
-                    continuity_rejected += 1
-                    continue
-                if anchor_dist > 140.0 and score < 0.995:
-                    continuity_rejected += 1
-                    continue
+            motion = self._candidate_motion_metrics(
+                gray, point[0], point[1], previous_gray=previous_gray)
+            rejection = validate_ai_step(
+                point, current, history, prior_speed=prior_speed, motion=motion)
+            if rejection:
+                continuity_rejected += 1
+                continue
 
             pred_dist = None
             cosine = None
@@ -1656,8 +1633,8 @@ class InteractiveBallAnalyzer:
                         cosine = (
                             previous_vector[0] * sx + previous_vector[1] * sy
                         ) / (previous_speed * step)
-                        if cosine < -0.20:
-                            continue
+                        # A supported physical step may reverse at contact.
+                        # The speed/image gate above remains mandatory.
 
             eligible.append({
                 "candidate": candidate,
@@ -25925,13 +25902,13 @@ class InteractiveBallAnalyzer:
                                     # AI is an assist: if it has no accepted candidate,
                                     # keep the normal tracker result for this frame.
                                     self._restore_tracking_state_for_provisional_guard(
-                                        post_track_snapshot
+                                        pre_track_snapshot
                                     )
-                                    tracked_position = rejected_hsv
+                                    tracked_position = prev_ball_center
                                     contact_local_ai = False
                                     print(
                                         f"[CONTACT_LOCAL_AI_FALLBACK] f{self.frame_count}: "
-                                        f"AI miss; keeping normal={tracked_position}"
+                                        f"AI miss; preserving trusted position={tracked_position}"
                                     )
                     if self.local_ai_recovery is not None and self._local_ai_frame_buffer:
                         self._local_ai_frame_buffer[-1]["normal_position"] = (
