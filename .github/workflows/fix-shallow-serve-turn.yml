@@ -25,3 +25,4 @@ jobs:
           tests/test_shallow_serve_turn_service_line.py
           tests/test_recovered_serve_scoring.py
           tests/test_ai_physical_validation.py
+          tests/test_tracking_audit.py

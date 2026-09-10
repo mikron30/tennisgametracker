@@ -74,5 +74,36 @@ class TrackingAuditTests(unittest.TestCase):
         self.assertEqual(endpoints[0]["end_position"], [2022, 513])
 
 
+class SequentialEventDecodeTests(unittest.TestCase):
+    def test_overlapping_windows_use_one_decode_and_correct_frame_mapping(self):
+        from unittest.mock import patch, MagicMock
+        import numpy as np
+        from tracking_audit import _decode_event_windows
+        cap = MagicMock()
+        cap.isOpened.return_value = True
+        cap.read.side_effect = [(True, np.full((2, 2, 3), i)) for i in range(8)]
+        with patch('tracking_audit.cv2.VideoCapture', return_value=cap) as opened:
+            windows = list(_decode_event_windows('unused', [(3, 5), (4, 7), (8, 8)]))
+        self.assertEqual(list(windows[0]), [3, 4, 5])
+        self.assertEqual(int(windows[0][3][0, 0, 0]), 2)
+        self.assertEqual(int(windows[1][4][0, 0, 0]), 3)
+        self.assertEqual(int(windows[2][8][0, 0, 0]), 7)
+        self.assertEqual(cap.read.call_count, 8)
+        opened.assert_called_once()
+        cap.set.assert_not_called()
+        cap.release.assert_called_once()
+
+    def test_short_video_fails_instead_of_silently_rendering_blank_tiles(self):
+        from unittest.mock import patch, MagicMock
+        from tracking_audit import _decode_event_windows
+        cap = MagicMock()
+        cap.isOpened.return_value = True
+        cap.read.return_value = (False, None)
+        with patch('tracking_audit.cv2.VideoCapture', return_value=cap):
+            with self.assertRaisesRegex(RuntimeError, 'tracker frame 1'):
+                list(_decode_event_windows('unused', [(3, 5)]))
+        cap.release.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()
