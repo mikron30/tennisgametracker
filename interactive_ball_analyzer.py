@@ -185,6 +185,8 @@ class _QuietTrackerOutput:
             text.startswith("[POINT_END]") or
             text.startswith("[TRACKING_START]") or
             text.startswith("[SERVE_START_") or
+            text.startswith("[SERVE_STANCE_") or
+            text.startswith("[SERVE STANCE V3]") or
             text.startswith("[BALL_LOST]") or
             text.startswith("[BALL_LOSS_DIAGNOSTIC]") or
             text.startswith("[JUMP_REJECTED]") or
@@ -22706,6 +22708,9 @@ class InteractiveBallAnalyzer:
         if not suppress_out_bounce:
             out_bounce_detected, out_bounce_reason = self._detect_out_of_court_bounce(ball_position, frame)
             if out_bounce_detected:
+                from out_bounce_verification import recover_continuing_ball
+                if recover_continuing_ball(self, ball_position):
+                    return False, "Out candidate replaced by continuing ball"
                 return True, out_bounce_reason
         
         # Check if ball is in or just above the marked net area.
@@ -22924,6 +22929,9 @@ class InteractiveBallAnalyzer:
         if not suppress_out_bounce:
             out_bounce_detected, out_bounce_reason = self._detect_out_of_court_bounce(ball_position, frame)
             if out_bounce_detected:
+                from out_bounce_verification import recover_continuing_ball
+                if recover_continuing_ball(self, ball_position):
+                    return False, "Out candidate replaced by continuing ball"
                 return True, out_bounce_reason
 
         if self._mark_serve_net_contact_candidate(ball_position, frame):
