@@ -29,3 +29,4 @@ jobs:
           tests/test_out_bounce_motion_consistency.py
           tests/test_night_serve_geometry.py
           tests/test_out_bounce_verification.py
+          tests/test_tracking_evidence.py

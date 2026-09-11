@@ -252,6 +252,18 @@ def evaluate_serve_stance(analyzer, serve_position, frame) -> Dict:
         result.update(decision="hold", reason=f"{side} player confidence too low")
         return result
 
+    # A weak HOG match on an empty court patch is not a verified server.
+    # Strong detections can certify a stationary server; weaker matches need
+    # independent motion inside their box before entering the legal cache.
+    night = str(getattr(analyzer, 'config_file', '')).replace('\\', '/').split('/')[-1] == 'hsv_config_04_left_night.json'
+    if night and result["confidence"] < 0.60:
+        from tracking_evidence import player_box_motion
+        support = player_box_motion(analyzer, track.bbox)
+        if support is None or support < 0.01:
+            analyzer._serve_stance_last_valid = None
+            result.update(decision="hold", reason=f"weak player box lacks motion support ({support})")
+            return result
+
     feet = getattr(track, "shoes", None)
     if feet is None:
         x, y, w, h = [float(v) for v in track.bbox]

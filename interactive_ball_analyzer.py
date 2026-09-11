@@ -7265,6 +7265,14 @@ class InteractiveBallAnalyzer:
         current_metrics = self._collect_override_candidate_metrics(
             current_pos, current_area, prev_pos, predicted_point, frame_gray
         )
+        if self._is_night_session_config():
+            from tracking_evidence import unsupported_size_collapse
+            if unsupported_size_collapse(float(override['area']), float(current_area),
+                                         current_metrics, override_metrics):
+                print(f"Frame {self.frame_count}: [HSV SIZE COLLAPSE REJECT] "
+                      f"keeping={current_pos} area={current_area} "
+                      f"rejected={override['pos']} area={override['area']}")
+                return False
         night_far_baseline_dynamic_current = self._night_far_baseline_dynamic_current_lock(
             label,
             current_pos,
