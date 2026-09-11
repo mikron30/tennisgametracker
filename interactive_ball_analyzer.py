@@ -16265,6 +16265,7 @@ class InteractiveBallAnalyzer:
             return None
 
         frame_height, frame_width = frame.shape[:2]
+        committed_frame_origin = tuple(self.ball_center) if self.ball_center is not None else None
         search_frame = frame
         search_radius = None
         x1, y1 = 0, 0
@@ -21481,6 +21482,16 @@ class InteractiveBallAnalyzer:
             # Log motion metrics and detect focus loss spikes
             focus_loss_triggered = False
             if not allow_inactive:
+                # Late HSV replacements may overwrite loop-local dx/dy or prev_pos.
+                # Commit one coherent vector from the frame-entry anchor to the
+                # selected ball, rather than mixing alternate hypotheses.
+                if committed_frame_origin is not None and self.ball_center is not None:
+                    prev_pos = committed_frame_origin
+                    dx = self.ball_center[0] - prev_pos[0]
+                    dy = self.ball_center[1] - prev_pos[1]
+                    velocity = math.hypot(dx, dy)
+                    direction_deg = math.degrees(math.atan2(dy, dx))
+                    self.last_delta = (dx, dy)
                 focus_loss_triggered = self.log_motion_metrics(prev_pos, dx, dy, velocity, direction_deg)
                 if focus_loss_triggered and (serve_contact_grace or rally_contact_grace):
                     self.focus_loss_active = False
@@ -25566,6 +25577,13 @@ class InteractiveBallAnalyzer:
                 # Require consistent motion in the configured serve direction before starting.
                 # A single detection (ball just sitting in serve area) must NOT trigger tracking.
                 potential_serve = self.detect_serve_position(frame)
+                if potential_serve and self._is_night_session_config():
+                    from serve_stance_guard import evaluate_serve_stance
+                    stance = evaluate_serve_stance(self, potential_serve, frame)
+                    if stance['decision'] in ('hold', 'reject'):
+                        print(f"[SERVE STANCE V3] f{self.frame_count}: {stance['reason']}")
+                        potential_serve = None
+                        scan_position_history = []
                 if potential_serve:
                     scan_position_history.append(potential_serve)
                     if len(scan_position_history) > 10:
@@ -26541,6 +26559,13 @@ class InteractiveBallAnalyzer:
                     lock_history=serve_position_history if serve_candidate_lock_active else None,
                     lock_miss_frames=serve_candidate_lock_miss_frames,
                 )
+                if potential_serve and self._is_night_session_config():
+                    from serve_stance_guard import evaluate_serve_stance
+                    stance = evaluate_serve_stance(self, potential_serve, frame)
+                    if stance['decision'] in ('hold', 'reject'):
+                        print(f"[SERVE STANCE V3] f{self.frame_count}: {stance['reason']}")
+                        potential_serve = None
+                        clear_waiting_serve_history()
                 if potential_serve:
                     serve_candidate_lock_miss_frames = 0
                     self.waiting_serve_candidate = potential_serve
