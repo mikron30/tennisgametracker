@@ -35,3 +35,33 @@ def test_multiple_moving_blobs_are_ambiguous():
     a=SimpleNamespace(ball_center=(450,100),frame_count=1)
     find_receiver_ball(a,frame([(440,100),(490,120)]));a.frame_count=2
     assert find_receiver_ball(a,frame([(437,104),(487,124)])) is None
+
+
+def test_recovery_carries_measured_motion_to_commit_and_arbitration():
+    from interactive_ball_analyzer import InteractiveBallAnalyzer
+    a=InteractiveBallAnalyzer.__new__(InteractiveBallAnalyzer)
+    a.ball_center=(450,100);a.frame_count=1
+    first=frame([(440,100)]);second=frame([(437,104)])
+    find_receiver_ball(a,first);a.frame_count=2
+    candidate=find_receiver_ball(a,second)
+    expected=cv2.absdiff(cv2.cvtColor(first,cv2.COLOR_BGR2GRAY)[96:113,429:446],
+                         cv2.cvtColor(second,cv2.COLOR_BGR2GRAY)[96:113,429:446])
+    assert candidate['motion_max']==float(expected.max())
+    assert candidate['motion_mean']==float(expected.mean())
+    assert candidate['motion_max']>=50
+    a._local_ai_tight_roi_attempt_frame=2
+    a._update_recovered_motion=lambda old,new: None
+    a._activate_regular_hsv=lambda: None
+    a._commit_night_visible_ball_recovery(candidate,second)
+    assert a._last_tracked_candidate_motion_max==candidate['motion_max']
+    a._finalize_pending_provisional_static_candidate=lambda: False
+    a._player_point_zone=lambda p:'racket_fragment'
+    a._try_active_tight_local_ai_hold=lambda *args,**kwargs: None
+    a._local_ai_recovery_reason=lambda *args: None
+    a._maybe_clear_post_serve_pre_net_recovery=lambda *args,**kwargs: None
+    def unexpected_restore(snapshot):
+        raise AssertionError('measured moving candidate was rolled back')
+    a._restore_tracking_state_for_provisional_guard=unexpected_restore
+    selected=a._try_local_ai_recovery((450,100),candidate['pos'],5,
+                                     pre_track_snapshot={'ball_center':(450,100)},frame=second)
+    assert selected==candidate['pos']==a.ball_center

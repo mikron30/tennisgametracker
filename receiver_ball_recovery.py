@@ -35,6 +35,9 @@ def find_receiver_ball(analyzer, frame):
                             source='receiver_temporal',recovery_label='RECEIVER TEMPORAL RECOVER'))
     prior=getattr(analyzer,'_receiver_ball_probe',None)
     now=int(analyzer.frame_count)
+    previous_gray = getattr(analyzer, '_receiver_ball_probe_gray', None)
+    current_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    analyzer._receiver_ball_probe_gray = current_gray
     analyzer._receiver_ball_probe=(now,choices)
     if prior is None or not 1<=now-prior[0]<=2:
         return None
@@ -44,4 +47,16 @@ def find_receiver_ball(analyzer, frame):
             distance=math.dist(c['pos'],old['pos'])
             if 2<=distance<=65 and .35<=c['area']/old['area']<=2.8:
                 pairs.append(c)
-    return pairs[0] if len(pairs)==1 else None
+    if len(pairs) != 1 or previous_gray is None or previous_gray.shape != current_gray.shape:
+        return None
+    candidate = dict(pairs[0])
+    cx, cy = candidate['pos']
+    # Use the same image pair that supplied temporal confirmation. Other
+    # recovery paths may already have overwritten the tracker gray buffer.
+    patch = np.s_[max(0,cy-8):cy+9, max(0,cx-8):cx+9]
+    diff = cv2.absdiff(previous_gray[patch], current_gray[patch])
+    candidate['motion_mean'] = float(np.mean(diff))
+    candidate['motion_max'] = float(np.max(diff))
+    candidate['motion_source'] = 'receiver_probe_frame_pair'
+    candidate['motion_frames'] = (prior[0], now)
+    return candidate
