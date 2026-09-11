@@ -16286,6 +16286,16 @@ class InteractiveBallAnalyzer:
         if hasattr(self, '_prev_frame_gray') and self._prev_frame_gray is not None:
             frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
+        if (not allow_inactive and self._is_night_session_config()
+                and not getattr(self, '_awaiting_serve_bounce', False)
+                and int(getattr(self, '_player_reacq_protect_until_frame', -1)) >= self.frame_count):
+            from receiver_ball_recovery import find_receiver_ball
+            receiver_candidate = find_receiver_ball(self, frame)
+            if receiver_candidate is not None:
+                return self._commit_night_visible_ball_recovery(receiver_candidate, frame)
+        else:
+            self._receiver_ball_probe = None
+
         outbound_contact_ball = self._find_night_contact_outbound_continuation(
             frame, frame_gray
         )
