@@ -74,3 +74,25 @@ the correct winner. Full-video regression and tracking recovery remain open.
 Focused tests: 50 passed, including the replay that fails on the old method,
 a consistent real out bounce and equivalent angles wrapped by 360 degrees.
 Audit sheets now decode sequentially with corrected frame mapping as well.
+
+
+## V2 source-video result — September 11: FAILED promotion gate
+
+The user replayed frames 4000–4499 and supplied serve_check_v2.zip. The process
+exited 0 and sequential event images are now visually clean. This does not
+mean tracking is correct. The f4292 mixed-motion OUT was suppressed, but the
+same rally ended at f4314 instead, with the marker on the racket while the
+near player visibly carries a ball in his other hand. Its stored winner also
+changed from P1 to P2; neither result is validated.
+
+A false subsequent serve is accepted at f4375 (history start f4370) while the
+near player is walking, producing another false OUT at f4422. A further
+provisional start occurs at f4439. Event counts fell from 9/7 high-severity
+to 6/3, but that is not a correctness metric. The candidate remains a draft
+and must not be promoted as a successful tracking/scoring fix.
+
+Next work must address candidate identity across racket/head occlusion and
+require serve-launch evidence independent of a rising player fragment. More
+endpoint-specific suppression alone merely shifts the error. Existing clean
+images and both logs are sufficient evidence for these failures; the user
+does not need to repeat the same audit unchanged.
