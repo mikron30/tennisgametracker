@@ -1,82 +1,33 @@
-name: Fix shallow serve turn recognition
+name: Validate shallow serve turn recognition
 
 on:
   push:
+    branches: [codex-ai-recovery-wip, codex/shallow-serve-turn-candidate]
+  pull_request:
     branches: [codex-ai-recovery-wip]
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  patch-and-test:
+  focused-regressions:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: codex-ai-recovery-wip
-          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Install deps
+      - name: Install dependencies
         run: python -m pip install -r requirements.txt pytest
-      - name: Patch shallow serve bounce recognition
-        shell: bash
-        run: |
-          python - <<'PY'
-          from pathlib import Path
-
-          path = Path('interactive_ball_analyzer.py')
-          text = path.read_text(encoding='utf-8')
-
-          old_gate = '''        if velocity < 5.0 or not (\n                soft_vertical_reversal or sharp_turn or shallow_perspective_bounce):\n            return None\n'''
-          new_gate = '''        if velocity < 5.0 or not (\n                soft_vertical_reversal or sharp_turn or shallow_serve_turn or\n                shallow_perspective_bounce):\n            return None\n'''
-          if old_gate not in text:
-              raise SystemExit('serve-turn acceptance gate not found')
-          text = text.replace(old_gate, new_gate, 1)
-
-          old_slack = '''        if (\n                shallow_perspective_bounce and\n                same_target_half and\n                net_y is not None and\n                service_y is not None):\n'''
-          new_slack = '''        if (\n                (shallow_perspective_bounce or shallow_serve_turn) and\n                same_target_half and\n                net_y is not None and\n                service_y is not None):\n'''
-          if old_slack not in text:
-              raise SystemExit('service-line slack gate not found')
-          text = text.replace(old_slack, new_slack, 1)
-          path.write_text(text, encoding='utf-8')
-
-          Path('tests/test_shallow_serve_turn_service_line.py').write_text('''import unittest\n\nimport numpy as np\n\nfrom interactive_ball_analyzer import InteractiveBallAnalyzer\n\n\nclass ShallowServeTurnServiceLineTests(unittest.TestCase):\n    def test_faster_shallow_turn_gets_service_line_slack(self):\n        analyzer = InteractiveBallAnalyzer.__new__(InteractiveBallAnalyzer)\n        analyzer.config_file = "hsv_config_04_left_night.json"\n        analyzer.frame_count = 4118\n        analyzer.point_start_frame_internal = 4077\n        analyzer._serve_phase_active = True\n        analyzer._awaiting_serve_bounce = True\n        analyzer.ball_center = (1733, 381)\n        analyzer.last_motion = {"dx": -12, "dy": 4, "distance": 12.6}\n        analyzer.prev_motion = {"dx": -10, "dy": 4, "distance": 10.8}\n        analyzer.serve_direction_dy = -1\n        analyzer._point_target_service_side = "left"\n        analyzer._serve_bounce_frame_limit = lambda: 45\n        analyzer._evaluate_target_service_box_fresh = lambda point, frame, side: (\n            False,\n            "Serve bounce outside left service box",\n            {\n                "center_x": 1930.0,\n                "service_y": 452.0,\n                "net_y": 492.5,\n                "net_margin": 38.0,\n            },\n        )\n        analyzer._net_contact_geometry = lambda point: None\n        frame = np.zeros((2160, 3840, 3), dtype=np.uint8)\n\n        event = analyzer._serve_bounce_in_from_turn_candidate(\n            (1720, 325), frame, dx=-13, dy=-56, angle_jump=95.4, velocity=57.5\n        )\n\n        self.assertIsNotNone(event)\n        self.assertEqual(event["point"], (1733, 381))\n        self.assertTrue(event["soft_vertical_reversal"])\n        self.assertTrue(event["sharp_turn"])\n        self.assertFalse(event["shallow_perspective_bounce"])\n        self.assertTrue(event["shallow_service_box_slack"])\n\n\nif __name__ == "__main__":\n    unittest.main()\n''', encoding='utf-8')
-          PY
-          python -m py_compile interactive_ball_analyzer.py
-          git diff --check
       - name: Run focused regressions
-        id: tests
-        shell: bash
-        run: |
-          set +e
-          python -m pytest -q \
-            tests/test_shallow_serve_turn_service_line.py \
-            tests/test_recovered_serve_scoring.py \
-            tests/test_ai_physical_validation.py 2>&1 | tee pytest-output.txt
-          rc=${PIPESTATUS[0]}
-          echo "$rc" > pytest-exit-code.txt
-          exit $rc
-      - name: Upload test output
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: shallow-serve-test-output
-          path: |
-            pytest-output.txt
-            pytest-exit-code.txt
-      - name: Commit validated fix
-        if: success()
-        shell: bash
-        run: |
-          rm -f .github/workflows/fix-shallow-serve-turn.yml
-          git config user.name 'chatgpt-ai-recovery'
-          git config user.email 'actions@users.noreply.github.com'
-          git add interactive_ball_analyzer.py tests/test_shallow_serve_turn_service_line.py .github/workflows/fix-shallow-serve-turn.yml
-          if git diff --cached --quiet; then
-            echo 'No changes to commit'
-            exit 0
-          fi
-          git commit -m 'Recognize shallow service-line bounce as serve in'
-          git push origin HEAD:codex-ai-recovery-wip
+        run: >-
+          python -m pytest -q
+          tests/test_shallow_serve_turn_service_line.py
+          tests/test_recovered_serve_scoring.py
+          tests/test_ai_physical_validation.py
+          tests/test_tracking_audit.py
+          tests/test_out_bounce_motion_consistency.py
+          tests/test_night_serve_geometry.py
+          tests/test_out_bounce_verification.py
+          tests/test_tracking_evidence.py
+          tests/test_receiver_ball_recovery.py

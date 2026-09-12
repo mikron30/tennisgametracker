@@ -185,6 +185,8 @@ class _QuietTrackerOutput:
             text.startswith("[POINT_END]") or
             text.startswith("[TRACKING_START]") or
             text.startswith("[SERVE_START_") or
+            text.startswith("[SERVE_STANCE_") or
+            text.startswith("[SERVE STANCE V3]") or
             text.startswith("[BALL_LOST]") or
             text.startswith("[BALL_LOSS_DIAGNOSTIC]") or
             text.startswith("[JUMP_REJECTED]") or
@@ -7022,6 +7024,13 @@ class InteractiveBallAnalyzer:
         self.direction_change_streak = 0
         self._post_reacq_frames = max(getattr(self, '_post_reacq_frames', 0), 3)
         self._last_motion_reacq_frame = self.frame_count
+        # Pair the recovery marker with the exact accepted position. The outer
+        # main-loop jump guard intentionally trusts a large same-frame motion
+        # reacquisition only when both frame and position match. Other motion
+        # reacquisition paths already maintain this pair; visible-ball recovery
+        # previously set only the frame, so a genuine recovery could be rejected
+        # after a poisoned HSV anchor.
+        self._last_motion_reacq_pos = tuple(new_pos)
         self.last_seen_frame = self.frame_count
         self._last_tracked_candidate_frame = self.frame_count
         self._last_tracked_candidate_motion_frame = self.frame_count
@@ -7263,6 +7272,14 @@ class InteractiveBallAnalyzer:
         current_metrics = self._collect_override_candidate_metrics(
             current_pos, current_area, prev_pos, predicted_point, frame_gray
         )
+        if self._is_night_session_config():
+            from tracking_evidence import unsupported_size_collapse
+            if unsupported_size_collapse(float(override['area']), float(current_area),
+                                         current_metrics, override_metrics):
+                print(f"Frame {self.frame_count}: [HSV SIZE COLLAPSE REJECT] "
+                      f"keeping={current_pos} area={current_area} "
+                      f"rejected={override['pos']} area={override['area']}")
+                return False
         night_far_baseline_dynamic_current = self._night_far_baseline_dynamic_current_lock(
             label,
             current_pos,
@@ -10772,6 +10789,31 @@ class InteractiveBallAnalyzer:
         if displacement < max(70.0, min(180.0, float(getattr(self, "ball_size", 0.0) or 0.0) * 1.5)):
             return False
 
+        # A timeout recovery can land on a compact ball-coloured point inside a
+        # player while the actual image change is the player's whole body. A
+        # very large relocation backed by broad local motion is identity repair
+        # evidence only while the motion itself remains ball-sized.
+        recovery_zone = self._player_point_zone(recovered)
+        large_relocation = displacement >= max(300.0, float(width) * 0.08)
+        player_motion_zone = recovery_zone in (
+            'player_head_hat', 'player_shoes', 'racket_fragment', 'player_body'
+        )
+        broad_player_motion = (
+            large_relocation and
+            (
+                motion_ratio >= 0.65 or
+                (player_motion_zone and motion_ratio >= 0.30)
+            )
+        )
+        if broad_player_motion:
+            print(
+                f"Frame {self.frame_count}: [TERMINAL RECOVERY REJECT] "
+                f"broad player-motion candidate={recovered} "
+                f"zone={recovery_zone or 'none'} displacement={displacement:.1f}px "
+                f"motion={motion_ratio:.3f}"
+            )
+            return False
+
         dx = recovered[0] - previous[0]
         dy = recovered[1] - previous[1]
         distance = math.hypot(dx, dy)
@@ -10995,13 +11037,42 @@ class InteractiveBallAnalyzer:
         )
         return True
 
+    def _confirmed_pending_out_endpoint(self, reason):
+        """Return V14's original bounce point only on its confirmation frame."""
+        confirm_frame = int(getattr(
+            self, '_last_confirmed_pending_out_confirm_frame', -1000000
+        ))
+        if confirm_frame != int(self.frame_count):
+            return None
+        position = getattr(self, '_last_confirmed_pending_out_position', None)
+        if not isinstance(position, (tuple, list)) or len(position) < 2:
+            return None
+        reason_text = str(reason or '')
+        expected_reason = getattr(self, '_last_confirmed_pending_out_reason', None)
+        if expected_reason is not None and reason_text != str(expected_reason):
+            return None
+        if 'bounced out of court' not in reason_text.lower():
+            return None
+        return (int(round(float(position[0]))), int(round(float(position[1]))))
+
     def _record_point_result(self, reason, end_position=None, frame=None, history_end_frame=None):
         if self._last_scored_point_end_frame == self.frame_count:
             return None
 
         requested_history_end_frame = history_end_frame
         reason_lower = (reason or "").lower()
-        end_position = self._terminal_player_overlap_position(reason, end_position, frame=frame)
+        confirmed_pending_endpoint = self._confirmed_pending_out_endpoint(reason)
+        if confirmed_pending_endpoint is not None:
+            # V15: the rebound frame proves the OUT but is not the bounce location.
+            # Preserve V14's original source point instead of letting generic
+            # terminal endpoint repair replace it with a current-frame blob.
+            end_position = confirmed_pending_endpoint
+            print(
+                f"[POINT_END POSITION OVERRIDE] f{self.frame_count}: "
+                f"using confirmed pending OUT source={end_position}"
+            )
+        else:
+            end_position = self._terminal_player_overlap_position(reason, end_position, frame=frame)
         if "video_read_failure" in reason_lower:
             outcome = self._point_outcome(
                 None,
@@ -16265,6 +16336,7 @@ class InteractiveBallAnalyzer:
             return None
 
         frame_height, frame_width = frame.shape[:2]
+        committed_frame_origin = tuple(self.ball_center) if self.ball_center is not None else None
         search_frame = frame
         search_radius = None
         x1, y1 = 0, 0
@@ -16274,6 +16346,16 @@ class InteractiveBallAnalyzer:
         frame_gray = None
         if hasattr(self, '_prev_frame_gray') and self._prev_frame_gray is not None:
             frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+        if (not allow_inactive and self._is_night_session_config()
+                and not getattr(self, '_awaiting_serve_bounce', False)
+                and int(getattr(self, '_player_reacq_protect_until_frame', -1)) >= self.frame_count):
+            from receiver_ball_recovery import find_receiver_ball
+            receiver_candidate = find_receiver_ball(self, frame)
+            if receiver_candidate is not None:
+                return self._commit_night_visible_ball_recovery(receiver_candidate, frame)
+        else:
+            self._receiver_ball_probe = None
 
         outbound_contact_ball = self._find_night_contact_outbound_continuation(
             frame, frame_gray
@@ -21481,6 +21563,16 @@ class InteractiveBallAnalyzer:
             # Log motion metrics and detect focus loss spikes
             focus_loss_triggered = False
             if not allow_inactive:
+                # Late HSV replacements may overwrite loop-local dx/dy or prev_pos.
+                # Commit one coherent vector from the frame-entry anchor to the
+                # selected ball, rather than mixing alternate hypotheses.
+                if committed_frame_origin is not None and self.ball_center is not None:
+                    prev_pos = committed_frame_origin
+                    dx = self.ball_center[0] - prev_pos[0]
+                    dy = self.ball_center[1] - prev_pos[1]
+                    velocity = math.hypot(dx, dy)
+                    direction_deg = math.degrees(math.atan2(dy, dx))
+                    self.last_delta = (dx, dy)
                 focus_loss_triggered = self.log_motion_metrics(prev_pos, dx, dy, velocity, direction_deg)
                 if focus_loss_triggered and (serve_contact_grace or rally_contact_grace):
                     self.focus_loss_active = False
@@ -22695,6 +22787,9 @@ class InteractiveBallAnalyzer:
         if not suppress_out_bounce:
             out_bounce_detected, out_bounce_reason = self._detect_out_of_court_bounce(ball_position, frame)
             if out_bounce_detected:
+                from out_bounce_verification import recover_continuing_ball
+                if recover_continuing_ball(self, ball_position):
+                    return False, "Out candidate replaced by continuing ball"
                 return True, out_bounce_reason
         
         # Check if ball is in or just above the marked net area.
@@ -22913,6 +23008,9 @@ class InteractiveBallAnalyzer:
         if not suppress_out_bounce:
             out_bounce_detected, out_bounce_reason = self._detect_out_of_court_bounce(ball_position, frame)
             if out_bounce_detected:
+                from out_bounce_verification import recover_continuing_ball
+                if recover_continuing_ball(self, ball_position):
+                    return False, "Out candidate replaced by continuing ball"
                 return True, out_bounce_reason
 
         if self._mark_serve_net_contact_candidate(ball_position, frame):
@@ -23854,6 +23952,9 @@ class InteractiveBallAnalyzer:
             return None
         if self.point_start_frame_internal is None:
             return None
+        # Match the OUT path: a confirmed rally hit ends serve-only inference.
+        if int(getattr(self, '_last_racket_contact_frame', -1000000)) >= int(self.point_start_frame_internal):
+            return None
         frames_since_start = self.frame_count - self.point_start_frame_internal
         if frames_since_start < 3 or frames_since_start > self._serve_bounce_frame_limit():
             return None
@@ -23869,6 +23970,14 @@ class InteractiveBallAnalyzer:
         recent_descent = incoming_dy >= 2.0 and (previous_dy >= 1.0 or incoming_dy >= 4.0)
         soft_vertical_reversal = recent_descent and dy <= -3.0 and upward_progress >= 3.0
         sharp_turn = angle_jump >= 45.0 and incoming_dy >= 1.0 and dy <= -3.0
+        # Use the same shallow-turn evidence as the OUT classifier. This must
+        # be defined locally; the OUT method's local variable is not shared.
+        shallow_serve_turn = (
+            self._is_night_session_config() and
+            incoming_dy >= 4.0 and dy <= -2.0 and
+            upward_progress >= 2.0 and velocity >= 7.0 and
+            angle_jump >= 60.0
+        )
         # At the far service box, perspective can keep screen-space Y moving upward
         # through the bounce. In that case the impact appears as a sharp speed minimum
         # followed by acceleration in the same courtward direction.
@@ -23888,7 +23997,7 @@ class InteractiveBallAnalyzer:
         # not immediately promote the same pixel patch to a serve bounce on a
         # later frame.  This is deliberately scoped to the short retry window
         # and to a nearby point, preserving genuine shallow serve turns.
-        if shallow_perspective_bounce:
+        if shallow_perspective_bounce or shallow_serve_turn:
             suppressed_frame = int(
                 getattr(self, '_last_out_bounce_suppressed_frame', -1000000)
             )
@@ -23907,6 +24016,7 @@ class InteractiveBallAnalyzer:
                     f"recent static side artifact at {bounce_point}"
                 )
                 shallow_perspective_bounce = False
+                shallow_serve_turn = False
         if shallow_perspective_bounce:
             print(
                 f"Frame {self.frame_count}: [SHALLOW SERVE BOUNCE] candidate={bounce_point} "
@@ -23914,7 +24024,8 @@ class InteractiveBallAnalyzer:
                 f"outgoing=({dx:.1f},{dy:.1f},{velocity:.1f}) angle={angle_jump:.1f}"
             )
         if velocity < 5.0 or not (
-                soft_vertical_reversal or sharp_turn or shallow_perspective_bounce):
+                soft_vertical_reversal or sharp_turn or shallow_serve_turn or
+                shallow_perspective_bounce):
             return None
 
         target_side = getattr(self, '_point_target_service_side', None)
@@ -23935,7 +24046,7 @@ class InteractiveBallAnalyzer:
         service_y = geometry.get('service_y')
         shallow_service_box_slack = False
         if (
-                shallow_perspective_bounce and
+                (shallow_perspective_bounce or shallow_serve_turn) and
                 same_target_half and
                 net_y is not None and
                 service_y is not None):
@@ -23979,6 +24090,7 @@ class InteractiveBallAnalyzer:
             'soft_vertical_reversal': soft_vertical_reversal,
             'sharp_turn': sharp_turn,
             'shallow_perspective_bounce': shallow_perspective_bounce,
+            'shallow_serve_turn': shallow_serve_turn,
         }
 
     def _commit_serve_bounce_in_event(self, event, frame):
@@ -24026,6 +24138,77 @@ class InteractiveBallAnalyzer:
             return False, None
         if getattr(self, '_last_motion_reacq_frame', -1000000) == self.frame_count:
             return False, None
+        # V14: a deep night candidate may look static exactly at the bounce.
+        # Keep that candidate briefly and confirm it only when a later, bounded
+        # opposite-direction track proves a real rebound. This runs before the
+        # legacy two-frame static-artifact wait so the original OUT location is
+        # not lost while the tracker holds the stale point for two frames.
+        pending_static_out = getattr(self, '_pending_night_static_out', None)
+        if isinstance(pending_static_out, dict):
+            try:
+                pending_frame = int(pending_static_out.get('frame', -1000000))
+                pending_pos = tuple(pending_static_out.get('position', ()))
+                pending_dx = float(pending_static_out.get('dx', 0.0) or 0.0)
+                pending_dy = float(pending_static_out.get('dy', 0.0) or 0.0)
+            except (TypeError, ValueError):
+                pending_frame = -1000000
+                pending_pos = ()
+                pending_dx = pending_dy = 0.0
+
+            pending_age = int(self.frame_count) - pending_frame
+            if pending_age < 0 or pending_age > 4 or len(pending_pos) < 2:
+                self._pending_night_static_out = None
+            elif pending_age >= 3:
+                current_dx = float(self.last_motion.get('dx', 0.0) or 0.0)
+                current_dy = float(self.last_motion.get('dy', 0.0) or 0.0)
+                current_speed = float(self.last_motion.get('distance', 0.0) or 0.0)
+                pending_speed = math.hypot(pending_dx, pending_dy)
+                displacement = math.hypot(
+                    float(ball_position[0]) - float(pending_pos[0]),
+                    float(ball_position[1]) - float(pending_pos[1]),
+                )
+                turn_angle = 0.0
+                if pending_speed > 0.0 and current_speed > 0.0:
+                    cosine = (
+                        pending_dx * current_dx + pending_dy * current_dy
+                    ) / (pending_speed * current_speed)
+                    cosine = max(-1.0, min(1.0, cosine))
+                    turn_angle = math.degrees(math.acos(cosine))
+
+                width = int(frame.shape[1]) if frame is not None else 0
+                max_rebound_step = max(180.0, float(width) * 0.055)
+                max_rebound_displacement = max(260.0, float(width) * 0.08)
+                coherent_rebound = (
+                    pending_dy >= 6.0 and
+                    current_dy <= -12.0 and
+                    turn_angle >= 120.0 and
+                    24.0 <= current_speed <= max_rebound_step and
+                    50.0 <= displacement <= max_rebound_displacement
+                )
+                if coherent_rebound:
+                    original_position = (
+                        int(round(float(pending_pos[0]))),
+                        int(round(float(pending_pos[1]))),
+                    )
+                    original_side = str(pending_static_out.get('side') or 'unknown')
+                    self._pending_night_static_out = None
+                    self.ball_center = original_position
+                    self._last_confirmed_pending_out_frame = pending_frame
+                    self._last_confirmed_pending_out_position = original_position
+                    confirmed_reason = f"Ball bounced out of court ({original_side} sideline)"
+                    self._last_confirmed_pending_out_confirm_frame = int(self.frame_count)
+                    self._last_confirmed_pending_out_reason = confirmed_reason
+                    print(
+                        f"Frame {self.frame_count}: [OUT-BOUNCE PENDING CONFIRMED] "
+                        f"source_f={pending_frame} point={original_position} side={original_side} "
+                        f"age={pending_age} rebound={tuple(ball_position)} "
+                        f"speed={current_speed:.1f}px turn={turn_angle:.1f}deg "
+                        f"displacement={displacement:.1f}px"
+                    )
+                    return True, confirmed_reason
+                if pending_age >= 4:
+                    self._pending_night_static_out = None
+
         # A static side artifact can be followed by a valid airborne candidate
         # one frame later. Do not use that artifact's stale outside position as
         # the previous leg of a sideline reversal (point 9 a prior frame).
@@ -24118,6 +24301,26 @@ class InteractiveBallAnalyzer:
         prev_dy = float(self.prev_motion.get('dy', 0.0) or 0.0)
         curr_speed = float(self.last_motion.get('distance', 0.0) or 0.0)
         prev_speed = float(self.prev_motion.get('distance', 0.0) or 0.0)
+
+        # Candidate replacement can leave a direction from one HSV hypothesis
+        # beside the displacement of another. Such a mixed record cannot
+        # establish a bounce, even if the cached angles form a sharp turn.
+        # Do not rewrite the track or infer a winner from that ambiguity.
+        for motion, step_x, step_y in (
+                (self.prev_motion, prev_dx, prev_dy),
+                (self.last_motion, curr_dx, curr_dy)):
+            direction = motion.get('direction_deg')
+            if direction is None or math.hypot(step_x, step_y) < 1.0:
+                continue
+            measured = math.degrees(math.atan2(step_y, step_x))
+            mismatch = abs((float(direction) - measured + 180.0) % 360.0 - 180.0)
+            if not math.isfinite(mismatch) or mismatch > 5.0:
+                print(
+                    f"Frame {self.frame_count}: [OUT-BOUNCE MOTION CONFLICT] "
+                    f"direction={direction} displacement=({step_x:.1f},{step_y:.1f}) "
+                    f"measured={measured:.1f}; waiting for consistent ball motion"
+                )
+                return False, None
 
         # During the initial serve flight, a rejected HSV fragment can jump
         # hundreds of pixels in one frame (point 9 a prior frame: the marker leapt to
@@ -24244,6 +24447,23 @@ class InteractiveBallAnalyzer:
                 )
             )
             if deep_static_out:
+                # V14: only arm a pending OUT when the static-looking point is
+                # still supported by a coherent descending flight. Pure side
+                # hotspots remain ordinary suppressions and never get promoted.
+                if recent_descending and curr_dy >= 6.0 and curr_speed >= 6.0:
+                    self._pending_night_static_out = {
+                        'frame': int(self.frame_count),
+                        'position': tuple(ball_position),
+                        'side': side,
+                        'dx': curr_dx,
+                        'dy': curr_dy,
+                        'speed': curr_speed,
+                    }
+                    print(
+                        f"Frame {self.frame_count}: [OUT-BOUNCE PENDING] "
+                        f"point={tuple(ball_position)} side={side} "
+                        f"motion=({curr_dx:.1f},{curr_dy:.1f}) speed={curr_speed:.1f}px"
+                    )
                 self._last_out_bounce_suppressed_frame = self.frame_count
                 self._last_out_bounce_suppressed_point = tuple(ball_position)
                 print(
@@ -25532,6 +25752,13 @@ class InteractiveBallAnalyzer:
                 # Require consistent motion in the configured serve direction before starting.
                 # A single detection (ball just sitting in serve area) must NOT trigger tracking.
                 potential_serve = self.detect_serve_position(frame)
+                if potential_serve and self._is_night_session_config():
+                    from serve_stance_guard import evaluate_serve_stance
+                    stance = evaluate_serve_stance(self, potential_serve, frame)
+                    if stance['decision'] in ('hold', 'reject'):
+                        print(f"[SERVE STANCE V3] f{self.frame_count}: {stance['reason']}")
+                        potential_serve = None
+                        scan_position_history = []
                 if potential_serve:
                     scan_position_history.append(potential_serve)
                     if len(scan_position_history) > 10:
@@ -26364,10 +26591,16 @@ class InteractiveBallAnalyzer:
                         if point_ended:
                             point_end_frame = self.frame_count
                             dur = point_end_frame - point_start_frame if point_start_frame else 0
+                            confirmed_pending_endpoint = self._confirmed_pending_out_endpoint(reason)
+                            point_end_position = (
+                                confirmed_pending_endpoint
+                                if confirmed_pending_endpoint is not None
+                                else tracked_position
+                            )
                             print(f"Frame {self.frame_count}: POINT ENDED - {reason}")
                             print(f"Point duration: {dur} frames")
-                            print(f"[POINT_END] f{self.frame_count}: reason={reason} duration={dur}f pos={tracked_position} vel={vel:.1f}px vel_hist={vel_hist_tail}")
-                            self._record_point_result(reason, end_position=tracked_position, frame=frame)
+                            print(f"[POINT_END] f{self.frame_count}: reason={reason} duration={dur}f pos={point_end_position} vel={vel:.1f}px vel_hist={vel_hist_tail}")
+                            self._record_point_result(reason, end_position=point_end_position, frame=frame)
                             reason_lower = reason.lower()
                             if "bounced twice" in reason_lower:
                                 self._serve_scan_block_until_frame = max(
@@ -26388,7 +26621,7 @@ class InteractiveBallAnalyzer:
                                 game_state = "WAITING_FOR_SERVE"
                             else:
                                 game_state = "POINT_ENDED"
-                            reset_tracking_state(hold_end_marker=True, end_position=tracked_position)
+                            reset_tracking_state(hold_end_marker=True, end_position=point_end_position)
                         else:
                             _verbose_debug_print(f"Frame {self.frame_count}: Ball tracking continued")
                 else:
@@ -26507,6 +26740,13 @@ class InteractiveBallAnalyzer:
                     lock_history=serve_position_history if serve_candidate_lock_active else None,
                     lock_miss_frames=serve_candidate_lock_miss_frames,
                 )
+                if potential_serve and self._is_night_session_config():
+                    from serve_stance_guard import evaluate_serve_stance
+                    stance = evaluate_serve_stance(self, potential_serve, frame)
+                    if stance['decision'] in ('hold', 'reject'):
+                        print(f"[SERVE STANCE V3] f{self.frame_count}: {stance['reason']}")
+                        potential_serve = None
+                        clear_waiting_serve_history()
                 if potential_serve:
                     serve_candidate_lock_miss_frames = 0
                     self.waiting_serve_candidate = potential_serve
