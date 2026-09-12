@@ -24109,6 +24109,74 @@ class InteractiveBallAnalyzer:
             return False, None
         if getattr(self, '_last_motion_reacq_frame', -1000000) == self.frame_count:
             return False, None
+        # V14: a deep night candidate may look static exactly at the bounce.
+        # Keep that candidate briefly and confirm it only when a later, bounded
+        # opposite-direction track proves a real rebound. This runs before the
+        # legacy two-frame static-artifact wait so the original OUT location is
+        # not lost while the tracker holds the stale point for two frames.
+        pending_static_out = getattr(self, '_pending_night_static_out', None)
+        if isinstance(pending_static_out, dict):
+            try:
+                pending_frame = int(pending_static_out.get('frame', -1000000))
+                pending_pos = tuple(pending_static_out.get('position', ()))
+                pending_dx = float(pending_static_out.get('dx', 0.0) or 0.0)
+                pending_dy = float(pending_static_out.get('dy', 0.0) or 0.0)
+            except (TypeError, ValueError):
+                pending_frame = -1000000
+                pending_pos = ()
+                pending_dx = pending_dy = 0.0
+
+            pending_age = int(self.frame_count) - pending_frame
+            if pending_age < 0 or pending_age > 4 or len(pending_pos) < 2:
+                self._pending_night_static_out = None
+            elif pending_age >= 3:
+                current_dx = float(self.last_motion.get('dx', 0.0) or 0.0)
+                current_dy = float(self.last_motion.get('dy', 0.0) or 0.0)
+                current_speed = float(self.last_motion.get('distance', 0.0) or 0.0)
+                pending_speed = math.hypot(pending_dx, pending_dy)
+                displacement = math.hypot(
+                    float(ball_position[0]) - float(pending_pos[0]),
+                    float(ball_position[1]) - float(pending_pos[1]),
+                )
+                turn_angle = 0.0
+                if pending_speed > 0.0 and current_speed > 0.0:
+                    cosine = (
+                        pending_dx * current_dx + pending_dy * current_dy
+                    ) / (pending_speed * current_speed)
+                    cosine = max(-1.0, min(1.0, cosine))
+                    turn_angle = math.degrees(math.acos(cosine))
+
+                width = int(frame.shape[1]) if frame is not None else 0
+                max_rebound_step = max(180.0, float(width) * 0.055)
+                max_rebound_displacement = max(260.0, float(width) * 0.08)
+                coherent_rebound = (
+                    pending_dy >= 6.0 and
+                    current_dy <= -12.0 and
+                    turn_angle >= 120.0 and
+                    24.0 <= current_speed <= max_rebound_step and
+                    50.0 <= displacement <= max_rebound_displacement
+                )
+                if coherent_rebound:
+                    original_position = (
+                        int(round(float(pending_pos[0]))),
+                        int(round(float(pending_pos[1]))),
+                    )
+                    original_side = str(pending_static_out.get('side') or 'unknown')
+                    self._pending_night_static_out = None
+                    self.ball_center = original_position
+                    self._last_confirmed_pending_out_frame = pending_frame
+                    self._last_confirmed_pending_out_position = original_position
+                    print(
+                        f"Frame {self.frame_count}: [OUT-BOUNCE PENDING CONFIRMED] "
+                        f"source_f={pending_frame} point={original_position} side={original_side} "
+                        f"age={pending_age} rebound={tuple(ball_position)} "
+                        f"speed={current_speed:.1f}px turn={turn_angle:.1f}deg "
+                        f"displacement={displacement:.1f}px"
+                    )
+                    return True, f"Ball bounced out of court ({original_side} sideline)"
+                if pending_age >= 4:
+                    self._pending_night_static_out = None
+
         # A static side artifact can be followed by a valid airborne candidate
         # one frame later. Do not use that artifact's stale outside position as
         # the previous leg of a sideline reversal (point 9 a prior frame).
@@ -24347,6 +24415,23 @@ class InteractiveBallAnalyzer:
                 )
             )
             if deep_static_out:
+                # V14: only arm a pending OUT when the static-looking point is
+                # still supported by a coherent descending flight. Pure side
+                # hotspots remain ordinary suppressions and never get promoted.
+                if recent_descending and curr_dy >= 6.0 and curr_speed >= 6.0:
+                    self._pending_night_static_out = {
+                        'frame': int(self.frame_count),
+                        'position': tuple(ball_position),
+                        'side': side,
+                        'dx': curr_dx,
+                        'dy': curr_dy,
+                        'speed': curr_speed,
+                    }
+                    print(
+                        f"Frame {self.frame_count}: [OUT-BOUNCE PENDING] "
+                        f"point={tuple(ball_position)} side={side} "
+                        f"motion=({curr_dx:.1f},{curr_dy:.1f}) speed={curr_speed:.1f}px"
+                    )
                 self._last_out_bounce_suppressed_frame = self.frame_count
                 self._last_out_bounce_suppressed_point = tuple(ball_position)
                 print(
