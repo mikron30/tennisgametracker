@@ -10789,6 +10789,31 @@ class InteractiveBallAnalyzer:
         if displacement < max(70.0, min(180.0, float(getattr(self, "ball_size", 0.0) or 0.0) * 1.5)):
             return False
 
+        # A timeout recovery can land on a compact ball-coloured point inside a
+        # player while the actual image change is the player's whole body. A
+        # very large relocation backed by broad local motion is identity repair
+        # evidence only while the motion itself remains ball-sized.
+        recovery_zone = self._player_point_zone(recovered)
+        large_relocation = displacement >= max(300.0, float(width) * 0.08)
+        player_motion_zone = recovery_zone in (
+            'player_head_hat', 'player_shoes', 'racket_fragment', 'player_body'
+        )
+        broad_player_motion = (
+            large_relocation and
+            (
+                motion_ratio >= 0.65 or
+                (player_motion_zone and motion_ratio >= 0.30)
+            )
+        )
+        if broad_player_motion:
+            print(
+                f"Frame {self.frame_count}: [TERMINAL RECOVERY REJECT] "
+                f"broad player-motion candidate={recovered} "
+                f"zone={recovery_zone or 'none'} displacement={displacement:.1f}px "
+                f"motion={motion_ratio:.3f}"
+            )
+            return False
+
         dx = recovered[0] - previous[0]
         dy = recovered[1] - previous[1]
         distance = math.hypot(dx, dy)

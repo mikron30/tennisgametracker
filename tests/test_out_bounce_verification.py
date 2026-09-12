@@ -2,7 +2,7 @@ import io
 from types import SimpleNamespace
 import numpy as np
 from out_bounce_verification import recover_continuing_ball
-from interactive_ball_analyzer import _QuietTrackerOutput
+from interactive_ball_analyzer import _QuietTrackerOutput, InteractiveBallAnalyzer
 
 
 def fixture(candidate=(2933,691), moving=True):
@@ -131,6 +131,49 @@ def test_large_vector_without_terminal_recovery_provenance_is_not_suppressed():
         frame=4331, pos=[2983,733], stuck=0, source='normal_tracking')]}
     a._terminal_moving_ball_candidate=lambda *args,**kwargs: None
     assert not recover_continuing_ball(a,a.ball_center)
+
+
+def terminal_recovery_fixture(broad_motion=True, zone='player_body'):
+    a=InteractiveBallAnalyzer.__new__(InteractiveBallAnalyzer)
+    a.frame_count=4331
+    a.ball_center=(3830,125)
+    a.ball_size=2.0
+    previous=np.zeros((900,3840),dtype=np.uint8)
+    current=np.zeros_like(previous)
+    cx,cy=2983,733
+    radius=12 if broad_motion else 3
+    current[cy-radius:cy+radius+1,cx-radius:cx+radius+1]=100
+    a._terminal_current_frame=np.zeros((1,1,3),dtype=np.uint8)
+    a._terminal_previous_gray=previous
+    a._terminal_current_gray=current
+    a._terminal_moving_ball_candidate=lambda *args,**kwargs:(cx,cy)
+    a._player_point_zone=lambda p:zone
+    a.ball_velocity_history=[]
+    a.motion_history=[]
+    a._point_history_current={'tracking_trace':[]}
+    a.last_seen_frame=4300
+    a.stuck_frame_count=16
+    a.edge_wait=True
+    a._player_reacq_protect_until_frame=4400
+    a._player_reacq_motion_failed_until_frame=4400
+    return a
+
+
+def test_terminal_timeout_recovery_rejects_broad_player_motion():
+    a=terminal_recovery_fixture(broad_motion=True,zone='player_body')
+    assert not a._resume_from_terminal_motion_candidate(
+        'Ball stuck for too long',(3830,125))
+    assert a.ball_center==(3830,125)
+    assert a.motion_history==[]
+
+
+def test_terminal_timeout_recovery_keeps_compact_large_candidate():
+    a=terminal_recovery_fixture(broad_motion=False,zone='player_body')
+    assert a._resume_from_terminal_motion_candidate(
+        'Ball stuck for too long',(3830,125))
+    assert a.ball_center==(2983,733)
+    assert a.motion_history[-1]['pos']==(2983,733)
+    assert a._point_history_current['tracking_trace'][-1]['source']=='terminal_motion_recovery'
 
 
 def test_quiet_keeps_stance_diagnostics():
