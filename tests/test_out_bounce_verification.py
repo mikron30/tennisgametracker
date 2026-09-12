@@ -102,6 +102,37 @@ def test_mismatched_recovery_marker_does_not_suppress_out():
     assert not recover_continuing_ball(a,a.ball_center)
 
 
+def test_tagged_terminal_recovery_vector_cannot_create_later_out():
+    a=fixture(moving=False)
+    a.frame_count=4335
+    a.ball_center=(3264,343)
+    a.prev_motion=dict(dx=-783,dy=331,distance=850.1)
+    a.last_motion=dict(dx=144,dy=-143,distance=202.9)
+    a.motion_history=[dict(
+        frame=4331, pos=(2983,733), prev_pos=(3766,402), distance=850.1)]
+    a._point_history_current={'tracking_trace':[dict(
+        frame=4331, pos=[2983,733], stuck=0,
+        source='terminal_motion_recovery')]}
+    a._terminal_moving_ball_candidate=lambda *args,**kwargs: None
+    assert recover_continuing_ball(a,a.ball_center)
+    assert a._last_out_bounce_suppressed_frame == 4335
+    assert a._last_out_bounce_suppressed_point == (3264,343)
+
+
+def test_large_vector_without_terminal_recovery_provenance_is_not_suppressed():
+    a=fixture(moving=False)
+    a.frame_count=4335
+    a.ball_center=(3264,343)
+    a.prev_motion=dict(dx=-783,dy=331,distance=850.1)
+    a.last_motion=dict(dx=144,dy=-143,distance=202.9)
+    a.motion_history=[dict(
+        frame=4331, pos=(2983,733), prev_pos=(3766,402), distance=850.1)]
+    a._point_history_current={'tracking_trace':[dict(
+        frame=4331, pos=[2983,733], stuck=0, source='normal_tracking')]}
+    a._terminal_moving_ball_candidate=lambda *args,**kwargs: None
+    assert not recover_continuing_ball(a,a.ball_center)
+
+
 def test_quiet_keeps_stance_diagnostics():
     target=io.StringIO();stream=_QuietTrackerOutput(target)
     stream.write('[SERVE_STANCE_ALLOW] legal\n[SERVE STANCE V3] inside court\ncontour noise\n')
