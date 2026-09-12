@@ -76,6 +76,32 @@ def test_large_high_speed_candidate_still_requires_real_recovery():
     assert not recover_continuing_ball(a,a.ball_center)
 
 
+def test_large_verified_recovery_vector_cannot_create_next_frame_out():
+    a=fixture(moving=False)
+    a.frame_count=4307
+    a.ball_center=(2906,760)
+    a.prev_motion=dict(dx=-833,dy=-1043,distance=1334.8)
+    a.last_motion=dict(dx=-73,dy=167,distance=182.3)
+    a._last_motion_reacq_frame=4306
+    a._last_motion_reacq_pos=(2979,593)
+    a._terminal_moving_ball_candidate=lambda *args,**kwargs: None
+    assert recover_continuing_ball(a,a.ball_center)
+    assert a._last_out_bounce_suppressed_frame == 4307
+    assert a._last_out_bounce_suppressed_point == (2906,760)
+
+
+def test_mismatched_recovery_marker_does_not_suppress_out():
+    a=fixture(moving=False)
+    a.frame_count=4307
+    a.ball_center=(2906,760)
+    a.prev_motion=dict(dx=-833,dy=-1043,distance=1334.8)
+    a.last_motion=dict(dx=-73,dy=167,distance=182.3)
+    a._last_motion_reacq_frame=4306
+    a._last_motion_reacq_pos=(2500,500)
+    a._terminal_moving_ball_candidate=lambda *args,**kwargs: None
+    assert not recover_continuing_ball(a,a.ball_center)
+
+
 def test_quiet_keeps_stance_diagnostics():
     target=io.StringIO();stream=_QuietTrackerOutput(target)
     stream.write('[SERVE_STANCE_ALLOW] legal\n[SERVE STANCE V3] inside court\ncontour noise\n')
