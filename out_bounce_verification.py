@@ -15,10 +15,47 @@ def recover_continuing_ball(analyzer, position):
     dx, dy = float(current['dx']), float(current['dy'])
     speed = math.hypot(rx, ry)
     current_speed = math.hypot(dx, dy)
+
+    # A verified motion reacquisition can legitimately move the tracker a long
+    # distance from a poisoned HSV anchor to the real ball.  That correction is
+    # an identity repair, not an incoming tennis-ball vector.  On the very next
+    # frame, the sideline detector must not use that synthetic vector to infer a
+    # direction reversal / bounce.  Require both recovery markers to identify
+    # the reconstructed previous-frame anchor, and only suppress when the
+    # correction is far beyond an ordinary one-frame motion.
+    recovery_frame = int(getattr(analyzer, '_last_motion_reacq_frame', -1000000))
+    recovery_pos = getattr(analyzer, '_last_motion_reacq_pos', None)
+    current_frame = int(getattr(analyzer, 'frame_count', -1000000))
+    image = getattr(analyzer, '_terminal_current_frame', None)
+    if (
+        recovery_frame == current_frame - 1 and
+        isinstance(recovery_pos, (tuple, list)) and
+        len(recovery_pos) >= 2 and
+        image is not None
+    ):
+        previous_anchor = (
+            float(position[0]) - dx,
+            float(position[1]) - dy,
+        )
+        anchor_error = math.hypot(
+            previous_anchor[0] - float(recovery_pos[0]),
+            previous_anchor[1] - float(recovery_pos[1]),
+        )
+        synthetic_limit = max(400.0, float(image.shape[1]) * 0.10)
+        if anchor_error <= 4.0 and speed > synthetic_limit:
+            analyzer._last_out_bounce_suppressed_frame = current_frame
+            analyzer._last_out_bounce_suppressed_point = tuple(position)
+            print(
+                f'Frame {current_frame}: [OUT VERIFY RECOVERY GRACE] '
+                f'ignoring synthetic incoming reacquisition vector '
+                f'speed={speed:.1f}px anchor_error={anchor_error:.1f}px '
+                f'recovery={tuple(recovery_pos)} limit={synthetic_limit:.1f}px'
+            )
+            return True
+
     # Only investigate sudden candidate switches, not ordinary rebounds.
     if speed < 6 or current_speed < max(70, 2.5 * speed):
         return False
-    image = getattr(analyzer, '_terminal_current_frame', None)
     before = getattr(analyzer, '_terminal_previous_gray', None)
     after = getattr(analyzer, '_terminal_current_gray', None)
     if image is None or before is None or after is None or before.shape != after.shape:
