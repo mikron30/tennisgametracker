@@ -4,6 +4,75 @@ import cv2
 import numpy as np
 
 
+def _matching_recent_terminal_recovery(analyzer, rx, ry, current_frame, image):
+    """Return a recent terminal-recovery vector when it still owns prev_motion.
+
+    ``_resume_from_terminal_motion_candidate`` can intentionally teleport the
+    tracker from a stale terminal marker to a separately moving ball. That jump
+    is useful for identity recovery but is not a physical ball-flight vector.
+    The recovery is explicitly tagged in the point tracking trace, while the
+    matching motion-history entry carries the exact old/new positions.  Use both
+    records so ordinary large movements cannot be mistaken for a synthetic
+    recovery.
+    """
+    context = getattr(analyzer, '_point_history_current', None)
+    trace = context.get('tracking_trace', []) if isinstance(context, dict) else []
+    recovery_frames = {}
+    for entry in reversed(trace):
+        try:
+            frame = int(entry.get('frame', -1000000))
+        except (TypeError, ValueError):
+            continue
+        age = current_frame - frame
+        if age < 0:
+            continue
+        if age > 8:
+            break
+        if entry.get('source') != 'terminal_motion_recovery':
+            continue
+        pos = entry.get('pos')
+        if isinstance(pos, (tuple, list)) and len(pos) >= 2:
+            recovery_frames[frame] = (float(pos[0]), float(pos[1]))
+
+    if not recovery_frames or image is None:
+        return None
+
+    synthetic_limit = max(400.0, float(image.shape[1]) * 0.10)
+    for entry in reversed(getattr(analyzer, 'motion_history', []) or []):
+        try:
+            frame = int(entry.get('frame', -1000000))
+        except (TypeError, ValueError):
+            continue
+        if frame not in recovery_frames:
+            continue
+        pos = entry.get('pos')
+        prev_pos = entry.get('prev_pos')
+        if not (
+            isinstance(pos, (tuple, list)) and len(pos) >= 2 and
+            isinstance(prev_pos, (tuple, list)) and len(prev_pos) >= 2
+        ):
+            continue
+        recovered = recovery_frames[frame]
+        if math.hypot(float(pos[0]) - recovered[0], float(pos[1]) - recovered[1]) > 4.0:
+            continue
+        recovery_dx = float(pos[0]) - float(prev_pos[0])
+        recovery_dy = float(pos[1]) - float(prev_pos[1])
+        recovery_speed = math.hypot(recovery_dx, recovery_dy)
+        if recovery_speed <= synthetic_limit:
+            continue
+        vector_error = math.hypot(rx - recovery_dx, ry - recovery_dy)
+        tolerance = max(4.0, recovery_speed * 0.015)
+        if vector_error <= tolerance:
+            return {
+                'frame': frame,
+                'pos': (int(round(recovered[0])), int(round(recovered[1]))),
+                'speed': recovery_speed,
+                'vector_error': vector_error,
+                'limit': synthetic_limit,
+            }
+    return None
+
+
 def recover_continuing_ball(analyzer, position):
     if not analyzer._is_night_session_config():
         return False
@@ -52,6 +121,28 @@ def recover_continuing_ball(analyzer, position):
                 f'recovery={tuple(recovery_pos)} limit={synthetic_limit:.1f}px'
             )
             return True
+
+    # A timeout/stuck recovery has the same provenance problem, but its marker
+    # lives in the point trace rather than ``_last_motion_reacq_*``.  Suppress
+    # only while ``prev_motion`` still exactly matches that explicitly tagged
+    # recovery jump.  Once a real local step replaces it, normal bounce logic
+    # resumes immediately.
+    terminal_recovery = _matching_recent_terminal_recovery(
+        analyzer, rx, ry, current_frame, image
+    )
+    if terminal_recovery is not None:
+        analyzer._last_out_bounce_suppressed_frame = current_frame
+        analyzer._last_out_bounce_suppressed_point = tuple(position)
+        print(
+            f'Frame {current_frame}: [OUT VERIFY TERMINAL RECOVERY GRACE] '
+            f'ignoring synthetic terminal-recovery vector '
+            f"source_f={terminal_recovery['frame']} "
+            f"recovery={terminal_recovery['pos']} "
+            f"speed={terminal_recovery['speed']:.1f}px "
+            f"vector_error={terminal_recovery['vector_error']:.1f}px "
+            f"limit={terminal_recovery['limit']:.1f}px"
+        )
+        return True
 
     # Only investigate sudden candidate switches, not ordinary rebounds.
     if speed < 6 or current_speed < max(70, 2.5 * speed):
