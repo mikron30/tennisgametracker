@@ -11037,13 +11037,42 @@ class InteractiveBallAnalyzer:
         )
         return True
 
+    def _confirmed_pending_out_endpoint(self, reason):
+        """Return V14's original bounce point only on its confirmation frame."""
+        confirm_frame = int(getattr(
+            self, '_last_confirmed_pending_out_confirm_frame', -1000000
+        ))
+        if confirm_frame != int(self.frame_count):
+            return None
+        position = getattr(self, '_last_confirmed_pending_out_position', None)
+        if not isinstance(position, (tuple, list)) or len(position) < 2:
+            return None
+        reason_text = str(reason or '')
+        expected_reason = getattr(self, '_last_confirmed_pending_out_reason', None)
+        if expected_reason is not None and reason_text != str(expected_reason):
+            return None
+        if 'bounced out of court' not in reason_text.lower():
+            return None
+        return (int(round(float(position[0]))), int(round(float(position[1]))))
+
     def _record_point_result(self, reason, end_position=None, frame=None, history_end_frame=None):
         if self._last_scored_point_end_frame == self.frame_count:
             return None
 
         requested_history_end_frame = history_end_frame
         reason_lower = (reason or "").lower()
-        end_position = self._terminal_player_overlap_position(reason, end_position, frame=frame)
+        confirmed_pending_endpoint = self._confirmed_pending_out_endpoint(reason)
+        if confirmed_pending_endpoint is not None:
+            # V15: the rebound frame proves the OUT but is not the bounce location.
+            # Preserve V14's original source point instead of letting generic
+            # terminal endpoint repair replace it with a current-frame blob.
+            end_position = confirmed_pending_endpoint
+            print(
+                f"[POINT_END POSITION OVERRIDE] f{self.frame_count}: "
+                f"using confirmed pending OUT source={end_position}"
+            )
+        else:
+            end_position = self._terminal_player_overlap_position(reason, end_position, frame=frame)
         if "video_read_failure" in reason_lower:
             outcome = self._point_outcome(
                 None,
@@ -24166,6 +24195,9 @@ class InteractiveBallAnalyzer:
                     self.ball_center = original_position
                     self._last_confirmed_pending_out_frame = pending_frame
                     self._last_confirmed_pending_out_position = original_position
+                    confirmed_reason = f"Ball bounced out of court ({original_side} sideline)"
+                    self._last_confirmed_pending_out_confirm_frame = int(self.frame_count)
+                    self._last_confirmed_pending_out_reason = confirmed_reason
                     print(
                         f"Frame {self.frame_count}: [OUT-BOUNCE PENDING CONFIRMED] "
                         f"source_f={pending_frame} point={original_position} side={original_side} "
@@ -24173,7 +24205,7 @@ class InteractiveBallAnalyzer:
                         f"speed={current_speed:.1f}px turn={turn_angle:.1f}deg "
                         f"displacement={displacement:.1f}px"
                     )
-                    return True, f"Ball bounced out of court ({original_side} sideline)"
+                    return True, confirmed_reason
                 if pending_age >= 4:
                     self._pending_night_static_out = None
 
@@ -26559,10 +26591,16 @@ class InteractiveBallAnalyzer:
                         if point_ended:
                             point_end_frame = self.frame_count
                             dur = point_end_frame - point_start_frame if point_start_frame else 0
+                            confirmed_pending_endpoint = self._confirmed_pending_out_endpoint(reason)
+                            point_end_position = (
+                                confirmed_pending_endpoint
+                                if confirmed_pending_endpoint is not None
+                                else tracked_position
+                            )
                             print(f"Frame {self.frame_count}: POINT ENDED - {reason}")
                             print(f"Point duration: {dur} frames")
-                            print(f"[POINT_END] f{self.frame_count}: reason={reason} duration={dur}f pos={tracked_position} vel={vel:.1f}px vel_hist={vel_hist_tail}")
-                            self._record_point_result(reason, end_position=tracked_position, frame=frame)
+                            print(f"[POINT_END] f{self.frame_count}: reason={reason} duration={dur}f pos={point_end_position} vel={vel:.1f}px vel_hist={vel_hist_tail}")
+                            self._record_point_result(reason, end_position=point_end_position, frame=frame)
                             reason_lower = reason.lower()
                             if "bounced twice" in reason_lower:
                                 self._serve_scan_block_until_frame = max(
@@ -26583,7 +26621,7 @@ class InteractiveBallAnalyzer:
                                 game_state = "WAITING_FOR_SERVE"
                             else:
                                 game_state = "POINT_ENDED"
-                            reset_tracking_state(hold_end_marker=True, end_position=tracked_position)
+                            reset_tracking_state(hold_end_marker=True, end_position=point_end_position)
                         else:
                             _verbose_debug_print(f"Frame {self.frame_count}: Ball tracking continued")
                 else:

@@ -113,3 +113,25 @@ class OutBounceMotionConsistencyTests(unittest.TestCase):
             (False, None),
         )
         self.assertIsNotNone(self.a._pending_night_static_out)
+
+
+    def test_v15_confirmed_pending_out_uses_original_endpoint(self):
+        self.a.frame_count = 4287
+        self.a._last_confirmed_pending_out_confirm_frame = 4287
+        self.a._last_confirmed_pending_out_position = (2922, 729)
+        self.a._last_confirmed_pending_out_reason = 'Ball bounced out of court (right sideline)'
+        self.assertEqual(
+            self.a._confirmed_pending_out_endpoint('Ball bounced out of court (right sideline)'),
+            (2922, 729),
+        )
+
+    def test_v15_pending_endpoint_override_is_same_frame_and_reason_scoped(self):
+        self.a.frame_count = 4288
+        self.a._last_confirmed_pending_out_confirm_frame = 4287
+        self.a._last_confirmed_pending_out_position = (2922, 729)
+        self.a._last_confirmed_pending_out_reason = 'Ball bounced out of court (right sideline)'
+        self.assertIsNone(
+            self.a._confirmed_pending_out_endpoint('Ball bounced out of court (right sideline)')
+        )
+        self.a.frame_count = 4287
+        self.assertIsNone(self.a._confirmed_pending_out_endpoint('STUCK_TIMEOUT'))
