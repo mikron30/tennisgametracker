@@ -7024,6 +7024,13 @@ class InteractiveBallAnalyzer:
         self.direction_change_streak = 0
         self._post_reacq_frames = max(getattr(self, '_post_reacq_frames', 0), 3)
         self._last_motion_reacq_frame = self.frame_count
+        # Pair the recovery marker with the exact accepted position. The outer
+        # main-loop jump guard intentionally trusts a large same-frame motion
+        # reacquisition only when both frame and position match. Other motion
+        # reacquisition paths already maintain this pair; visible-ball recovery
+        # previously set only the frame, so a genuine recovery could be rejected
+        # after a poisoned HSV anchor.
+        self._last_motion_reacq_pos = tuple(new_pos)
         self.last_seen_frame = self.frame_count
         self._last_tracked_candidate_frame = self.frame_count
         self._last_tracked_candidate_motion_frame = self.frame_count

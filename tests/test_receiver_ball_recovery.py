@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+import math
 import cv2
 import numpy as np
 from receiver_ball_recovery import find_receiver_ball
@@ -63,6 +64,22 @@ def test_recovery_carries_measured_motion_to_commit_and_arbitration():
     a._activate_regular_hsv=lambda: None
     a._commit_night_visible_ball_recovery(candidate,second)
     assert a._last_tracked_candidate_motion_max==candidate['motion_max']
+    assert a._last_motion_reacq_frame==a.frame_count
+    assert a._last_motion_reacq_pos==candidate['pos']
+
+    # V10 repairs the pair consumed by the outer jump guard. A large recovery
+    # from a poisoned anchor is therefore eligible for the existing 1500 px
+    # motion-reacquisition limit instead of being rejected by the normal 400 px
+    # one-frame gate.
+    poisoned_anchor=(1500,900)
+    jump=math.hypot(candidate['pos'][0]-poisoned_anchor[0],
+                    candidate['pos'][1]-poisoned_anchor[1])
+    assert 400 < jump < 1500
+    assert (
+        a._last_motion_reacq_frame==a.frame_count and
+        a._last_motion_reacq_pos==candidate['pos']
+    )
+
     a._finalize_pending_provisional_static_candidate=lambda: False
     a._player_point_zone=lambda p:'racket_fragment'
     a._try_active_tight_local_ai_hold=lambda *args,**kwargs: None
