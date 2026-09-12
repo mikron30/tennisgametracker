@@ -14,14 +14,35 @@ def recover_continuing_ball(analyzer, position):
     rx, ry = float(incoming['dx']), float(incoming['dy'])
     dx, dy = float(current['dx']), float(current['dy'])
     speed = math.hypot(rx, ry)
+    current_speed = math.hypot(dx, dy)
     # Only investigate sudden candidate switches, not ordinary rebounds.
-    if speed < 6 or math.hypot(dx, dy) < max(70, 2.5 * speed):
+    if speed < 6 or current_speed < max(70, 2.5 * speed):
         return False
     image = getattr(analyzer, '_terminal_current_frame', None)
     before = getattr(analyzer, '_terminal_previous_gray', None)
     after = getattr(analyzer, '_terminal_current_gray', None)
     if image is None or before is None or after is None or before.shape != after.shape:
         return False
+
+    # Night footage can occasionally replace the ball with a 1-3 px court or
+    # player fragment. If that tiny fragment also requires a one-frame jump
+    # beyond the same physical step bound used by the sideline detector, it
+    # cannot establish an OUT by itself. Keep the normal tracker state intact
+    # and use the existing short OUT-suppression window; the next frames may
+    # still prove a real bounce or another terminal condition.
+    current_ball_size = float(getattr(analyzer, 'ball_size', 0.0) or 0.0)
+    max_physical_step = max(125.0, float(image.shape[1]) * 0.035)
+    if current_ball_size <= 3.0 and current_speed > max_physical_step:
+        analyzer._last_out_bounce_suppressed_frame = analyzer.frame_count
+        analyzer._last_out_bounce_suppressed_point = tuple(position)
+        print(
+            f'Frame {analyzer.frame_count}: [OUT VERIFY SUPPRESS] '
+            f'tiny high-speed night candidate pos={position} '
+            f'size={current_ball_size:.1f}px speed={current_speed:.1f} '
+            f'limit={max_physical_step:.1f}'
+        )
+        return True
+
     candidate = analyzer._terminal_moving_ball_candidate(
         position, image, before, after,
         allow_static_anywhere=False, allow_small_static=False)
