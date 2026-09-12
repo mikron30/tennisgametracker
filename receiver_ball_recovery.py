@@ -59,4 +59,21 @@ def find_receiver_ball(analyzer, frame):
     candidate['motion_max'] = float(np.max(diff))
     candidate['motion_source'] = 'receiver_probe_frame_pair'
     candidate['motion_frames'] = (prior[0], now)
+
+    # The main tracking loop asks Contact Local AI to re-arbitrate suspicious
+    # player-adjacent positions after normal tracking. On an AI miss that path
+    # restores the pre-track anchor. A receiver recovery already has independent
+    # two-frame temporal evidence, so a *moving* recovery must not be erased
+    # merely because Contact Local AI has no alternative candidate. Suppress
+    # only that same-frame trigger; all later frames and the regular buffered
+    # Local-AI recovery remain active.
+    moving_evidence = (
+        candidate['motion_mean'] >= 4.0 or candidate['motion_max'] >= 25.0
+    )
+    candidate['contact_ai_same_frame_protected'] = bool(moving_evidence)
+    if moving_evidence:
+        analyzer._contact_local_ai_cooldown_until_frame = max(
+            int(getattr(analyzer, '_contact_local_ai_cooldown_until_frame', -1000000)),
+            now,
+        )
     return candidate

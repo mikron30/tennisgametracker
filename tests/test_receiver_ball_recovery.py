@@ -49,6 +49,15 @@ def test_recovery_carries_measured_motion_to_commit_and_arbitration():
     assert candidate['motion_max']==float(expected.max())
     assert candidate['motion_mean']==float(expected.mean())
     assert candidate['motion_max']>=50
+    assert candidate['contact_ai_same_frame_protected'] is True
+    assert a._contact_local_ai_cooldown_until_frame==2
+
+    # This is the main-loop arbitration layer V7 did not exercise. A verified
+    # temporal receiver recovery must not arm Contact Local AI again on the
+    # same frame; its "AI miss" fallback would restore the old anchor.
+    a.local_ai_recovery=object()
+    assert a._contact_local_ai_trigger((450,100),candidate['pos'],{}) is None
+
     a._local_ai_tight_roi_attempt_frame=2
     a._update_recovered_motion=lambda old,new: None
     a._activate_regular_hsv=lambda: None
