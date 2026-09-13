@@ -26674,19 +26674,24 @@ class InteractiveBallAnalyzer:
                                     float(getattr(self, 'ball_size', 0.0) or 0.0) * 3.0,
                                 )
                             )
-                            history_end_frame = (
-                                self.frame_count
-                                if static_timeout_artifact else
-                                self._stuck_timeout_end_frame(
-                                    point_start_frame=point_start_frame,
-                                    frame=self.frame_count,
-                                )
-                            )
+                            # V18: a marker already classified as a recent static
+                            # out-bounce artifact must not be allowed to end the point
+                            # through the generic stuck-timeout path. Keep recovery alive
+                            # and let a later real ball observation or legitimate endpoint
+                            # decide the point instead.
                             if static_timeout_artifact:
                                 print(
-                                    f"Frame {self.frame_count}: [STUCK-TIMEOUT FRAME NOT BACKDATED] "
-                                    f"static marker began at f{static_timeout_frame}"
+                                    f"Frame {self.frame_count}: [STUCK-TIMEOUT SUPPRESSED] "
+                                    f"static marker {tuple(tracked_position)} follows suppressed "
+                                    f"artifact {tuple(static_timeout_point)} from f{static_timeout_frame}; "
+                                    f"continuing recovery instead of scoring"
                                 )
+                                continue
+
+                            history_end_frame = self._stuck_timeout_end_frame(
+                                point_start_frame=point_start_frame,
+                                frame=self.frame_count,
+                            )
                             print(f"Frame {self.frame_count}: POINT ENDED - {stuck_reason}")
                             print(f"Point duration: {dur} frames")
                             print(
