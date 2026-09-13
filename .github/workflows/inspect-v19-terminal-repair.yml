@@ -1,0 +1,44 @@
+name: Inspect V19 terminal repair
+
+on:
+  push:
+    branches:
+      - codex/shallow-serve-turn-candidate
+    paths:
+      - .github/workflows/inspect-v19-terminal-repair.yml
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out branch
+        uses: actions/checkout@v4
+        with:
+          ref: codex/shallow-serve-turn-candidate
+      - name: Print terminal repair contexts
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          lines = Path('interactive_ball_analyzer.py').read_text(encoding='utf-8').splitlines()
+          needles = [
+              'TERMINAL MOTION REPAIR',
+              '_resume_from_terminal_motion_candidate',
+              'Ball lost (likely out of court)',
+              'Ball stopped on player side',
+              'end_reason',
+          ]
+          printed = set()
+          for needle in needles:
+              hits = [i for i, line in enumerate(lines) if needle.lower() in line.lower()]
+              print(f'\n===== {needle!r}: {len(hits)} hits =====')
+              for i in hits[:8]:
+                  lo, hi = max(0, i-55), min(len(lines), i+85)
+                  key = (lo, hi)
+                  if key in printed:
+                      continue
+                  printed.add(key)
+                  print(f'\n--- lines {lo+1}-{hi} (hit {i+1}) ---')
+                  for n in range(lo, hi):
+                      print(f'{n+1:05d}: {lines[n]}')
+          PY
