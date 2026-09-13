@@ -8,6 +8,7 @@ def _verbose_debug_print(*args, **kwargs):
     if _verbose_debug_enabled:
         print(*args, **kwargs)
 import contextlib
+import copy
 import csv
 import os
 import sys
@@ -1001,6 +1002,20 @@ class InteractiveBallAnalyzer:
             return "held-position"
         return None
 
+    _PROVISIONAL_BOUNCE_FIELDS = (
+        'ground_bounce_count', 'last_ground_bounce_frame',
+        '_recent_racket_rebound_bounce_frame', '_ground_bounce_debug_history',
+        '_pending_rally_end_reason', '_pending_rally_end_frame',
+        'recent_bounce_markers', '_last_impact_marker_frame',
+        '_last_impact_marker_pos', '_last_impact_marker_kind',
+        'direction_change_events', '_awaiting_serve_bounce',
+        '_serve_phase_active', '_serve_phase_closed_frame',
+        '_serve_landed_in_current_attempt', '_serve_in_recorded_attempt',
+        '_last_serve_bounce_frame', '_last_serve_bounce_point',
+        '_last_serve_bounce_net_contact_like', '_last_serve_bounce_was_in',
+        'serve_stats',
+    )
+
     def _snapshot_tracking_state_for_provisional_guard(self):
         """Save only live tracking fields that a rejected contour can poison."""
         def clone(value):
@@ -1021,17 +1036,42 @@ class InteractiveBallAnalyzer:
             "_prev_frame_gray", "_last_tracked_candidate_motion_frame",
             "_last_tracked_candidate_motion_mean", "_last_tracked_candidate_motion_max",
         )
-        return {
+        snapshot = {
             field: clone(getattr(self, field))
             for field in fields
             if hasattr(self, field)
         }
+        # HSV can register a bounce before its candidate is accepted.  Position
+        # rollback must also undo that candidate's bounce, queued terminal and
+        # serve-in accounting, or repeated rejected launches become two bounces.
+        snapshot['_provisional_bounce_state'] = copy.deepcopy({
+            field: getattr(self, field)
+            for field in self._PROVISIONAL_BOUNCE_FIELDS
+            if hasattr(self, field)
+        })
+        return snapshot
 
     def _restore_tracking_state_for_provisional_guard(self, snapshot):
         if not snapshot:
             return
         for field, value in snapshot.items():
-            setattr(self, field, value)
+            if field != '_provisional_bounce_state':
+                setattr(self, field, copy.deepcopy(value))
+        if '_provisional_bounce_state' in snapshot:
+            bounce_state = snapshot['_provisional_bounce_state']
+            previous_count = int(getattr(self, 'ground_bounce_count', 0))
+            for field in self._PROVISIONAL_BOUNCE_FIELDS:
+                if field in bounce_state:
+                    setattr(self, field, copy.deepcopy(bounce_state[field]))
+                elif hasattr(self, field):
+                    delattr(self, field)
+            restored_count = int(getattr(self, 'ground_bounce_count', 0))
+            if previous_count != restored_count:
+                print(
+                    f'[REJECTED_CANDIDATE_BOUNCE_ROLLBACK] f{self.frame_count}: '
+                    f'bounces={previous_count}->{restored_count}; '
+                    'restored pre-candidate bounce evidence'
+                )
 
     def _static_blob_near(self, image, position, radius=14):
         """Find a compact HSV blob near ``position`` in one raw frame.
