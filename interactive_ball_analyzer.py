@@ -191,6 +191,9 @@ class _QuietTrackerOutput:
             text.startswith("[BALL_LOST]") or
             text.startswith("[BALL_LOSS_DIAGNOSTIC]") or
             text.startswith("[JUMP_REJECTED]") or
+            text.startswith("[CONTACT_LOCAL_AI") or
+            text.startswith("[CONTACT_NORMAL_PATH_RELEASE]") or
+            text.startswith("[LOCAL_AI_HANDOFF_STALL]") or
             text.startswith("[POINT_IGNORED]") or
             text.startswith("[MAX_FRAMES]") or
             text.startswith("[VIDEO_END]") or
@@ -1363,9 +1366,115 @@ class InteractiveBallAnalyzer:
                 f'angle={angle_delta:.0f}deg/pred={prediction_error:.0f}px'
             )
 
-        if (
-                (contact_near or watch_active) and proposed_speed >= jump_floor and
-                (angle_delta >= 35.0 or prediction_error >= 50.0)):
+        contact_jump_candidate = (
+            (contact_near or watch_active) and proposed_speed >= jump_floor and
+            (angle_delta >= 35.0 or prediction_error >= 50.0)
+        )
+
+        # V17: Contact Local-AI is an assist, not a permanent veto.
+        #
+        # During the short serve-contact/pre-bounce window, the normal HSV
+        # tracker can already see the outgoing ball while the local model still
+        # misses a blurred/contact-adjacent patch. The process loop deliberately
+        # rolls that normal candidate back when Contact Local-AI misses. Keep
+        # that protection for one-off racket/body fragments, but remember the
+        # rejected normal proposals. Three consecutive netward proposals with
+        # a coherent direction prove an independent causal ball path and let the
+        # normal tracker keep the third frame.
+        serve_contact_path_window = (
+            contact_jump_candidate and
+            tracked_position is not None and
+            bool(getattr(self, '_awaiting_serve_bounce', False)) and
+            int(getattr(self, '_serve_contact_grace_frames', 0) or 0) > 0 and
+            int(getattr(self, 'ground_bounce_count', 0) or 0) == 0 and
+            int(getattr(self, 'serve_direction_dy', 0) or 0) != 0
+        )
+        contact_normal_path = list(
+            getattr(self, '_contact_normal_fallback_path', []) or []
+        )
+
+        if serve_contact_path_window:
+            current_sample = {
+                'frame': int(self.frame_count),
+                'pos': tuple(tracked_position),
+                'area': float(proposed_size),
+            }
+            if (
+                    contact_normal_path and
+                    int(current_sample['frame']) !=
+                    int(contact_normal_path[-1].get('frame', -1000000)) + 1):
+                contact_normal_path = []
+
+            if contact_normal_path:
+                previous_sample = contact_normal_path[-1]
+                previous_pos = tuple(previous_sample['pos'])
+                step_dx = float(tracked_position[0] - previous_pos[0])
+                step_dy = float(tracked_position[1] - previous_pos[1])
+                step_distance = math.hypot(step_dx, step_dy)
+                serve_dy = int(getattr(self, 'serve_direction_dy', 0) or 0)
+                netward_progress = -step_dy if serve_dy < 0 else step_dy
+                if not (
+                        20.0 <= step_distance <= 220.0 and
+                        netward_progress >= 15.0):
+                    contact_normal_path = []
+
+            contact_normal_path.append(current_sample)
+            contact_normal_path = contact_normal_path[-3:]
+            self._contact_normal_fallback_path = contact_normal_path
+
+            if len(contact_normal_path) == 3:
+                p0 = tuple(contact_normal_path[0]['pos'])
+                p1 = tuple(contact_normal_path[1]['pos'])
+                p2 = tuple(contact_normal_path[2]['pos'])
+                v1 = (
+                    float(p1[0] - p0[0]),
+                    float(p1[1] - p0[1]),
+                )
+                v2 = (
+                    float(p2[0] - p1[0]),
+                    float(p2[1] - p1[1]),
+                )
+                len1 = math.hypot(v1[0], v1[1])
+                len2 = math.hypot(v2[0], v2[1])
+                cosine = (
+                    (v1[0] * v2[0] + v1[1] * v2[1]) /
+                    max(1.0, len1 * len2)
+                )
+                serve_dy = int(getattr(self, 'serve_direction_dy', 0) or 0)
+                total_netward = (
+                    float(p0[1] - p2[1])
+                    if serve_dy < 0 else
+                    float(p2[1] - p0[1])
+                )
+                coherent_path = (
+                    20.0 <= len1 <= 220.0 and
+                    20.0 <= len2 <= 220.0 and
+                    cosine >= 0.90 and
+                    total_netward >= 100.0
+                )
+                if coherent_path:
+                    self._contact_local_ai_state = None
+                    self._contact_local_ai_cooldown_until_frame = max(
+                        int(getattr(
+                            self,
+                            '_contact_local_ai_cooldown_until_frame',
+                            -1000000,
+                        )),
+                        int(self.frame_count) + 2,
+                    )
+                    self._contact_normal_fallback_path = []
+                    print(
+                        f"[CONTACT_NORMAL_PATH_RELEASE] f{self.frame_count}: "
+                        f"accepted normal HSV={tuple(tracked_position)} after "
+                        f"3 coherent netward proposals "
+                        f"path={[entry['pos'] for entry in contact_normal_path]} "
+                        f"cos={cosine:.3f} net={total_netward:.1f}px"
+                    )
+                    return None
+        else:
+            self._contact_normal_fallback_path = []
+
+        if contact_jump_candidate:
             return (
                 f'contact-jump:{proposed_speed:.0f}px>={jump_floor:.0f}/'
                 f'angle={angle_delta:.0f}deg/pred={prediction_error:.0f}px'
