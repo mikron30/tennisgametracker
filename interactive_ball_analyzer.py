@@ -11221,7 +11221,38 @@ class InteractiveBallAnalyzer:
                 f"using confirmed pending OUT source={end_position}"
             )
         else:
+            original_end_position = end_position
             end_position = self._terminal_player_overlap_position(reason, end_position, frame=frame)
+
+            # V19: generic terminal repair can prove that a stale player-side
+            # timeout marker was not the ball.  In V18 the repaired endpoint was
+            # persisted, but the old "Ball stopped on player side" reason stayed
+            # attached to it and was then copied verbatim into point history.
+            # Re-label only the reviewed night-session failure mode: the original
+            # reason must be exact, the repair must be a substantial relocation,
+            # and the repaired point must no longer support the in-court stopped
+            # interpretation.  Confirmed bounce/out endpoints above are untouched.
+            terminal_repair_distance = 0.0
+            if original_end_position is not None and end_position is not None:
+                terminal_repair_distance = math.hypot(
+                    float(end_position[0]) - float(original_end_position[0]),
+                    float(end_position[1]) - float(original_end_position[1]),
+                )
+            if (
+                self._is_night_session_config() and
+                reason_lower == "ball stopped on player side" and
+                terminal_repair_distance >= 70.0 and
+                self._in_court_timeout_landing_outcome(end_position, frame) is None
+            ):
+                previous_reason = reason
+                reason = "Ball lost (likely out of court)"
+                reason_lower = reason.lower()
+                print(
+                    f"[TERMINAL REASON REPAIR] f{self.frame_count}: "
+                    f"{previous_reason} at {original_end_position} -> "
+                    f"{reason} at {end_position} "
+                    f"distance={terminal_repair_distance:.1f}px"
+                )
         if "video_read_failure" in reason_lower:
             outcome = self._point_outcome(
                 None,
