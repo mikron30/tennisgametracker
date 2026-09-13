@@ -15,25 +15,26 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: codex/shallow-serve-turn-candidate
-      - name: Print terminal repair contexts
+      - name: Print V19 record-result contexts
         shell: bash
         run: |
           python - <<'PY'
           from pathlib import Path
           lines = Path('interactive_ball_analyzer.py').read_text(encoding='utf-8').splitlines()
           needles = [
-              'TERMINAL MOTION REPAIR',
-              '_resume_from_terminal_motion_candidate',
-              'Ball lost (likely out of court)',
-              'Ball stopped on player side',
-              'end_reason',
+              'def _record_point_result',
+              '_terminal_player_overlap_position(',
+              '_append_point_history_row(',
+              '_in_court_timeout_landing_outcome(',
+              'def _determine_point_outcome',
+              'def _resolve_point_outcome',
           ]
           printed = set()
           for needle in needles:
               hits = [i for i, line in enumerate(lines) if needle.lower() in line.lower()]
               print(f'\n===== {needle!r}: {len(hits)} hits =====')
-              for i in hits[:8]:
-                  lo, hi = max(0, i-55), min(len(lines), i+85)
+              for i in hits[:12]:
+                  lo, hi = max(0, i-80), min(len(lines), i+180)
                   key = (lo, hi)
                   if key in printed:
                       continue
