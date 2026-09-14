@@ -50,7 +50,7 @@ INSERT = '''                    return self.ball_center
                         source=best_source,
                     )
                     self.stuck_frame_count = max(
-                        int(getattr(self, '_stuck_frame_count', getattr(self, 'stuck_frame_count', 0))) + 1,
+                        int(getattr(self, 'stuck_frame_count', 0)) + 1,
                         1,
                     )
                     print(
