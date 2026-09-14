@@ -1,0 +1,40 @@
+name: Inspect V25 player reacquisition
+
+on:
+  push:
+    branches:
+      - codex/shallow-serve-turn-candidate
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Show reacquisition context
+        shell: python
+        run: |
+          from pathlib import Path
+          path = Path('interactive_ball_analyzer.py')
+          lines = path.read_text(encoding='utf-8').splitlines()
+          needles = [
+              'PLAYER-REACQ MOTION CONFIRMED',
+              'PLAYER-REACQ WEAK-JUMP REJECT',
+              'PLAYER-REACQ WEAK-JUMP VISIBLE BALL',
+          ]
+          found = False
+          for needle in needles:
+              for i, line in enumerate(lines):
+                  if needle in line:
+                      found = True
+                      lo = max(0, i - 90)
+                      hi = min(len(lines), i + 91)
+                      print(f'===== {needle} line {i+1} =====')
+                      for j in range(lo, hi):
+                          print(f'{j+1:06d}: {lines[j]}')
+                      print()
+          if not found:
+              raise SystemExit('reacquisition markers not found')
