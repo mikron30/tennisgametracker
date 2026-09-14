@@ -1,0 +1,125 @@
+name: Apply V25 extreme reacquisition conflict guard
+
+on:
+  push:
+    branches:
+      - codex/shallow-serve-turn-candidate
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Apply V25 player reacquisition guard
+        shell: python
+        run: |
+          from pathlib import Path
+
+          path = Path('interactive_ball_analyzer.py')
+          text = path.read_text(encoding='utf-8')
+
+          marker = '[PLAYER-REACQ EXTREME-PREDICTION REJECT]'
+          if marker in text:
+              print('V25 guard already present')
+              raise SystemExit(0)
+
+          anchor = '''                    return self.ball_center
+
+                # Clearing the protection now needs either strong image motion
+                # or geometric continuity. This preserves slow nearby tracks
+'''
+
+          insert = '''                    return self.ball_center
+
+                # V25: strong image motion by itself must not clear the
+                # player-contact reacquisition guard for an extreme jump that
+                # strongly contradicts the predicted ball trajectory.  The
+                # reviewed V20 f175 failure jumped 388px from the recovered
+                # ball while landing ~560px from prediction; the moving player
+                # supplied enough image motion to make that false fragment look
+                # valid.  Hold the last trusted ball for one more frame instead.
+                # Specialized top/back-return re-entry paths keep their own
+                # explicit long-jump validation and are intentionally excluded.
+                player_reacq_extreme_jump_limit = max(
+                    240.0, float(frame_width) * 0.065
+                )
+                player_reacq_extreme_pred_limit = max(
+                    150.0, float(frame_width) * 0.045
+                )
+                player_reacq_extreme_prediction_conflict = (
+                    player_reacq_guard_active and
+                    actual_distance >= player_reacq_extreme_jump_limit and
+                    selected_predicted_distance is not None and
+                    selected_predicted_distance >= player_reacq_extreme_pred_limit and
+                    not top_return_search_context and
+                    not back_return_search_context
+                )
+                if player_reacq_extreme_prediction_conflict:
+                    self._record_rejected_contour_debug(
+                        best_contour,
+                        x1,
+                        y1,
+                        cx,
+                        cy,
+                        selected_area_for_guard,
+                        (
+                            f"player-reacq extreme prediction conflict "
+                            f"jump={actual_distance:.1f}px "
+                            f"pred_dist={selected_predicted_distance:.1f}px"
+                        ),
+                        source=best_source,
+                    )
+                    self.stuck_frame_count = max(
+                        int(getattr(self, 'stuck_frame_count', 0)) + 1,
+                        1,
+                    )
+                    print(
+                        f"Frame {self.frame_count}: "
+                        f"[PLAYER-REACQ EXTREME-PREDICTION REJECT] "
+                        f"holding {self.ball_center} instead of ({cx},{cy}) "
+                        f"jump={actual_distance:.1f}px "
+                        f"limit={player_reacq_extreme_jump_limit:.1f}px "
+                        f"pred_dist={selected_predicted_distance:.1f}px "
+                        f"pred_limit={player_reacq_extreme_pred_limit:.1f}px "
+                        f"motion={motion_mean:.1f}/{motion_max:.1f}"
+                    )
+                    return self.ball_center
+
+                # Clearing the protection now needs either strong image motion
+                # or geometric continuity. This preserves slow nearby tracks
+'''
+
+          if anchor not in text:
+              raise SystemExit('V25 insertion anchor not found; refusing unsafe patch')
+
+          path.write_text(text.replace(anchor, insert, 1), encoding='utf-8')
+          print('V25 guard inserted')
+
+      - name: Syntax check
+        run: python -m py_compile interactive_ball_analyzer.py
+
+      - name: Focused regression tests
+        shell: bash
+        run: |
+          python -m pytest -q \
+            test_recovered_serve_scoring.py \
+            test_out_bounce_motion_consistency.py \
+            --basetemp=.pytest_tmp_v25
+
+      - name: Commit V25 candidate
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add interactive_ball_analyzer.py
+          if git diff --cached --quiet; then
+            echo "No runtime change to commit"
+            exit 0
+          fi
+          git commit -m "Apply V25 extreme reacquisition prediction guard"
+          git push
