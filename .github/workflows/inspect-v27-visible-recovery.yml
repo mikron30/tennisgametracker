@@ -1,0 +1,85 @@
+name: Inspect V27 visible-ball recovery
+
+on:
+  push:
+    branches:
+      - codex/shallow-serve-turn-candidate
+    paths:
+      - .github/workflows/inspect-v27-visible-recovery.yml
+
+permissions:
+  contents: write
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out branch
+        uses: actions/checkout@v4
+        with:
+          ref: codex/shallow-serve-turn-candidate
+          fetch-depth: 0
+
+      - name: Extract recovery and OUT callsite context
+        shell: python
+        run: |
+          from pathlib import Path
+
+          source = Path('interactive_ball_analyzer.py')
+          lines = source.read_text(encoding='utf-8').splitlines()
+          needles = [
+              'def _commit_night_visible_ball_recovery',
+              '_detect_out_of_court_bounce(',
+              'OUT-BOUNCE PENDING VISIBLE-CONFLICT REJECT',
+          ]
+
+          hits = []
+          for needle in needles:
+              for i, line in enumerate(lines):
+                  if needle in line:
+                      hits.append((needle, i))
+
+          if not hits:
+              raise SystemExit('V27 inspection targets not found')
+
+          ranges = []
+          for needle, i in hits:
+              before = 70 if 'def _commit' in needle else 45
+              after = 150 if 'def _commit' in needle else 90
+              ranges.append([max(0, i-before), min(len(lines), i+after+1)])
+          ranges.sort()
+          merged = []
+          for lo, hi in ranges:
+              if merged and lo <= merged[-1][1]:
+                  merged[-1][1] = max(merged[-1][1], hi)
+              else:
+                  merged.append([lo, hi])
+
+          out = [
+              '# V27 visible-ball recovery source context',
+              '',
+              'Generated from the candidate branch to make the f4287 reanchor safe.',
+              '',
+          ]
+          for lo, hi in merged:
+              out.append(f'## Lines {lo+1}-{hi}')
+              out.append('```python')
+              for j in range(lo, hi):
+                  out.append(f'{j+1:06d}: {lines[j]}')
+              out.append('```')
+              out.append('')
+
+          Path('V27_VISIBLE_RECOVERY_CONTEXT.md').write_text('\n'.join(out) + '\n', encoding='utf-8')
+
+      - name: Commit context when changed
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add V27_VISIBLE_RECOVERY_CONTEXT.md
+          if git diff --cached --quiet; then
+            echo "Context unchanged"
+            exit 0
+          fi
+          git commit -m "Record V27 visible recovery source context"
+          git push origin HEAD:codex/shallow-serve-turn-candidate
