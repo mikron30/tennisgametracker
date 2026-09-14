@@ -19854,6 +19854,62 @@ class InteractiveBallAnalyzer:
                                 recovery_candidate, frame
                             )
 
+                # V31: V30 proves the selected f176 candidate is a large,
+                # low-saturation, prediction-conflicting fragment, but the broad
+                # visible-ball helper can fail to return an independent candidate
+                # in that exact frame.  Do not then let a sharp player/racket edge
+                # clear the protection merely because motion_max is high.  A real
+                # ball recovery in this sequence has much stronger mean patch
+                # motion; the false fragment is characteristically spiky
+                # (low mean, high max).  In this narrow combination, hold the last
+                # trusted anchor for one additional frame so the genuine ball can
+                # reappear without poisoning direction/bounce state.
+                player_reacq_spiky_visible_conflict_hold = (
+                    player_reacq_visible_conflict_probe and
+                    actual_distance >= max(280.0, float(frame.shape[1]) * 0.07) and
+                    selected_predicted_distance is not None and
+                    selected_predicted_distance >= 130.0 and
+                    player_reacq_selected_area >= 180.0 and
+                    0 <= player_reacq_selected_s <= 55 and
+                    motion_mean < 30.0 and
+                    motion_max >= 80.0 and
+                    not top_return_search_context and
+                    not back_return_search_context
+                )
+                if player_reacq_spiky_visible_conflict_hold:
+                    self._record_rejected_contour_debug(
+                        best_contour,
+                        x1,
+                        y1,
+                        cx,
+                        cy,
+                        selected_area_for_guard,
+                        (
+                            f'player-reacq spiky visible-conflict hold '
+                            f'jump={actual_distance:.1f}px '
+                            f'pred_dist={selected_predicted_distance:.1f}px '
+                            f'motion={motion_mean:.1f}/{motion_max:.1f}'
+                        ),
+                        source=best_source,
+                    )
+                    self.stuck_frame_count = max(
+                        int(getattr(self, 'stuck_frame_count', 0)) + 1,
+                        1,
+                    )
+                    print(
+                        f'Frame {self.frame_count}: '
+                        f'[PLAYER-REACQ VISIBLE-CONFLICT HOLD] '
+                        f'holding {self.ball_center} instead of ({cx},{cy}) '
+                        f'hsv=({player_reacq_selected_h},'
+                        f'{player_reacq_selected_s},'
+                        f'{player_reacq_selected_v}) '
+                        f'area={player_reacq_selected_area:.1f}px '
+                        f'jump={actual_distance:.1f}px '
+                        f'pred_dist={selected_predicted_distance:.1f}px '
+                        f'motion={motion_mean:.1f}/{motion_max:.1f}'
+                    )
+                    return self.ball_center
+
                 if (
                         player_reacq_guard_active and
                         (
