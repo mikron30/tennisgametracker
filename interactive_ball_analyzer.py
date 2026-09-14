@@ -19692,6 +19692,106 @@ class InteractiveBallAnalyzer:
                 # or geometric continuity. This preserves slow nearby tracks
                 # while preventing a 300+ px weak-motion blob from becoming a
                 # new anchor simply because it is outside the player box.
+                # V28: a moving player/racket fragment can satisfy the generic
+                # strong-motion escape even when it is a large, prediction-conflicting
+                # reacquisition jump.  The reviewed early rally does this at f176:
+                # (709,1558), area 249, S=42, jump 301px, pred error 153px, while
+                # the real yellow ball is visibly elsewhere.  Do not weaken the
+                # normal strong-motion path.  Only override when the selected
+                # candidate is simultaneously large-jump, prediction-conflicting,
+                # large-area and low-saturation, and the existing visible-ball
+                # detector independently finds a more saturated moving ball well
+                # away from it in the same frame.
+                try:
+                    player_reacq_selected_h = int(hsv_values[0])
+                    player_reacq_selected_s = int(hsv_values[1])
+                    player_reacq_selected_v = int(hsv_values[2])
+                    player_reacq_selected_area = float(bulb_size or 0.0)
+                except (TypeError, ValueError, IndexError):
+                    player_reacq_selected_h = -1
+                    player_reacq_selected_s = -1
+                    player_reacq_selected_v = -1
+                    player_reacq_selected_area = 0.0
+
+                player_reacq_visible_conflict_probe = (
+                    player_reacq_guard_active and
+                    frame is not None and
+                    actual_distance >= max(240.0, float(frame.shape[1]) * 0.06) and
+                    selected_predicted_distance is not None and
+                    selected_predicted_distance >= max(110.0, float(frame.shape[1]) * 0.028) and
+                    player_reacq_selected_area >= 120.0 and
+                    0 <= player_reacq_selected_s <= 60
+                )
+                if player_reacq_visible_conflict_probe:
+                    visible_ball = None
+                    try:
+                        visible_ball = self._find_night_visible_ball_candidate(
+                            frame, frame_gray
+                        )
+                    except Exception:
+                        visible_ball = None
+
+                    if visible_ball is not None:
+                        try:
+                            visible_pos = tuple(visible_ball.get('pos', ()))
+                            visible_hsv = visible_ball.get('hsv')
+                            visible_s = (
+                                int(visible_hsv[1])
+                                if visible_hsv is not None and len(visible_hsv) >= 3
+                                else -1
+                            )
+                            visible_motion_mean = float(
+                                visible_ball.get('motion_mean', 0.0) or 0.0
+                            )
+                            visible_motion_max = float(
+                                visible_ball.get('motion_max', 0.0) or 0.0
+                            )
+                            visible_conflict_distance = (
+                                math.hypot(
+                                    float(visible_pos[0]) - float(cx),
+                                    float(visible_pos[1]) - float(cy),
+                                )
+                                if len(visible_pos) >= 2 else 0.0
+                            )
+                        except (TypeError, ValueError, IndexError):
+                            visible_pos = ()
+                            visible_s = -1
+                            visible_motion_mean = 0.0
+                            visible_motion_max = 0.0
+                            visible_conflict_distance = 0.0
+
+                        visible_conflict_limit = max(100.0, float(frame.shape[1]) * 0.025)
+                        visible_independent = (
+                            visible_conflict_distance >= visible_conflict_limit and
+                            visible_s >= player_reacq_selected_s + 15 and
+                            (
+                                visible_motion_mean >= 5.0 or
+                                visible_motion_max >= 35.0
+                            )
+                        )
+                        if visible_independent:
+                            print(
+                                f"Frame {self.frame_count}: "
+                                f"[PLAYER-REACQ STRONG-MOTION VISIBLE-CONFLICT REANCHOR] "
+                                f"rejected=({cx},{cy}) "
+                                f"hsv=({player_reacq_selected_h},"
+                                f"{player_reacq_selected_s},"
+                                f"{player_reacq_selected_v}) "
+                                f"area={player_reacq_selected_area:.1f}px "
+                                f"jump={actual_distance:.1f}px "
+                                f"pred_dist={selected_predicted_distance:.1f}px "
+                                f"visible={visible_pos} visible_s={visible_s} "
+                                f"motion={visible_motion_mean:.1f}/{visible_motion_max:.1f} "
+                                f"conflict={visible_conflict_distance:.1f}px"
+                            )
+                            recovery_candidate = dict(visible_ball)
+                            recovery_candidate['recovery_label'] = (
+                                'PLAYER-REACQ STRONG-MOTION VISIBLE REANCHOR'
+                            )
+                            return self._commit_night_visible_ball_recovery(
+                                recovery_candidate, frame
+                            )
+
                 if (
                         player_reacq_guard_active and
                         (
