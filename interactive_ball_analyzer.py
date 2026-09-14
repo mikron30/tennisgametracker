@@ -24456,23 +24456,32 @@ class InteractiveBallAnalyzer:
                 # candidate alone does not veto a normal rebound.
                 if coherent_rebound and frame is not None:
                     try:
-                        rebound_x = int(round(float(ball_position[0])))
-                        rebound_y = int(round(float(ball_position[1])))
-                        frame_h, frame_w = frame.shape[:2]
-                        rebound_x = max(0, min(frame_w - 1, rebound_x))
-                        rebound_y = max(0, min(frame_h - 1, rebound_y))
-                        hsv_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-                        rebound_hsv = hsv_frame[rebound_y, rebound_x]
-                        rebound_h = int(rebound_hsv[0])
-                        rebound_s = int(rebound_hsv[1])
-                        rebound_v = int(rebound_hsv[2])
+                        tracked_hsv = getattr(self, 'ball_hsv', None)
+                        current_rebound_size = float(getattr(self, 'ball_size', 0.0) or 0.0)
+                        if tracked_hsv is not None and len(tracked_hsv) >= 3:
+                            rebound_h = int(tracked_hsv[0])
+                            rebound_s = int(tracked_hsv[1])
+                            rebound_v = int(tracked_hsv[2])
+                        else:
+                            rebound_x = int(round(float(ball_position[0])))
+                            rebound_y = int(round(float(ball_position[1])))
+                            frame_h, frame_w = frame.shape[:2]
+                            rebound_x = max(0, min(frame_w - 1, rebound_x))
+                            rebound_y = max(0, min(frame_h - 1, rebound_y))
+                            hsv_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+                            rebound_hsv = hsv_frame[rebound_y, rebound_x]
+                            rebound_h = int(rebound_hsv[0])
+                            rebound_s = int(rebound_hsv[1])
+                            rebound_v = int(rebound_hsv[2])
                         dark_alt4_like = (
+                            current_rebound_size <= 30.0 and
                             rebound_h >= 88 and
                             rebound_s >= 85 and
                             rebound_v <= 130
                         )
                     except Exception:
                         rebound_h = rebound_s = rebound_v = -1
+                        current_rebound_size = 0.0
                         dark_alt4_like = False
 
                     visible_rebound = None
@@ -24504,6 +24513,7 @@ class InteractiveBallAnalyzer:
                                 f"source_f={pending_frame} point={pending_pos} "
                                 f"rebound={tuple(ball_position)} "
                                 f"hsv=({rebound_h},{rebound_s},{rebound_v}) "
+                                f"size={current_rebound_size:.1f}px "
                                 f"visible={visible_pos} "
                                 f"conflict={visible_conflict_distance:.1f}px"
                             )
