@@ -29,15 +29,15 @@ jobs:
           python - <<'PY'
           from pathlib import Path
           text = Path('interactive_ball_analyzer.py').read_text(encoding='utf-8')
-          start = text.index('# V28: a player-contact reacquisition')
-          end = text.index('                    if low_sat_large_fragment:', start)
+          start = text.index('# V28: a moving player/racket fragment')
+          end = text.index('                player_reacq_visible_conflict_probe = (', start)
           block = text[start:end]
-          assert "candidate_hsv = locals().get('hsv_values')" in block
+          assert "player_reacq_candidate_hsv = locals().get('hsv_values')" in block
+          assert "player_reacq_candidate_area = locals().get('bulb_size')" in block
           assert 'candidate_patch_hsv = cv2.cvtColor' in block
           assert "candidate_contour = locals().get('best_contour')" in block
-          assert 'candidate_area >= 18.0' in block
-          assert 'if hsv_values is not None' not in block
-          assert 'size={candidate_area:.1f}px' in text
+          assert 'int(hsv_values[0])' not in block
+          assert 'float(bulb_size or 0.0)' not in block
           print('V29 safe evidence guard present')
           PY
           git diff --check
