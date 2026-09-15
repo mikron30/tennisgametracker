@@ -625,217 +625,271 @@
 001771:                 continuity_rejected += 1
 ```
 
-## Lines 26679-26889
+## Lines 26664-26928
 ```python
-026679:                         if self._ignore_unresolved_timeout_if_game_decider(
-026680:                             "POINT_TIMEOUT", end_position=self.ball_center, frame=frame
-026681:                         ):
-026682:                             print(
-026683:                                 f"[POINT_IGNORED] f{self.frame_count}: reason=POINT_TIMEOUT "
-026684:                                 f"duration={dur}f would decide game without a located ball"
-026685:                             )
-026686:                         else:
-026687:                             timeout_reason = "POINT_TIMEOUT"
-026688:                             if self._in_court_timeout_landing_outcome(self.ball_center, frame) is not None:
-026689:                                 timeout_reason = "Ball stopped on player side"
-026690:                             # A duration timeout is only a fallback inference.  The
-026691:                             # terminal verifier can still see a compact moving ball
-026692:                             # in the just-decoded frame pair; continue the rally
-026693:                             # rather than scoring a false timeout in that case.
-026694:                             if self._resume_from_terminal_motion_candidate(
-026695:                                 timeout_reason, self.ball_center, frame=frame
-026696:                             ):
-026697:                                 continue
-026698:                             print(
-026699:                                 f"[POINT_END] f{self.frame_count}: reason={timeout_reason} "
-026700:                                 f"duration={dur}f — returning to serve detection"
-026701:                             )
-026702:                             self._record_point_result(timeout_reason, end_position=self.ball_center, frame=frame)
-026703:                         game_state = "WAITING_FOR_SERVE"
-026704:                         reset_tracking_state(hold_end_marker=True)
-026705: 
-026706:                 # Track ball through the point
-026707:                 tracked_position = None
-026708:                 if self.tracking and self.hsv_lower is not None and self.ball_center is not None:
-026709:                     prev_ball_center = self.ball_center
-026710:                     prev_stuck = self.stuck_frame_count
-026711:                     prev_top_return_wait = self._top_return_wait_active()
-026712:                     prev_back_return_wait = self._back_return_wait_active()
-026713:                     pre_track_snapshot = self._snapshot_tracking_state_for_provisional_guard()
-026714:                     self._local_ai_tight_roi_previous_gray = (
-026715:                         pre_track_snapshot.get('_prev_frame_gray')
-026716:                     )
-026717:                     forced_local_ai = False
-026718:                     contact_local_ai = False
-026719:                     tracked_position = self._force_local_ai_frame(frame, prev_ball_center)
-026720:                     if tracked_position is not None:
-026721:                         forced_local_ai = True
-026722:                     else:
-026723:                         # Once armed, contact Local AI owns the next few frames
-026724:                         # before HSV is allowed to mutate the anchor again.
-026725:                         tracked_position = self._run_contact_local_ai_frame(
-026726:                             frame, prev_ball_center
-026727:                         )
-026728:                         if tracked_position is not None:
-026729:                             contact_local_ai = True
-026730:                         else:
-026731:                             tracked_position = self.track_ball_in_frame(frame)
-026732:                             contact_reason = self._contact_local_ai_trigger(
-026733:                                 prev_ball_center, tracked_position, pre_track_snapshot
-026734:                             )
-026735:                             if contact_reason is not None:
-026736:                                 rejected_hsv = (
-026737:                                     tuple(tracked_position)
-026738:                                     if tracked_position is not None else None
-026739:                                 )
-026740:                                 post_track_snapshot = self._snapshot_tracking_state_for_provisional_guard()
-026741:                                 self._restore_tracking_state_for_provisional_guard(
-026742:                                     pre_track_snapshot
-026743:                                 )
-026744:                                 self._local_ai_tight_roi_previous_gray = (
-026745:                                     pre_track_snapshot.get('_prev_frame_gray')
-026746:                                 )
-026747:                                 # Debug only: preserve the normal detector's contact
-026748:                                 # hypothesis long enough to print candidate agreement.
-026749:                                 self._contact_local_ai_debug_normal_candidate = rejected_hsv
-026750:                                 tracked_position = self._run_contact_local_ai_frame(
-026751:                                     frame, prev_ball_center, arm_reason=contact_reason
-026752:                                 )
-026753:                                 self._contact_local_ai_debug_normal_candidate = None
-026754:                                 if tracked_position is not None:
-026755:                                     contact_local_ai = True
-026756:                                     print(
-026757:                                         f"[CONTACT_LOCAL_AI_REPLACE] f{self.frame_count}: "
-026758:                                         f"HSV={rejected_hsv} -> AI={tracked_position}"
-026759:                                     )
-026760:                                 else:
-026761:                                     # AI is an assist: if it has no accepted candidate,
-026762:                                     # keep the normal tracker result for this frame.
-026763:                                     self._restore_tracking_state_for_provisional_guard(
-026764:                                         pre_track_snapshot
-026765:                                     )
-026766:                                     tracked_position = prev_ball_center
-026767:                                     contact_local_ai = False
-026768:                                     print(
-026769:                                         f"[CONTACT_LOCAL_AI_FALLBACK] f{self.frame_count}: "
-026770:                                         f"AI miss; preserving trusted position={tracked_position}"
-026771:                                     )
-026772:                     if self.local_ai_recovery is not None and self._local_ai_frame_buffer:
-026773:                         self._local_ai_frame_buffer[-1]["normal_position"] = (
-026774:                             tuple(tracked_position) if tracked_position is not None else None
-026775:                         )
-026776:                     self._debug_local_ai_shadow_frame(frame, prev_ball_center, tracked_position)
-026777:                     if not forced_local_ai and not contact_local_ai:
-026778:                         tracked_position = self._try_local_ai_recovery(
-026779:                             prev_ball_center, tracked_position, prev_stuck,
-026780:                             pre_track_snapshot=pre_track_snapshot,
-026781:                             frame=frame,
-026782:                         )
-026783:                     self._local_ai_tight_roi_previous_gray = None
-026784:                     # Reject any position that jumps impossibly far in one frame (false positive).
-026785:                     # When the tracker is in re-acquisition mode (stuck >= 5 before the call), allow
-026786:                     # a larger jump because the ball may have traveled far while lost.
-026787:                     if tracked_position and prev_ball_center:
-026788:                         jump = math.hypot(tracked_position[0] - prev_ball_center[0],
-026789:                                           tracked_position[1] - prev_ball_center[1])
-026790:                         motion_reacq_this_frame = (
-026791:                             getattr(self, '_last_motion_reacq_frame', -1000000) == self.frame_count and
-026792:                             getattr(self, '_last_motion_reacq_pos', None) == tracked_position
-026793:                         )
-026794:                         trusted_rally_launch = (
-026795:                             getattr(self, '_trusted_rally_launch_frame', -1000000) == self.frame_count and
-026796:                             getattr(self, '_trusted_rally_launch_pos', None) == tracked_position
-026797:                         )
-026798:                         # Allow a larger jump when re-acquiring after being stuck for 5+ frames:
-026799:                         # a racket hit can send the ball 800+ px in one frame, so we use 1500px
-026800:                         # to let motion-based re-acquisition recover across the full court.
-026801:                         max_jump = 1500 if (
-026802:                             prev_stuck >= 5 or prev_top_return_wait or prev_back_return_wait or
-026803:                             motion_reacq_this_frame or trusted_rally_launch
-026804:                         ) else 400
-026805:                         if jump > max_jump:
-026806:                             print(f"[JUMP_REJECTED] f{self.frame_count}: jumped {jump:.0f}px from {prev_ball_center} to {tracked_position} (limit={max_jump}px, prev_stuck={prev_stuck}), keeping previous")
-026807:                             self.ball_center = prev_ball_center
-026808:                             self.stuck_frame_count = max(self.stuck_frame_count, prev_stuck + 1)
-026809:                             tracked_position = prev_ball_center
-026810: 
-026811:                     # Validate only the position that survived the physical
-026812:                     # jump gate above.  Previously the provisional serve
-026813:                     # state consumed a 425px false contour at a prior frame before
-026814:                     # that contour was rejected below.  Its bogus vector then
-026815:                     # hid the real upward reversal at a prior frame.
-026816:                     # Once a far toss is independently marked as caught, it
-026817:                     # becomes a *history* question only.  Do not continue to
-026818:                     # mutate the live provisional flags: the previous attempt
-026819:                     # cleared those flags at a prior frame and changed the otherwise
-026820:                     # stable HSV path of the following real rally.
-026821:                     tainted_far_toss_active = (
-026822:                         isinstance(
-026823:                             getattr(self, '_tainted_provisional_serve_start', None),
-026824:                             dict,
-026825:                         ) and
-026826:                         getattr(self, '_provisional_serve_start_kind', None) ==
-026827:                         'far-top-post-hit'
-026828:                     )
-026829:                     provisional_kind_before_validation = getattr(
-026830:                         self, '_provisional_serve_start_kind', None
-026831:                     )
-026832:                     provisional_reject_reason = (
-026833:                         None if tainted_far_toss_active else
-026834:                         self._validate_provisional_serve_start(
-026835:                             prev_ball_center, tracked_position
+026664:                                 f"Frame {self.frame_count}: [STALE-PLAYER TIMEOUT HOLD] "
+026665:                                 f"deferring unresolved timeout at {self.ball_center} "
+026666:                                 f"zone={timeout_marker_zone} stuck={self.stuck_frame_count}"
+026667:                             )
+026668:                         elif recent_bounce_hold:
+026669:                             last_bounce_frame = getattr(self, '_recent_return_bounce_recover_frame', self.frame_count)
+026670:                             frames_since_bounce = max(0, self.frame_count - last_bounce_frame)
+026671:                             print(
+026672:                                 f"Frame {self.frame_count}: delaying point timeout after recent bounce recover "
+026673:                                 f"({frames_since_bounce}f ago)"
+026674:                             )
+026675:                         elif recent_return_hold:
+026676:                             last_return_frame = getattr(self, '_recent_offscreen_return_frame', self.frame_count)
+026677:                             frames_since_return = max(0, self.frame_count - last_return_frame)
+026678:                             print(
+026679:                                 f"Frame {self.frame_count}: delaying point timeout after recent offscreen return "
+026680:                                 f"re-entry ({frames_since_return}f ago)"
+026681:                             )
+026682:                         else:
+026683:                             print(
+026684:                                 f"Frame {self.frame_count}: delaying point timeout while ball is still actively tracked "
+026685:                                 f"(seen {frames_since_seen}f ago, motion={last_motion_distance:.1f}px)"
+026686:                             )
+026687:                     else:
+026688:                         if self._ignore_unresolved_timeout_if_game_decider(
+026689:                             "POINT_TIMEOUT", end_position=self.ball_center, frame=frame
+026690:                         ):
+026691:                             print(
+026692:                                 f"[POINT_IGNORED] f{self.frame_count}: reason=POINT_TIMEOUT "
+026693:                                 f"duration={dur}f would decide game without a located ball"
+026694:                             )
+026695:                         else:
+026696:                             timeout_reason = "POINT_TIMEOUT"
+026697:                             if self._in_court_timeout_landing_outcome(self.ball_center, frame) is not None:
+026698:                                 timeout_reason = "Ball stopped on player side"
+026699:                             # A duration timeout is only a fallback inference.  The
+026700:                             # terminal verifier can still see a compact moving ball
+026701:                             # in the just-decoded frame pair; continue the rally
+026702:                             # rather than scoring a false timeout in that case.
+026703:                             if self._resume_from_terminal_motion_candidate(
+026704:                                 timeout_reason, self.ball_center, frame=frame
+026705:                             ):
+026706:                                 continue
+026707:                             print(
+026708:                                 f"[POINT_END] f{self.frame_count}: reason={timeout_reason} "
+026709:                                 f"duration={dur}f — returning to serve detection"
+026710:                             )
+026711:                             self._record_point_result(timeout_reason, end_position=self.ball_center, frame=frame)
+026712:                         game_state = "WAITING_FOR_SERVE"
+026713:                         reset_tracking_state(hold_end_marker=True)
+026714: 
+026715:                 # Track ball through the point
+026716:                 tracked_position = None
+026717:                 if self.tracking and self.hsv_lower is not None and self.ball_center is not None:
+026718:                     prev_ball_center = self.ball_center
+026719:                     prev_stuck = self.stuck_frame_count
+026720:                     prev_top_return_wait = self._top_return_wait_active()
+026721:                     prev_back_return_wait = self._back_return_wait_active()
+026722:                     pre_track_snapshot = self._snapshot_tracking_state_for_provisional_guard()
+026723:                     self._local_ai_tight_roi_previous_gray = (
+026724:                         pre_track_snapshot.get('_prev_frame_gray')
+026725:                     )
+026726:                     forced_local_ai = False
+026727:                     contact_local_ai = False
+026728:                     tracked_position = self._force_local_ai_frame(frame, prev_ball_center)
+026729:                     if tracked_position is not None:
+026730:                         forced_local_ai = True
+026731:                     else:
+026732:                         # Once armed, contact Local AI owns the next few frames
+026733:                         # before HSV is allowed to mutate the anchor again.
+026734:                         tracked_position = self._run_contact_local_ai_frame(
+026735:                             frame, prev_ball_center
+026736:                         )
+026737:                         if tracked_position is not None:
+026738:                             contact_local_ai = True
+026739:                         else:
+026740:                             tracked_position = self.track_ball_in_frame(frame)
+026741:                             verified_lower_contact_launch = (
+026742:                                 tracked_position is not None and
+026743:                                 int(getattr(
+026744:                                     self,
+026745:                                     '_last_verified_lower_contact_launch_frame',
+026746:                                     -1000000,
+026747:                                 )) == int(self.frame_count)
+026748:                             )
+026749:                             if verified_lower_contact_launch:
+026750:                                 # A dedicated NIGHT LOWER CONTACT LAUNCH has already
+026751:                                 # committed a geometrically verified outbound ball.
+026752:                                 # Do not let a Contact Local-AI miss restore the stale
+026753:                                 # pre-contact anchor on this exact frame.
+026754:                                 self._contact_local_ai_state = None
+026755:                                 self._contact_local_ai_cooldown_until_frame = max(
+026756:                                     int(getattr(
+026757:                                         self,
+026758:                                         '_contact_local_ai_cooldown_until_frame',
+026759:                                         -1000000,
+026760:                                     )),
+026761:                                     int(self.frame_count) + 2,
+026762:                                 )
+026763:                                 self._contact_normal_fallback_path = []
+026764:                                 contact_reason = None
+026765:                                 print(
+026766:                                     f"[CONTACT_LOCAL_AI VERIFIED-LOWER-LAUNCH RELEASE] "
+026767:                                     f"f{self.frame_count}: preserving normal launch="
+026768:                                     f"{tuple(tracked_position)}"
+026769:                                 )
+026770:                             else:
+026771:                                 contact_reason = self._contact_local_ai_trigger(
+026772:                                     prev_ball_center, tracked_position, pre_track_snapshot
+026773:                                 )
+026774:                             if contact_reason is not None:
+026775:                                 rejected_hsv = (
+026776:                                     tuple(tracked_position)
+026777:                                     if tracked_position is not None else None
+026778:                                 )
+026779:                                 post_track_snapshot = self._snapshot_tracking_state_for_provisional_guard()
+026780:                                 self._restore_tracking_state_for_provisional_guard(
+026781:                                     pre_track_snapshot
+026782:                                 )
+026783:                                 self._local_ai_tight_roi_previous_gray = (
+026784:                                     pre_track_snapshot.get('_prev_frame_gray')
+026785:                                 )
+026786:                                 # Debug only: preserve the normal detector's contact
+026787:                                 # hypothesis long enough to print candidate agreement.
+026788:                                 self._contact_local_ai_debug_normal_candidate = rejected_hsv
+026789:                                 tracked_position = self._run_contact_local_ai_frame(
+026790:                                     frame, prev_ball_center, arm_reason=contact_reason
+026791:                                 )
+026792:                                 self._contact_local_ai_debug_normal_candidate = None
+026793:                                 if tracked_position is not None:
+026794:                                     contact_local_ai = True
+026795:                                     print(
+026796:                                         f"[CONTACT_LOCAL_AI_REPLACE] f{self.frame_count}: "
+026797:                                         f"HSV={rejected_hsv} -> AI={tracked_position}"
+026798:                                     )
+026799:                                 else:
+026800:                                     # AI is an assist: if it has no accepted candidate,
+026801:                                     # keep the normal tracker result for this frame.
+026802:                                     self._restore_tracking_state_for_provisional_guard(
+026803:                                         pre_track_snapshot
+026804:                                     )
+026805:                                     tracked_position = prev_ball_center
+026806:                                     contact_local_ai = False
+026807:                                     print(
+026808:                                         f"[CONTACT_LOCAL_AI_FALLBACK] f{self.frame_count}: "
+026809:                                         f"AI miss; preserving trusted position={tracked_position}"
+026810:                                     )
+026811:                     if self.local_ai_recovery is not None and self._local_ai_frame_buffer:
+026812:                         self._local_ai_frame_buffer[-1]["normal_position"] = (
+026813:                             tuple(tracked_position) if tracked_position is not None else None
+026814:                         )
+026815:                     self._debug_local_ai_shadow_frame(frame, prev_ball_center, tracked_position)
+026816:                     if not forced_local_ai and not contact_local_ai:
+026817:                         tracked_position = self._try_local_ai_recovery(
+026818:                             prev_ball_center, tracked_position, prev_stuck,
+026819:                             pre_track_snapshot=pre_track_snapshot,
+026820:                             frame=frame,
+026821:                         )
+026822:                     self._local_ai_tight_roi_previous_gray = None
+026823:                     # Reject any position that jumps impossibly far in one frame (false positive).
+026824:                     # When the tracker is in re-acquisition mode (stuck >= 5 before the call), allow
+026825:                     # a larger jump because the ball may have traveled far while lost.
+026826:                     if tracked_position and prev_ball_center:
+026827:                         jump = math.hypot(tracked_position[0] - prev_ball_center[0],
+026828:                                           tracked_position[1] - prev_ball_center[1])
+026829:                         motion_reacq_this_frame = (
+026830:                             getattr(self, '_last_motion_reacq_frame', -1000000) == self.frame_count and
+026831:                             getattr(self, '_last_motion_reacq_pos', None) == tracked_position
+026832:                         )
+026833:                         trusted_rally_launch = (
+026834:                             getattr(self, '_trusted_rally_launch_frame', -1000000) == self.frame_count and
+026835:                             getattr(self, '_trusted_rally_launch_pos', None) == tracked_position
 026836:                         )
-026837:                     )
-026838:                     # A pending far-toss token is solely a fallback for a
-026839:                     # *rejected* practice toss.  Once this tentative flight
-026840:                     # has earned three coherent netward steps, it is a real
-026841:                     # serve (for example a prior frame -> a prior frame) and the token must
-026842:                     # not survive its fault/end state.  Leaving it alive
-026843:                     # caused the local model to re-use that old start at
-026844:                     # a prior frame and inject a second, false point.
-026845:                     if provisional_reject_reason is not None:
-026846:                         provisional_kind = getattr(self, '_provisional_serve_start_kind', None)
-026847:                         rejected_start = self._current_history_serve_start_frame()
-026848:                         if provisional_kind == 'far-top-post-hit':
-026849:                             # This is a caught far-side toss.  Do *not* reset
-026850:                             # to WAITING_FOR_SERVE: that was the rejected
-026851:                             # approach and it changed later, already-verified
-026852:                             # points.  Keep the normal HSV flow alive and ask
-026853:                             # local AI to prove a later outgoing path in
-026854:                             # shadow mode.  Only proven evidence may alter the
-026855:                             # final history/serve-fault interpretation.
-026856:                             self._tainted_provisional_serve_start = {
-026857:                                 'start_frame': rejected_start,
-026858:                                 'detected_frame': int(self.frame_count),
-026859:                                 'anchor': tuple(prev_ball_center),
-026860:                                 'reason': provisional_reject_reason,
-026861:                             }
-026862:                             print(
-026863:                                 f"[SERVE_START_TAINTED] f{self.frame_count}: "
-026864:                                 f"keeping tracker/provisional state for start f{rejected_start}; "
-026865:                                 f"{provisional_reject_reason}"
-026866:                             )
-026867:                         else:
-026868:                             print(
-026869:                                 f"[SERVE_START_REJECTED] f{self.frame_count}: "
-026870:                                 f"discarding provisional start f{rejected_start}; "
-026871:                                 f"{provisional_reject_reason}"
-026872:                             )
-026873:                             self._point_history_current = None
-026874:                             self._provisional_serve_start_kind = None
-026875:                             self._serve_start_requires_confirmation = False
-026876:                             game_state = "WAITING_FOR_SERVE"
-026877:                             clear_waiting_serve_history()
-026878:                             reset_tracking_state()
-026879:                             continue
-026880:                     # Shadow verification is intentionally side-effect free
-026881:                     # for ball position/game state.  It only supplies a
-026882:                     # later verified launch frame for history/fault scoring.
-026883:                     reconcile_tainted_far_serve_start()
-026884:                     if getattr(self, "_discard_provisional_serve_from_ai", False):
-026885:                         self._discard_provisional_serve_from_ai = False
-026886:                         self._ignore_unconfirmed_serve_start_result(
-026887:                             "local AI rejected repeated all-player-body recovery path"
-026888:                         )
-026889:                         print(
+026837:                         # Allow a larger jump when re-acquiring after being stuck for 5+ frames:
+026838:                         # a racket hit can send the ball 800+ px in one frame, so we use 1500px
+026839:                         # to let motion-based re-acquisition recover across the full court.
+026840:                         max_jump = 1500 if (
+026841:                             prev_stuck >= 5 or prev_top_return_wait or prev_back_return_wait or
+026842:                             motion_reacq_this_frame or trusted_rally_launch
+026843:                         ) else 400
+026844:                         if jump > max_jump:
+026845:                             print(f"[JUMP_REJECTED] f{self.frame_count}: jumped {jump:.0f}px from {prev_ball_center} to {tracked_position} (limit={max_jump}px, prev_stuck={prev_stuck}), keeping previous")
+026846:                             self.ball_center = prev_ball_center
+026847:                             self.stuck_frame_count = max(self.stuck_frame_count, prev_stuck + 1)
+026848:                             tracked_position = prev_ball_center
+026849: 
+026850:                     # Validate only the position that survived the physical
+026851:                     # jump gate above.  Previously the provisional serve
+026852:                     # state consumed a 425px false contour at a prior frame before
+026853:                     # that contour was rejected below.  Its bogus vector then
+026854:                     # hid the real upward reversal at a prior frame.
+026855:                     # Once a far toss is independently marked as caught, it
+026856:                     # becomes a *history* question only.  Do not continue to
+026857:                     # mutate the live provisional flags: the previous attempt
+026858:                     # cleared those flags at a prior frame and changed the otherwise
+026859:                     # stable HSV path of the following real rally.
+026860:                     tainted_far_toss_active = (
+026861:                         isinstance(
+026862:                             getattr(self, '_tainted_provisional_serve_start', None),
+026863:                             dict,
+026864:                         ) and
+026865:                         getattr(self, '_provisional_serve_start_kind', None) ==
+026866:                         'far-top-post-hit'
+026867:                     )
+026868:                     provisional_kind_before_validation = getattr(
+026869:                         self, '_provisional_serve_start_kind', None
+026870:                     )
+026871:                     provisional_reject_reason = (
+026872:                         None if tainted_far_toss_active else
+026873:                         self._validate_provisional_serve_start(
+026874:                             prev_ball_center, tracked_position
+026875:                         )
+026876:                     )
+026877:                     # A pending far-toss token is solely a fallback for a
+026878:                     # *rejected* practice toss.  Once this tentative flight
+026879:                     # has earned three coherent netward steps, it is a real
+026880:                     # serve (for example a prior frame -> a prior frame) and the token must
+026881:                     # not survive its fault/end state.  Leaving it alive
+026882:                     # caused the local model to re-use that old start at
+026883:                     # a prior frame and inject a second, false point.
+026884:                     if provisional_reject_reason is not None:
+026885:                         provisional_kind = getattr(self, '_provisional_serve_start_kind', None)
+026886:                         rejected_start = self._current_history_serve_start_frame()
+026887:                         if provisional_kind == 'far-top-post-hit':
+026888:                             # This is a caught far-side toss.  Do *not* reset
+026889:                             # to WAITING_FOR_SERVE: that was the rejected
+026890:                             # approach and it changed later, already-verified
+026891:                             # points.  Keep the normal HSV flow alive and ask
+026892:                             # local AI to prove a later outgoing path in
+026893:                             # shadow mode.  Only proven evidence may alter the
+026894:                             # final history/serve-fault interpretation.
+026895:                             self._tainted_provisional_serve_start = {
+026896:                                 'start_frame': rejected_start,
+026897:                                 'detected_frame': int(self.frame_count),
+026898:                                 'anchor': tuple(prev_ball_center),
+026899:                                 'reason': provisional_reject_reason,
+026900:                             }
+026901:                             print(
+026902:                                 f"[SERVE_START_TAINTED] f{self.frame_count}: "
+026903:                                 f"keeping tracker/provisional state for start f{rejected_start}; "
+026904:                                 f"{provisional_reject_reason}"
+026905:                             )
+026906:                         else:
+026907:                             print(
+026908:                                 f"[SERVE_START_REJECTED] f{self.frame_count}: "
+026909:                                 f"discarding provisional start f{rejected_start}; "
+026910:                                 f"{provisional_reject_reason}"
+026911:                             )
+026912:                             self._point_history_current = None
+026913:                             self._provisional_serve_start_kind = None
+026914:                             self._serve_start_requires_confirmation = False
+026915:                             game_state = "WAITING_FOR_SERVE"
+026916:                             clear_waiting_serve_history()
+026917:                             reset_tracking_state()
+026918:                             continue
+026919:                     # Shadow verification is intentionally side-effect free
+026920:                     # for ball position/game state.  It only supplies a
+026921:                     # later verified launch frame for history/fault scoring.
+026922:                     reconcile_tainted_far_serve_start()
+026923:                     if getattr(self, "_discard_provisional_serve_from_ai", False):
+026924:                         self._discard_provisional_serve_from_ai = False
+026925:                         self._ignore_unconfirmed_serve_start_result(
+026926:                             "local AI rejected repeated all-player-body recovery path"
+026927:                         )
+026928:                         print(
 ```
