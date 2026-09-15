@@ -26809,6 +26809,9 @@ class InteractiveBallAnalyzer:
                     )
                     forced_local_ai = False
                     contact_local_ai = False
+                    # V36: protect an explicitly verified NIGHT LOWER CONTACT LAUNCH
+                    # from later same-frame post-track recovery arbitration.
+                    verified_lower_contact_launch = False
                     tracked_position = self._force_local_ai_frame(frame, prev_ball_center)
                     if tracked_position is not None:
                         forced_local_ai = True
@@ -26981,7 +26984,16 @@ class InteractiveBallAnalyzer:
                             tuple(tracked_position) if tracked_position is not None else None
                         )
                     self._debug_local_ai_shadow_frame(frame, prev_ball_center, tracked_position)
-                    if not forced_local_ai and not contact_local_ai:
+                    if verified_lower_contact_launch:
+                        print(
+                            f"[VERIFIED-LOWER-LAUNCH POST-RECOVERY SKIP] "
+                            f"f{self.frame_count}: keeping launch={tuple(tracked_position)}"
+                        )
+                    if (
+                        not forced_local_ai and
+                        not contact_local_ai and
+                        not verified_lower_contact_launch
+                    ):
                         tracked_position = self._try_local_ai_recovery(
                             prev_ball_center, tracked_position, prev_stuck,
                             pre_track_snapshot=pre_track_snapshot,
