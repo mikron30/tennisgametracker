@@ -3,6 +3,7 @@ from pathlib import Path
 src = Path('interactive_ball_analyzer.py').read_text(encoding='utf-8').splitlines()
 needles = [
     'def _try_local_ai_recovery',
+    'repaired_position = (int(recovered["x"]), int(recovered["y"]))',
     'def _snapshot_tracking_state_for_provisional_guard',
     'def _restore_tracking_state_for_provisional_guard',
     'tracked_position = self._try_local_ai_recovery(',
@@ -15,8 +16,14 @@ for needle in needles:
     out.append(f'## {needle!r} — {len(hits)} hit(s)')
     out.append('```python')
     for i in hits:
-        before = 35 if needle.startswith('def ') else 70
-        after = 260 if needle.startswith('def ') else 180
+        if needle == 'def _try_local_ai_recovery':
+            before, after = 35, 520
+        elif needle.startswith('def '):
+            before, after = 35, 260
+        elif needle.startswith('repaired_position'):
+            before, after = 35, 180
+        else:
+            before, after = 70, 180
         start = max(0, i - before)
         end = min(len(src), i + after)
         key = (start, end)
