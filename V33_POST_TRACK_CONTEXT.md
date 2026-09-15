@@ -297,6 +297,485 @@
 002750:         repaired_position = (int(recovered["x"]), int(recovered["y"]))
 002751:         strict_repaired_reason = self._post_serve_pre_net_recovery_reason(
 002752:             previous_position, repaired_position
+002753:         )
+002754:         if strict_repaired_reason is not None:
+002755:             rejected_position = tuple(repaired_position)
+002756:             if pre_track_snapshot is not None:
+002757:                 self._restore_tracking_state_for_provisional_guard(pre_track_snapshot)
+002758:             self.stuck_frame_count = max(
+002759:                 int(previous_stuck or 0) + 1,
+002760:                 int(getattr(self, 'stuck_frame_count', 0) or 0),
+002761:             )
+002762:             print(
+002763:                 f"[POST_SERVE_PRE_NET_AI_REJECT] f{self.frame_count}: "
+002764:                 f"rejected={rejected_position} reason={strict_repaired_reason}; "
+002765:                 f"restored={previous_position} stuck={self.stuck_frame_count}"
+002766:             )
+002767:             return tuple(previous_position) if previous_position is not None else None
+002768: 
+002769:         self._maybe_clear_post_serve_pre_net_recovery(
+002770:             previous_position, repaired_position, source='local-ai'
+002771:         )
+002772:         self.ball_center = repaired_position
+002773:         self.ball_size = float(recovered.get("area", self.ball_size or 0.0))
+002774:         if recovered.get("trajectory_rescue"):
+002775:             trajectory_motion = dict(recovered.get("trajectory_motion") or {})
+002776:             prior_motion = (pre_track_snapshot or {}).get("last_motion")
+002777:             self.prev_motion = dict(prior_motion) if isinstance(prior_motion, dict) else prior_motion
+002778:             self.last_motion = trajectory_motion
+002779:             if float(trajectory_motion.get("distance", 0.0) or 0.0) >= 3.0:
+002780:                 self.last_nonzero_motion = dict(trajectory_motion)
+002781:             prior_history = list((pre_track_snapshot or {}).get("ball_velocity_history") or [])
+002782:             prior_history.append(float(trajectory_motion.get("distance", 0.0) or 0.0))
+002783:             self.ball_velocity_history = prior_history[-5:]
+002784:             self._held_direction_candidate = None
+002785:         self.last_seen_frame = self.frame_count
+002786:         self.stuck_frame_count = 0
+002787:         self._pending_rally_end_reason = None
+002788:         self._pending_rally_end_frame = -1
+002789:         self._local_ai_recovery_count += 1
+002790:         if reason != "post-recovery-follow":
+002791:             # A successful repair commonly happens at contact/occlusion.  The
+002792:             # next few frames are the outgoing flight, where the normal tracker
+002793:             # has the least reliable prediction.  Establish a bounded handoff
+002794:             # window; each *verified* local-AI frame can extend the immediate
+002795:             # follow-up by four frames, but never beyond this deadline.
+002796:             self._local_ai_handoff_deadline_frame = self.frame_count + 14
+002797: 
+002798:         handoff_deadline = int(getattr(self, "_local_ai_handoff_deadline_frame", -1))
+002799:         if handoff_deadline >= self.frame_count:
+002800:             self._local_ai_follow_until_frame = min(
+002801:                 handoff_deadline,
+002802:                 max(
+002803:                     int(getattr(self, "_local_ai_follow_until_frame", -1)),
+002804:                     self.frame_count + 4,
+002805:                 ),
+002806:             )
+002807:         print(
+002808:             f"[LOCAL_AI_RECOVERY] f{self.frame_count}: accepted {repaired_position} "
+002809:             f"score={float(recovered.get('ai_score', 0.0)):.6f} "
+002810:             f"replayed={self.local_ai_recovery.lookback_frames}f reason={reason}"
+002811:         )
+002812:         return repaired_position
+002813: 
+002814:     def _player_serve_context(self, serve_position):
+002815:         tracker = getattr(self, "player_tracker", None)
+002816:         if tracker is None:
+002817:             return {}
+002818:         try:
+002819:             server_idx = self._current_server_index()
+002820:             context = tracker.serve_context(
+002821:                 serve_position,
+002822:                 player_name=self.player_names[server_idx] if server_idx is not None else "",
+002823:             )
+002824:             tracker.adopt_serve_context(context, frame_index=int(getattr(self, 'frame_count', -1)))
+002825:             return context
+002826:         except Exception:
+002827:             return {}
+002828: 
+002829:     def _refresh_player_serve_context(self):
+002830:         """Refresh server/receiver geometry while the serve is still starting."""
+002831:         tracker = getattr(self, "player_tracker", None)
+002832:         context = getattr(self, "_point_history_current", None)
+002833:         if tracker is None or context is None:
+002834:             return
+002835:         serve_context = context.get('serve_context') or {}
+002836:         serve_x = serve_context.get('serve_x')
+002837:         serve_y = serve_context.get('serve_y')
+002838:         if serve_x is None or serve_y is None:
+002839:             return
+002840:         try:
+002841:             previous_receiver = serve_context.get('receiver_position')
+002842:             refreshed = self._player_serve_context((serve_x, serve_y))
+002843:             if not refreshed:
+002844:                 return
+002845:             # Do not replace a valid serve-ball coordinate; update the player
+002846:             # detections as they become available during the opening frames.
+002847:             for key, value in refreshed.items():
+002848:                 if value is not None and value != '':
+002849:                     serve_context[key] = value
+002850:             context['serve_context'] = serve_context
+002851:             current_receiver = serve_context.get('receiver_position')
+002852:             if current_receiver and current_receiver != previous_receiver:
+002853:                 print(
+002854:                     f"[SERVE_PLAYERS] f{self.frame_count}: "
+002855:                     f"server={serve_context.get('player') or 'unknown'} "
+002856:                     f"side={serve_context.get('player_side')} "
+002857:                     f"position={serve_context.get('player_position')} "
+002858:                     f"receiver_side={serve_context.get('receiver_side')} "
+002859:                     f"receiver_position={current_receiver} "
+002860:                     f"area={serve_context.get('receiver_area')}"
+002861:                 )
+002862:         except Exception:
+002863:             return
+002864: 
+002865:     def _draw_player_tracking(self, frame, scale=1.0):
+002866:         tracker = getattr(self, "player_tracker", None)
+002867:         if tracker is None:
+002868:             return frame
+002869:         if not getattr(self, "tracking", False) and getattr(self, "_point_history_current", None) is None:
+002870:             return frame
+002871:         result = frame
+002872:         try:
+002873:             for side, track in tracker.tracks.items():
+002874:                 if track.bbox is None:
+002875:                     continue
+002876:                 x, y, w, h = track.bbox
+002877:                 x1 = int(round(x * scale))
+002878:                 y1 = int(round(y * scale))
+002879:                 x2 = int(round((x + w) * scale))
+002880:                 y2 = int(round((y + h) * scale))
+002881:                 color = (255, 180, 40) if side == "near" else (40, 190, 255)
+002882:                 thickness = 2 if track.visible else 1
+002883:                 cv2.rectangle(result, (x1, y1), (x2, y2), color, thickness)
+002884:                 if track.head is not None:
+002885:                     hx, hy = int(track.head[0] * scale), int(track.head[1] * scale)
+002886:                     cv2.circle(result, (hx, hy), max(4, int(8 * scale)), color, 1)
+002887:                 if track.shoes is not None:
+002888:                     sx, sy = int(track.shoes[0] * scale), int(track.shoes[1] * scale)
+002889:                     cv2.circle(result, (sx, sy), max(3, int(6 * scale)), color, 1)
+002890:                 if track.racket and track.racket.get("line"):
+002891:                     lx1, ly1, lx2, ly2 = track.racket["line"]
+002892:                     cv2.line(
+002893:                         result,
+002894:                         (int(lx1 * scale), int(ly1 * scale)),
+002895:                         (int(lx2 * scale), int(ly2 * scale)),
+002896:                         (0, 165, 255),
+002897:                         max(1, int(round(2 * scale))),
+002898:                     )
+002899:                 label = f"{side} {track.confidence:.2f}"
+002900:                 cv2.putText(
+002901:                     result,
+002902:                     label,
+002903:                     (x1, max(15, y1 - 5)),
+002904:                     cv2.FONT_HERSHEY_SIMPLEX,
+002905:                     max(0.35, 0.5 * scale),
+002906:                     color,
+002907:                     max(1, int(round(1.5 * scale))),
+002908:                     cv2.LINE_AA,
+002909:                 )
+002910:         except Exception:
+002911:             return result
+002912:         return result
+002913: 
+002914:     def log_motion_metrics(self, prev_pos, dx, dy, distance, direction_deg):
+002915:         """Log per-frame motion and raise a focus-loss flag when movement spikes."""
+002916:         direction_text = f"{direction_deg:+.1f} deg" if direction_deg is not None else "N/A"
+002917:         print(f"Frame {self.frame_count}: Movement {distance:.1f}px (dx={dx}, dy={dy}) Direction: {direction_text}")
+002918: 
+002919:         self.prev_motion = self.last_motion
+002920:         self.last_motion = {
+002921:             'distance': distance,
+002922:             'dx': dx,
+002923:             'dy': dy,
+002924:             'direction_deg': direction_deg
+002925:         }
+002926:         if distance >= 3.0:
+002927:             self.last_nonzero_motion = dict(self.last_motion)
+002928:         angle_diff = None
+002929:         forward_vertical_reversal = False
+002930:         direction_change_detected = False
+002931:         if direction_deg is not None and distance > 5:
+002932:             if self.near_edge or getattr(self, 'edge_wait', False):
+002933:                 self._record_motion_vector(prev_pos, self.ball_center, direction_deg)
+002934:                 self.last_direction = direction_deg
+002935:                 return False
+002936:             if self.last_direction is not None:
+002937:                 threshold_deg = max(0.0, float(getattr(self, 'direction_change_min_degrees', 20.0)))
+002938:                 prev_dx = float(self.prev_motion.get('dx', 0.0)) if self.prev_motion is not None else 0.0
+002939:                 prev_dy = float(self.prev_motion.get('dy', 0.0)) if self.prev_motion is not None else 0.0
+002940:                 delta = abs(direction_deg - self.last_direction) % 360
+002941:                 angle_diff = min(delta, 360 - delta)
+002942:                 same_forward_x = abs(prev_dx) <= 3.0 or abs(dx) <= 3.0 or (prev_dx * dx) >= -6.0
+002943:                 forward_vertical_reversal = (
+002944:                     prev_dy >= 4.0 and
+002945:                     dy <= -4.0 and
+002946:                     same_forward_x
+002947:                 )
+002948:                 direction_change_detected = forward_vertical_reversal or angle_diff >= threshold_deg
+002949:                 if direction_change_detected:
+002950:                     change_point = prev_pos if prev_pos is not None else self.ball_center
+002951:                     if (getattr(self, 'ground_bounce_count', 0) > 0 and
+002952:                             (self.frame_count - getattr(self, 'last_ground_bounce_frame', -1000000)) > 2 and
+002953:                             distance > 12 and
+002954:                             (angle_diff >= 110.0 or (prev_dx * dx) < -12.0)):
+002955:                         if getattr(self, '_direction_only_bounce_preserve_frame', -1000000) == self.frame_count:
+002956:                             print(
+002957:                                 f"Frame {self.frame_count}: Preserving bounce count through "
+002958:                                 f"same-frame direction-only change"
+002959:                             )
+002960:                         else:
+002961:                             print(f"Frame {self.frame_count}: Resetting bounce count after new shot direction change")
+002962:                             self.ground_bounce_count = 0
+002963:                             self.last_ground_bounce_frame = -1000000
+002964:                     self.direction_change_points.append((change_point[0], change_point[1]))
+002965:                     self._record_direction_change_event(
+002966:                         change_point,
+002967:                         prev_dx,
+002968:                         prev_dy,
+002969:                         dx,
+002970:                         dy,
+002971:                         float(self.prev_motion.get('distance', 0.0)) if self.prev_motion is not None else 0.0,
+002972:                         distance,
+002973:                         angle_diff,
+002974:                     )
+002975:                     self._last_direction_change_frame = self.frame_count
+002976:                     self._last_direction_change_point = (int(change_point[0]), int(change_point[1]))
+002977:                     self._last_direction_change_angle = float(angle_diff)
+002978:                     self._last_direction_change_vertical_reversal = bool(forward_vertical_reversal)
+002979:                     if getattr(self, '_last_impact_marker_frame', -1000000) != self.frame_count:
+002980:                         self._add_impact_marker(
+002981:                             change_point,
+002982:                             kind="direction_change",
+002983:                             ttl=7,
+002984:                             label="direction change",
+002985:                         )
+002986:                     extra_tag = " vertical-reversal" if forward_vertical_reversal else ""
+002987:                     print(
+002988:                         f"Frame {self.frame_count}: Direction change detected "
+002989:                         f"({angle_diff:.1f} deg, threshold={threshold_deg:.1f}{extra_tag})"
+002990:                     )
+002991:             self._record_motion_vector(
+002992:                 prev_pos,
+002993:                 self.ball_center,
+002994:                 direction_deg,
+002995:                 angle_diff=angle_diff,
+002996:                 changed=direction_change_detected,
+002997:                 vertical_reversal=forward_vertical_reversal,
+002998:             )
+002999:             self.last_direction = direction_deg
+003000:         self.motion_history.append({
+003001:             'frame': self.frame_count,
+003002:             'distance': distance,
+003003:             'direction_deg': direction_deg,
+003004:             'pos': tuple(self.ball_center) if self.ball_center is not None else None,
+003005:             'prev_pos': tuple(prev_pos) if prev_pos is not None else None,
+003006:         })
+003007:         if len(self.motion_history) > 200:
+003008:             self.motion_history.pop(0)
+003009: 
+003010:         # Compare to recent median distance (starting from start_frame)
+003011:         if self.focus_loss_frame is None and self.frame_count >= self.start_frame:
+003012:             baseline_distances = [
+```
+
+## 'repaired_position = (int(recovered["x"]), int(recovered["y"]))' — 1 hit(s)
+```python
+002715:                         f"[LOCAL_AI_PLAYER_JUMP_ROLLBACK] f{self.frame_count}: "
+002716:                         f"rejected {rejected_position} jump={player_jump:.1f}px > "
+002717:                         f"{jump_limit:.1f}px; restored {previous_position} "
+002718:                         f"stuck={self.stuck_frame_count}"
+002719:                     )
+002720:                     return previous_position
+002721:             # Do not let a local-AI rejection still mutate the track.  In the
+002722:             # serve-start state a compact candidate with no inter-frame motion
+002723:             # is a likely static highlight.  Restore the state from before
+002724:             # HSV committed it, then use the next decoded frame to determine
+002725:             # whether that blob persisted in place.
+002726:             if (
+002727:                     reason.startswith(("provisional-serve-jump:", "static-candidate-jump:")) and
+002728:                     pre_track_snapshot is not None and
+002729:                     tracked_position is not None and
+002730:                     float(getattr(self, "_last_tracked_candidate_motion_mean", 0.0) or 0.0) < 5.0 and
+002731:                     float(getattr(self, "_last_tracked_candidate_motion_max", 0.0) or 0.0) < 25.0):
+002732:                 current_image = None
+002733:                 if self._local_ai_frame_buffer:
+002734:                     current_image = self._local_ai_frame_buffer[-1].get("image")
+002735:                 self._pending_provisional_static_candidate = {
+002736:                     "frame": int(self.frame_count),
+002737:                     "pos": tuple(tracked_position),
+002738:                     "blob": self._static_blob_near(current_image, tracked_position),
+002739:                 }
+002740:                 self._restore_tracking_state_for_provisional_guard(pre_track_snapshot)
+002741:                 self.stuck_frame_count = int(previous_stuck) + 1
+002742:                 print(
+002743:                     f"[PROVISIONAL_STATIC_GUARD] f{self.frame_count}: "
+002744:                     f"deferred zero-motion rejected jump {tracked_position}; "
+002745:                     "waiting for next-frame persistence"
+002746:                 )
+002747:                 return previous_position
+002748:             return tracked_position
+002749:         self._local_ai_all_body_rejections = 0
+002750:         repaired_position = (int(recovered["x"]), int(recovered["y"]))
+002751:         strict_repaired_reason = self._post_serve_pre_net_recovery_reason(
+002752:             previous_position, repaired_position
+002753:         )
+002754:         if strict_repaired_reason is not None:
+002755:             rejected_position = tuple(repaired_position)
+002756:             if pre_track_snapshot is not None:
+002757:                 self._restore_tracking_state_for_provisional_guard(pre_track_snapshot)
+002758:             self.stuck_frame_count = max(
+002759:                 int(previous_stuck or 0) + 1,
+002760:                 int(getattr(self, 'stuck_frame_count', 0) or 0),
+002761:             )
+002762:             print(
+002763:                 f"[POST_SERVE_PRE_NET_AI_REJECT] f{self.frame_count}: "
+002764:                 f"rejected={rejected_position} reason={strict_repaired_reason}; "
+002765:                 f"restored={previous_position} stuck={self.stuck_frame_count}"
+002766:             )
+002767:             return tuple(previous_position) if previous_position is not None else None
+002768: 
+002769:         self._maybe_clear_post_serve_pre_net_recovery(
+002770:             previous_position, repaired_position, source='local-ai'
+002771:         )
+002772:         self.ball_center = repaired_position
+002773:         self.ball_size = float(recovered.get("area", self.ball_size or 0.0))
+002774:         if recovered.get("trajectory_rescue"):
+002775:             trajectory_motion = dict(recovered.get("trajectory_motion") or {})
+002776:             prior_motion = (pre_track_snapshot or {}).get("last_motion")
+002777:             self.prev_motion = dict(prior_motion) if isinstance(prior_motion, dict) else prior_motion
+002778:             self.last_motion = trajectory_motion
+002779:             if float(trajectory_motion.get("distance", 0.0) or 0.0) >= 3.0:
+002780:                 self.last_nonzero_motion = dict(trajectory_motion)
+002781:             prior_history = list((pre_track_snapshot or {}).get("ball_velocity_history") or [])
+002782:             prior_history.append(float(trajectory_motion.get("distance", 0.0) or 0.0))
+002783:             self.ball_velocity_history = prior_history[-5:]
+002784:             self._held_direction_candidate = None
+002785:         self.last_seen_frame = self.frame_count
+002786:         self.stuck_frame_count = 0
+002787:         self._pending_rally_end_reason = None
+002788:         self._pending_rally_end_frame = -1
+002789:         self._local_ai_recovery_count += 1
+002790:         if reason != "post-recovery-follow":
+002791:             # A successful repair commonly happens at contact/occlusion.  The
+002792:             # next few frames are the outgoing flight, where the normal tracker
+002793:             # has the least reliable prediction.  Establish a bounded handoff
+002794:             # window; each *verified* local-AI frame can extend the immediate
+002795:             # follow-up by four frames, but never beyond this deadline.
+002796:             self._local_ai_handoff_deadline_frame = self.frame_count + 14
+002797: 
+002798:         handoff_deadline = int(getattr(self, "_local_ai_handoff_deadline_frame", -1))
+002799:         if handoff_deadline >= self.frame_count:
+002800:             self._local_ai_follow_until_frame = min(
+002801:                 handoff_deadline,
+002802:                 max(
+002803:                     int(getattr(self, "_local_ai_follow_until_frame", -1)),
+002804:                     self.frame_count + 4,
+002805:                 ),
+002806:             )
+002807:         print(
+002808:             f"[LOCAL_AI_RECOVERY] f{self.frame_count}: accepted {repaired_position} "
+002809:             f"score={float(recovered.get('ai_score', 0.0)):.6f} "
+002810:             f"replayed={self.local_ai_recovery.lookback_frames}f reason={reason}"
+002811:         )
+002812:         return repaired_position
+002813: 
+002814:     def _player_serve_context(self, serve_position):
+002815:         tracker = getattr(self, "player_tracker", None)
+002816:         if tracker is None:
+002817:             return {}
+002818:         try:
+002819:             server_idx = self._current_server_index()
+002820:             context = tracker.serve_context(
+002821:                 serve_position,
+002822:                 player_name=self.player_names[server_idx] if server_idx is not None else "",
+002823:             )
+002824:             tracker.adopt_serve_context(context, frame_index=int(getattr(self, 'frame_count', -1)))
+002825:             return context
+002826:         except Exception:
+002827:             return {}
+002828: 
+002829:     def _refresh_player_serve_context(self):
+002830:         """Refresh server/receiver geometry while the serve is still starting."""
+002831:         tracker = getattr(self, "player_tracker", None)
+002832:         context = getattr(self, "_point_history_current", None)
+002833:         if tracker is None or context is None:
+002834:             return
+002835:         serve_context = context.get('serve_context') or {}
+002836:         serve_x = serve_context.get('serve_x')
+002837:         serve_y = serve_context.get('serve_y')
+002838:         if serve_x is None or serve_y is None:
+002839:             return
+002840:         try:
+002841:             previous_receiver = serve_context.get('receiver_position')
+002842:             refreshed = self._player_serve_context((serve_x, serve_y))
+002843:             if not refreshed:
+002844:                 return
+002845:             # Do not replace a valid serve-ball coordinate; update the player
+002846:             # detections as they become available during the opening frames.
+002847:             for key, value in refreshed.items():
+002848:                 if value is not None and value != '':
+002849:                     serve_context[key] = value
+002850:             context['serve_context'] = serve_context
+002851:             current_receiver = serve_context.get('receiver_position')
+002852:             if current_receiver and current_receiver != previous_receiver:
+002853:                 print(
+002854:                     f"[SERVE_PLAYERS] f{self.frame_count}: "
+002855:                     f"server={serve_context.get('player') or 'unknown'} "
+002856:                     f"side={serve_context.get('player_side')} "
+002857:                     f"position={serve_context.get('player_position')} "
+002858:                     f"receiver_side={serve_context.get('receiver_side')} "
+002859:                     f"receiver_position={current_receiver} "
+002860:                     f"area={serve_context.get('receiver_area')}"
+002861:                 )
+002862:         except Exception:
+002863:             return
+002864: 
+002865:     def _draw_player_tracking(self, frame, scale=1.0):
+002866:         tracker = getattr(self, "player_tracker", None)
+002867:         if tracker is None:
+002868:             return frame
+002869:         if not getattr(self, "tracking", False) and getattr(self, "_point_history_current", None) is None:
+002870:             return frame
+002871:         result = frame
+002872:         try:
+002873:             for side, track in tracker.tracks.items():
+002874:                 if track.bbox is None:
+002875:                     continue
+002876:                 x, y, w, h = track.bbox
+002877:                 x1 = int(round(x * scale))
+002878:                 y1 = int(round(y * scale))
+002879:                 x2 = int(round((x + w) * scale))
+002880:                 y2 = int(round((y + h) * scale))
+002881:                 color = (255, 180, 40) if side == "near" else (40, 190, 255)
+002882:                 thickness = 2 if track.visible else 1
+002883:                 cv2.rectangle(result, (x1, y1), (x2, y2), color, thickness)
+002884:                 if track.head is not None:
+002885:                     hx, hy = int(track.head[0] * scale), int(track.head[1] * scale)
+002886:                     cv2.circle(result, (hx, hy), max(4, int(8 * scale)), color, 1)
+002887:                 if track.shoes is not None:
+002888:                     sx, sy = int(track.shoes[0] * scale), int(track.shoes[1] * scale)
+002889:                     cv2.circle(result, (sx, sy), max(3, int(6 * scale)), color, 1)
+002890:                 if track.racket and track.racket.get("line"):
+002891:                     lx1, ly1, lx2, ly2 = track.racket["line"]
+002892:                     cv2.line(
+002893:                         result,
+002894:                         (int(lx1 * scale), int(ly1 * scale)),
+002895:                         (int(lx2 * scale), int(ly2 * scale)),
+002896:                         (0, 165, 255),
+002897:                         max(1, int(round(2 * scale))),
+002898:                     )
+002899:                 label = f"{side} {track.confidence:.2f}"
+002900:                 cv2.putText(
+002901:                     result,
+002902:                     label,
+002903:                     (x1, max(15, y1 - 5)),
+002904:                     cv2.FONT_HERSHEY_SIMPLEX,
+002905:                     max(0.35, 0.5 * scale),
+002906:                     color,
+002907:                     max(1, int(round(1.5 * scale))),
+002908:                     cv2.LINE_AA,
+002909:                 )
+002910:         except Exception:
+002911:             return result
+002912:         return result
+002913: 
+002914:     def log_motion_metrics(self, prev_pos, dx, dy, distance, direction_deg):
+002915:         """Log per-frame motion and raise a focus-loss flag when movement spikes."""
+002916:         direction_text = f"{direction_deg:+.1f} deg" if direction_deg is not None else "N/A"
+002917:         print(f"Frame {self.frame_count}: Movement {distance:.1f}px (dx={dx}, dy={dy}) Direction: {direction_text}")
+002918: 
+002919:         self.prev_motion = self.last_motion
+002920:         self.last_motion = {
+002921:             'distance': distance,
+002922:             'dx': dx,
+002923:             'dy': dy,
+002924:             'direction_deg': direction_deg
+002925:         }
+002926:         if distance >= 3.0:
+002927:             self.last_nonzero_motion = dict(self.last_motion)
+002928:         angle_diff = None
+002929:         forward_vertical_reversal = False
 ```
 
 ## 'def _snapshot_tracking_state_for_provisional_guard' — 1 hit(s)
