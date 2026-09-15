@@ -1,0 +1,52 @@
+name: Apply V30 player reacquisition precommit evidence
+
+on:
+  push:
+    branches:
+      - codex/shallow-serve-turn-candidate
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out branch
+        uses: actions/checkout@v4
+        with:
+          ref: codex/shallow-serve-turn-candidate
+          fetch-depth: 0
+
+      - name: Apply V30 patch
+        run: python tools/fix_v30_player_reacq_precommit_evidence.py
+
+      - name: Validate patched tracker
+        shell: bash
+        run: |
+          python -m py_compile interactive_ball_analyzer.py
+          python - <<'PY'
+          from pathlib import Path
+          text = Path('interactive_ball_analyzer.py').read_text(encoding='utf-8')
+          assert 'candidate_pixel_hsv = cv2.cvtColor' in text
+          assert 'current_ball_size or 0.0' in text
+          assert '[PLAYER-REACQ VISIBLE-CONFLICT PROBE]' in text
+          assert 'PLAYER-REACQ STRONG-MOTION VISIBLE-CONFLICT REANCHOR' in text
+          print('V30 precommit evidence guard present')
+          PY
+          git diff --check
+          git diff -- interactive_ball_analyzer.py
+
+      - name: Commit patched tracker
+        shell: bash
+        run: |
+          if git diff --quiet -- interactive_ball_analyzer.py; then
+            echo "No tracker changes to commit"
+            exit 1
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add interactive_ball_analyzer.py
+          git commit -m "Apply V30 player reacquisition precommit evidence fix"
+          git push origin HEAD:codex/shallow-serve-turn-candidate

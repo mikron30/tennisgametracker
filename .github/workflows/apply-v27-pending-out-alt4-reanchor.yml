@@ -1,0 +1,53 @@
+name: Apply V27 pending OUT ALT4 visible reanchor
+
+on:
+  push:
+    branches:
+      - codex/shallow-serve-turn-candidate
+    paths:
+      - .github/workflows/apply-v27-pending-out-alt4-reanchor.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out branch
+        uses: actions/checkout@v4
+        with:
+          ref: codex/shallow-serve-turn-candidate
+          fetch-depth: 0
+
+      - name: Apply V27 patch
+        run: python tools/apply_v27_pending_out_alt4_visible_reanchor.py
+
+      - name: Validate patched tracker
+        shell: bash
+        run: |
+          python -m py_compile interactive_ball_analyzer.py
+          python - <<'PY'
+          from pathlib import Path
+          text = Path('interactive_ball_analyzer.py').read_text(encoding='utf-8')
+          assert 'OUT-PENDING ALT4 VISIBLE-CONFLICT REJECT' in text
+          assert 'OUT-PENDING ALT4 VISIBLE REANCHOR' in text
+          assert "3 <= pending_age <= 4 and alt4_dark_tiny" in text
+          assert "return self._commit_night_visible_ball_recovery(" in text
+          print('V27 precommit reanchor guard present')
+          PY
+          git diff --check
+          git diff -- interactive_ball_analyzer.py
+
+      - name: Commit patched tracker
+        shell: bash
+        run: |
+          if git diff --quiet -- interactive_ball_analyzer.py; then
+            echo "No tracker changes to commit"
+            exit 1
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add interactive_ball_analyzer.py
+          git commit -m "Apply V27 pending OUT ALT4 visible reanchor"
+          git push origin HEAD:codex/shallow-serve-turn-candidate

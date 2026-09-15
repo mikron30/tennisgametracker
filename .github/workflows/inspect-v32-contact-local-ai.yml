@@ -1,0 +1,66 @@
+name: Inspect V32 contact local AI arbitration
+
+on:
+  push:
+    branches:
+      - codex/shallow-serve-turn-candidate
+
+permissions:
+  contents: write
+
+jobs:
+  inspect:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out branch
+        uses: actions/checkout@v4
+        with:
+          ref: codex/shallow-serve-turn-candidate
+          fetch-depth: 0
+
+      - name: Extract Contact Local-AI contexts
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('interactive_ball_analyzer.py')
+          lines = path.read_text(encoding='utf-8').splitlines()
+          needles = [
+              'CONTACT_LOCAL_AI_FALLBACK',
+              'CONTACT_LOCAL_AI_MISS',
+              'CONTACT_LOCAL_AI_EXPIRE',
+              '_contact_local_ai_state',
+          ]
+          hits = []
+          for i, line in enumerate(lines):
+              if any(n in line for n in needles):
+                  hits.append(i)
+          ranges = []
+          for i in hits:
+              lo = max(0, i - 90)
+              hi = min(len(lines), i + 121)
+              if ranges and lo <= ranges[-1][1] + 20:
+                  ranges[-1] = (ranges[-1][0], max(ranges[-1][1], hi))
+              else:
+                  ranges.append((lo, hi))
+          out = ['# V32 Contact Local-AI source context', '']
+          for lo, hi in ranges:
+              out += [f'## Lines {lo+1}-{hi}', '```python']
+              for j in range(lo, hi):
+                  out.append(f'{j+1:06d}: {lines[j]}')
+              out += ['```', '']
+          if not hits:
+              raise SystemExit('No Contact Local-AI markers found')
+          Path('V32_CONTACT_LOCAL_AI_CONTEXT.md').write_text('\n'.join(out), encoding='utf-8')
+          print(f'Found {len(hits)} marker hits across {len(ranges)} ranges')
+          PY
+
+      - name: Commit context
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add V32_CONTACT_LOCAL_AI_CONTEXT.md
+          git commit -m "Record V32 Contact Local-AI source context"
+          git push origin HEAD:codex/shallow-serve-turn-candidate

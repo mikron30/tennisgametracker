@@ -5,7 +5,8 @@ is available, require evidence that the player on the serving end is standing
 behind the physical baseline and that the serve candidate is horizontally
 consistent with that player.
 
-The rule is frame-independent. Court geometry is read from the calibrated
+The rule is frame-independent. The night near baseline uses local image segments
+to accommodate lens curvature. Other court geometry is read from the calibrated
 ``adjusted_court_points.txt`` file. In that layout points 1-2 are the far
 baseline endpoints and points 3-4 are the near baseline endpoints. The
 player's feet/bottom-of-box are compared with the appropriate perspective
@@ -251,6 +252,18 @@ def evaluate_serve_stance(analyzer, serve_position, frame) -> Dict:
         result.update(decision="hold", reason=f"{side} player confidence too low")
         return result
 
+    # A weak HOG match on an empty court patch is not a verified server.
+    # Strong detections can certify a stationary server; weaker matches need
+    # independent motion inside their box before entering the legal cache.
+    night = str(getattr(analyzer, 'config_file', '')).replace('\\', '/').split('/')[-1] == 'hsv_config_04_left_night.json'
+    if night and result["confidence"] < 0.60:
+        from tracking_evidence import player_box_motion
+        support = player_box_motion(analyzer, track.bbox)
+        if support is None or support < 0.01:
+            analyzer._serve_stance_last_valid = None
+            result.update(decision="hold", reason=f"weak player box lacks motion support ({support})")
+            return result
+
     feet = getattr(track, "shoes", None)
     if feet is None:
         x, y, w, h = [float(v) for v in track.bbox]
@@ -258,14 +271,30 @@ def evaluate_serve_stance(analyzer, serve_position, frame) -> Dict:
     feet = (float(feet[0]), float(feet[1]))
     result["feet"] = (int(round(feet[0])), int(round(feet[1])))
 
-    geometry_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "adjusted_court_points.txt")
-    points = _load_full_frame_points(geometry_path)
-    if points is None:
-        result.update(decision="bypass", reason="calibrated baseline points unavailable")
-        return result
+    night = str(getattr(analyzer, 'config_file', '')).replace('\\', '/').split('/')[-1] == 'hsv_config_04_left_night.json'
+    if night and side == 'near':
+        from night_serve_geometry import near_baseline
+        cache = getattr(analyzer, '_night_serve_baseline', None)
+        if cache is None or cache[0] != frame.shape[:2]:
+            model = near_baseline(frame)
+            if model is not None:
+                analyzer._night_serve_baseline = (frame.shape[:2], model)
+        else:
+            model = cache[1]
+        if model is None:
+            result.update(decision='hold', reason='night baseline not visible')
+            return result
+        c2, c1, c0 = model['curve']
+        baseline_y = c2 * feet[0] ** 2 + c1 * feet[0] + c0
+    else:
+        geometry_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "adjusted_court_points.txt")
+        points = _load_full_frame_points(geometry_path)
+        if points is None:
+            result.update(decision="bypass", reason="calibrated baseline points unavailable")
+            return result
 
-    baseline = (points[3], points[4]) if side == "near" else (points[1], points[2])
-    baseline_y = _line_y(baseline[0], baseline[1], feet[0])
+        baseline = (points[3], points[4]) if side == "near" else (points[1], points[2])
+        baseline_y = _line_y(baseline[0], baseline[1], feet[0])
     if baseline_y is None:
         result.update(decision="bypass", reason="invalid calibrated baseline")
         return result
