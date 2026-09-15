@@ -1,0 +1,18 @@
+name: Inspect V33 post-track state
+
+on:
+  push:
+    branches:
+      - codex/shallow-serve-turn-candidate
+
+jobs:
+  inspect:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: codex/shallow-serve-turn-candidate
+          fetch-depth: 0
+      - name: Inspect post-track state arbitration
+        run: python tools/inspect_v33_post_track_state.py
