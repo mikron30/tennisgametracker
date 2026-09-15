@@ -2,10 +2,10 @@ from pathlib import Path
 
 src = Path('interactive_ball_analyzer.py').read_text(encoding='utf-8').splitlines()
 needles = [
-    'contact_reason is not None',
+    'def _run_contact_local_ai_frame',
+    'def _commit_night_visible_ball_recovery',
     'CONTACT_LOCAL_AI_REPLACE',
-    'contact_local_ai_position',
-    '_contact_local_ai_trigger(',
+    'log_motion_metrics(',
 ]
 
 out = ['# V34 Contact Local-AI replacement context', '']
@@ -15,8 +15,10 @@ for needle in needles:
     out.append(f'## {needle!r} — {len(hits)} hit(s)')
     out.append('```python')
     for i in hits:
-        start = max(0, i - 80)
-        end = min(len(src), i + 180)
+        before = 40 if needle.startswith('def ') else 100
+        after = 260 if needle.startswith('def ') else 180
+        start = max(0, i - before)
+        end = min(len(src), i + after)
         key = (start, end)
         if key in seen:
             continue
