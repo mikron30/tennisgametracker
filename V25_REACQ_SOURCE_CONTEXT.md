@@ -257,64 +257,8 @@ Generated from `interactive_ball_analyzer.py` on this branch for V25 diagnosis.
 019736:                             candidate_pixel, cv2.COLOR_BGR2HSV
 ```
 
-## Lines 19757-19977
+## Lines 19813-20033
 ```python
-019757:                             # independent visible-ball candidate far away.
-019758:                             player_reacq_selected_area = float(
-019759:                                 current_ball_size or 0.0
-019760:                             )
-019761:                 except (TypeError, ValueError, IndexError, cv2.error):
-019762:                     player_reacq_selected_h = -1
-019763:                     player_reacq_selected_s = -1
-019764:                     player_reacq_selected_v = -1
-019765:                     player_reacq_selected_area = 0.0
-019766: 
-019767:                 player_reacq_visible_conflict_probe = (
-019768:                     player_reacq_guard_active and
-019769:                     frame is not None and
-019770:                     actual_distance >= max(240.0, float(frame.shape[1]) * 0.06) and
-019771:                     selected_predicted_distance is not None and
-019772:                     selected_predicted_distance >= max(110.0, float(frame.shape[1]) * 0.028) and
-019773:                     player_reacq_selected_area >= 120.0 and
-019774:                     0 <= player_reacq_selected_s <= 60
-019775:                 )
-019776:                 if player_reacq_visible_conflict_probe:
-019777:                     print(
-019778:                         f"Frame {self.frame_count}: "
-019779:                         f"[PLAYER-REACQ VISIBLE-CONFLICT PROBE] "
-019780:                         f"candidate=({cx},{cy}) "
-019781:                         f"hsv=({player_reacq_selected_h},"
-019782:                         f"{player_reacq_selected_s},"
-019783:                         f"{player_reacq_selected_v}) "
-019784:                         f"area={player_reacq_selected_area:.1f}px "
-019785:                         f"jump={actual_distance:.1f}px "
-019786:                         f"pred_dist={selected_predicted_distance:.1f}px"
-019787:                     )
-019788:                     visible_ball = None
-019789:                     try:
-019790:                         visible_ball = self._find_night_visible_ball_candidate(
-019791:                             frame, frame_gray
-019792:                         )
-019793:                     except Exception:
-019794:                         visible_ball = None
-019795: 
-019796:                     if visible_ball is not None:
-019797:                         try:
-019798:                             visible_pos = tuple(visible_ball.get('pos', ()))
-019799:                             visible_hsv = visible_ball.get('hsv')
-019800:                             visible_s = (
-019801:                                 int(visible_hsv[1])
-019802:                                 if visible_hsv is not None and len(visible_hsv) >= 3
-019803:                                 else -1
-019804:                             )
-019805:                             visible_motion_mean = float(
-019806:                                 visible_ball.get('motion_mean', 0.0) or 0.0
-019807:                             )
-019808:                             visible_motion_max = float(
-019809:                                 visible_ball.get('motion_max', 0.0) or 0.0
-019810:                             )
-019811:                             visible_conflict_distance = (
-019812:                                 math.hypot(
 019813:                                     float(visible_pos[0]) - float(cx),
 019814:                                     float(visible_pos[1]) - float(cy),
 019815:                                 )
@@ -359,126 +303,182 @@ Generated from `interactive_ball_analyzer.py` on this branch for V25 diagnosis.
 019854:                                 recovery_candidate, frame
 019855:                             )
 019856: 
-019857:                 if (
-019858:                         player_reacq_guard_active and
-019859:                         (
-019860:                             player_reacq_strong_motion or
-019861:                             player_reacq_prediction_close or
-019862:                             player_reacq_close_to_anchor
-019863:                         ) and
-019864:                         self._player_point_zone((cx, cy)) is None
-019865:                 ):
-019866:                     print(
-019867:                         f"Frame {self.frame_count}: [PLAYER-REACQ MOTION CONFIRMED] "
-019868:                         f"clearing guard at ({cx},{cy}) motion={motion_mean:.1f}/{motion_max:.1f} "
-019869:                         f"jump={actual_distance:.1f}px pred_dist={selected_predicted_distance}"
-019870:                     )
-019871:                     self._player_reacq_protect_until_frame = -1
-019872: 
-019873:                 relaxed_contact_min_y = self._contact_reacquire_min_y(
-019874:                     contact_reacquire_bounds,
-019875:                     selected_predicted_distance,
-019876:                     motion_mean,
-019877:                     motion_max,
-019878:                 ) if contact_reacquire_bounds is not None else None
-019879:                 selected_area = selected_area_for_guard
-019880:                 player_reacq_static = self._player_reacq_static_candidate(
-019881:                     {
-019882:                         'pos': (cx, cy),
-019883:                         'area': selected_area,
-019884:                         'motion_mean': motion_mean,
-019885:                         'motion_max': motion_max,
-019886:                     },
-019887:                     predicted_point=predicted_point,
-019888:                 )
-019889:                 # The regular contour search can still run after motion
-019890:                 # reacquisition returns no candidate.  Apply the same
-019891:                 # adjacent-court guard to that path; otherwise a tiny static
-019892:                 # blob outside the singles sideline can reset stuck_frame_count
-019893:                 # and become the point-ending position.
-019894:                 if not player_reacq_static and int(
-019895:                         getattr(self, '_player_reacq_protect_until_frame', -1)
-019896:                     ) >= self.frame_count:
-019897:                     try:
-019898:                         outside_court, outside_side, left_x, right_x = self._point_outside_singles_sidelines(
-019899:                             (cx, cy), frame
-019900:                         )
-019901:                     except Exception:
-019902:                         outside_court, outside_side, left_x, right_x = False, None, None, None
-019903:                     if outside_court:
-019904:                         sideline_depth = (
-019905:                             (float(left_x) - cx) if outside_side == 'left'
-019906:                             else (cx - float(right_x))
-019907:                         )
-019908:                         if sideline_depth > 35.0 or (motion_mean < 6.0 and motion_max < 25.0):
-019909:                             player_reacq_static = True
-019910:                 if not player_reacq_static and int(
-019911:                         getattr(self, '_player_reacq_protect_until_frame', -1)
-019912:                     ) >= self.frame_count:
-019913:                     tracker = getattr(self, 'player_tracker', None)
-019914:                     try:
-019915:                         outside_main_court = (
-019916:                             tracker is not None and
-019917:                             hasattr(tracker, '_center_is_in_court') and
-019918:                             not tracker._center_is_in_court((cx, cy), frame_width=frame.shape[1])
-019919:                         )
-019920:                     except Exception:
-019921:                         outside_main_court = False
-019922:                     if outside_main_court:
-019923:                         player_reacq_static = True
-019924:                 if player_reacq_static:
-019925:                     self._record_rejected_contour_debug(
-019926:                         best_contour,
-019927:                         x1,
-019928:                         y1,
-019929:                         cx,
-019930:                         cy,
-019931:                         selected_area,
-019932:                         "player-reacq distant static blob",
-019933:                         source=best_source,
-019934:                     )
-019935:                     self.stuck_frame_count = max(
-019936:                         int(getattr(self, 'stuck_frame_count', 0)) + 1, 1
-019937:                     )
-019938:                     print(
-019939:                         f"Frame {self.frame_count}: [PLAYER-REACQ STATIC REJECT] "
-019940:                         f"holding {self.ball_center} instead of ({cx},{cy}) "
-019941:                         f"motion={motion_mean:.1f}/{motion_max:.1f}"
-019942:                     )
-019943:                     visible_ball = self._find_night_visible_ball_candidate(frame, frame_gray)
-019944:                     if visible_ball is not None:
-019945:                         print(
-019946:                             f"Frame {self.frame_count}: [PLAYER-REACQ VISIBLE BALL] "
-019947:                             f"using {visible_ball['pos']} area={visible_ball['area']:.1f}px "
-019948:                             f"instead of static candidate ({cx},{cy})"
-019949:                         )
-019950:                         return self._commit_night_visible_ball_recovery(visible_ball, frame)
-019951:                     return self.ball_center
-019952:                 if top_return_search_context:
-019953:                     if (
-019954:                         getattr(self, '_top_return_mode', 'edge') in ('upper_side', 'upper_racket') and
-019955:                         best_source not in ('primary', 'regular', 'alt')
-019956:                     ):
-019957:                         top_return_ok = False
-019958:                         top_return_reason = f"top-return source {best_source} not allowed for upper-side reentry"
-019959:                     else:
-019960:                         top_return_ok, top_return_reason = self._top_return_reentry_ok(
-019961:                             (cx, cy), selected_area, motion_mean, motion_max, frame.shape
-019962:                         )
-019963:                     if not top_return_ok:
-019964:                         motion_reentry = self._find_top_return_motion_reentry(frame, frame_gray)
-019965:                         if motion_reentry is not None:
-019966:                             return self._commit_top_return_reentry(
-019967:                                 motion_reentry, "TOP-RETURN MOTION REENTRY"
-019968:                             )
-019969:                         self._record_rejected_contour_debug(
-019970:                             best_contour,
-019971:                             x1,
-019972:                             y1,
-019973:                             cx,
-019974:                             cy,
-019975:                             selected_area,
-019976:                             top_return_reason,
-019977:                             source=best_source,
+019857:                 # V31: V30 proves the selected f176 candidate is a large,
+019858:                 # low-saturation, prediction-conflicting fragment, but the broad
+019859:                 # visible-ball helper can fail to return an independent candidate
+019860:                 # in that exact frame.  Do not then let a sharp player/racket edge
+019861:                 # clear the protection merely because motion_max is high.  A real
+019862:                 # ball recovery in this sequence has much stronger mean patch
+019863:                 # motion; the false fragment is characteristically spiky
+019864:                 # (low mean, high max).  In this narrow combination, hold the last
+019865:                 # trusted anchor for one additional frame so the genuine ball can
+019866:                 # reappear without poisoning direction/bounce state.
+019867:                 player_reacq_spiky_visible_conflict_hold = (
+019868:                     player_reacq_visible_conflict_probe and
+019869:                     actual_distance >= max(280.0, float(frame.shape[1]) * 0.07) and
+019870:                     selected_predicted_distance is not None and
+019871:                     selected_predicted_distance >= 130.0 and
+019872:                     player_reacq_selected_area >= 180.0 and
+019873:                     0 <= player_reacq_selected_s <= 55 and
+019874:                     motion_mean < 30.0 and
+019875:                     motion_max >= 80.0 and
+019876:                     not top_return_search_context and
+019877:                     not back_return_search_context
+019878:                 )
+019879:                 if player_reacq_spiky_visible_conflict_hold:
+019880:                     self._record_rejected_contour_debug(
+019881:                         best_contour,
+019882:                         x1,
+019883:                         y1,
+019884:                         cx,
+019885:                         cy,
+019886:                         selected_area_for_guard,
+019887:                         (
+019888:                             f'player-reacq spiky visible-conflict hold '
+019889:                             f'jump={actual_distance:.1f}px '
+019890:                             f'pred_dist={selected_predicted_distance:.1f}px '
+019891:                             f'motion={motion_mean:.1f}/{motion_max:.1f}'
+019892:                         ),
+019893:                         source=best_source,
+019894:                     )
+019895:                     self.stuck_frame_count = max(
+019896:                         int(getattr(self, 'stuck_frame_count', 0)) + 1,
+019897:                         1,
+019898:                     )
+019899:                     print(
+019900:                         f'Frame {self.frame_count}: '
+019901:                         f'[PLAYER-REACQ VISIBLE-CONFLICT HOLD] '
+019902:                         f'holding {self.ball_center} instead of ({cx},{cy}) '
+019903:                         f'hsv=({player_reacq_selected_h},'
+019904:                         f'{player_reacq_selected_s},'
+019905:                         f'{player_reacq_selected_v}) '
+019906:                         f'area={player_reacq_selected_area:.1f}px '
+019907:                         f'jump={actual_distance:.1f}px '
+019908:                         f'pred_dist={selected_predicted_distance:.1f}px '
+019909:                         f'motion={motion_mean:.1f}/{motion_max:.1f}'
+019910:                     )
+019911:                     return self.ball_center
+019912: 
+019913:                 if (
+019914:                         player_reacq_guard_active and
+019915:                         (
+019916:                             player_reacq_strong_motion or
+019917:                             player_reacq_prediction_close or
+019918:                             player_reacq_close_to_anchor
+019919:                         ) and
+019920:                         self._player_point_zone((cx, cy)) is None
+019921:                 ):
+019922:                     print(
+019923:                         f"Frame {self.frame_count}: [PLAYER-REACQ MOTION CONFIRMED] "
+019924:                         f"clearing guard at ({cx},{cy}) motion={motion_mean:.1f}/{motion_max:.1f} "
+019925:                         f"jump={actual_distance:.1f}px pred_dist={selected_predicted_distance}"
+019926:                     )
+019927:                     self._player_reacq_protect_until_frame = -1
+019928: 
+019929:                 relaxed_contact_min_y = self._contact_reacquire_min_y(
+019930:                     contact_reacquire_bounds,
+019931:                     selected_predicted_distance,
+019932:                     motion_mean,
+019933:                     motion_max,
+019934:                 ) if contact_reacquire_bounds is not None else None
+019935:                 selected_area = selected_area_for_guard
+019936:                 player_reacq_static = self._player_reacq_static_candidate(
+019937:                     {
+019938:                         'pos': (cx, cy),
+019939:                         'area': selected_area,
+019940:                         'motion_mean': motion_mean,
+019941:                         'motion_max': motion_max,
+019942:                     },
+019943:                     predicted_point=predicted_point,
+019944:                 )
+019945:                 # The regular contour search can still run after motion
+019946:                 # reacquisition returns no candidate.  Apply the same
+019947:                 # adjacent-court guard to that path; otherwise a tiny static
+019948:                 # blob outside the singles sideline can reset stuck_frame_count
+019949:                 # and become the point-ending position.
+019950:                 if not player_reacq_static and int(
+019951:                         getattr(self, '_player_reacq_protect_until_frame', -1)
+019952:                     ) >= self.frame_count:
+019953:                     try:
+019954:                         outside_court, outside_side, left_x, right_x = self._point_outside_singles_sidelines(
+019955:                             (cx, cy), frame
+019956:                         )
+019957:                     except Exception:
+019958:                         outside_court, outside_side, left_x, right_x = False, None, None, None
+019959:                     if outside_court:
+019960:                         sideline_depth = (
+019961:                             (float(left_x) - cx) if outside_side == 'left'
+019962:                             else (cx - float(right_x))
+019963:                         )
+019964:                         if sideline_depth > 35.0 or (motion_mean < 6.0 and motion_max < 25.0):
+019965:                             player_reacq_static = True
+019966:                 if not player_reacq_static and int(
+019967:                         getattr(self, '_player_reacq_protect_until_frame', -1)
+019968:                     ) >= self.frame_count:
+019969:                     tracker = getattr(self, 'player_tracker', None)
+019970:                     try:
+019971:                         outside_main_court = (
+019972:                             tracker is not None and
+019973:                             hasattr(tracker, '_center_is_in_court') and
+019974:                             not tracker._center_is_in_court((cx, cy), frame_width=frame.shape[1])
+019975:                         )
+019976:                     except Exception:
+019977:                         outside_main_court = False
+019978:                     if outside_main_court:
+019979:                         player_reacq_static = True
+019980:                 if player_reacq_static:
+019981:                     self._record_rejected_contour_debug(
+019982:                         best_contour,
+019983:                         x1,
+019984:                         y1,
+019985:                         cx,
+019986:                         cy,
+019987:                         selected_area,
+019988:                         "player-reacq distant static blob",
+019989:                         source=best_source,
+019990:                     )
+019991:                     self.stuck_frame_count = max(
+019992:                         int(getattr(self, 'stuck_frame_count', 0)) + 1, 1
+019993:                     )
+019994:                     print(
+019995:                         f"Frame {self.frame_count}: [PLAYER-REACQ STATIC REJECT] "
+019996:                         f"holding {self.ball_center} instead of ({cx},{cy}) "
+019997:                         f"motion={motion_mean:.1f}/{motion_max:.1f}"
+019998:                     )
+019999:                     visible_ball = self._find_night_visible_ball_candidate(frame, frame_gray)
+020000:                     if visible_ball is not None:
+020001:                         print(
+020002:                             f"Frame {self.frame_count}: [PLAYER-REACQ VISIBLE BALL] "
+020003:                             f"using {visible_ball['pos']} area={visible_ball['area']:.1f}px "
+020004:                             f"instead of static candidate ({cx},{cy})"
+020005:                         )
+020006:                         return self._commit_night_visible_ball_recovery(visible_ball, frame)
+020007:                     return self.ball_center
+020008:                 if top_return_search_context:
+020009:                     if (
+020010:                         getattr(self, '_top_return_mode', 'edge') in ('upper_side', 'upper_racket') and
+020011:                         best_source not in ('primary', 'regular', 'alt')
+020012:                     ):
+020013:                         top_return_ok = False
+020014:                         top_return_reason = f"top-return source {best_source} not allowed for upper-side reentry"
+020015:                     else:
+020016:                         top_return_ok, top_return_reason = self._top_return_reentry_ok(
+020017:                             (cx, cy), selected_area, motion_mean, motion_max, frame.shape
+020018:                         )
+020019:                     if not top_return_ok:
+020020:                         motion_reentry = self._find_top_return_motion_reentry(frame, frame_gray)
+020021:                         if motion_reentry is not None:
+020022:                             return self._commit_top_return_reentry(
+020023:                                 motion_reentry, "TOP-RETURN MOTION REENTRY"
+020024:                             )
+020025:                         self._record_rejected_contour_debug(
+020026:                             best_contour,
+020027:                             x1,
+020028:                             y1,
+020029:                             cx,
+020030:                             cy,
+020031:                             selected_area,
+020032:                             top_return_reason,
+020033:                             source=best_source,
 ```
 
