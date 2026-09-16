@@ -863,117 +863,117 @@
 026984:                             tuple(tracked_position) if tracked_position is not None else None
 026985:                         )
 026986:                     self._debug_local_ai_shadow_frame(frame, prev_ball_center, tracked_position)
-026987:                     if verified_lower_contact_launch:
-026988:                         print(
-026989:                             f"[VERIFIED-LOWER-LAUNCH POST-RECOVERY SKIP] "
-026990:                             f"f{self.frame_count}: keeping launch={tuple(tracked_position)}"
-026991:                         )
-026992:                     if (
-026993:                         not forced_local_ai and
-026994:                         not contact_local_ai and
-026995:                         not verified_lower_contact_launch
-026996:                     ):
-026997:                         tracked_position = self._try_local_ai_recovery(
-026998:                             prev_ball_center, tracked_position, prev_stuck,
-026999:                             pre_track_snapshot=pre_track_snapshot,
-027000:                             frame=frame,
-027001:                         )
-027002:                     self._local_ai_tight_roi_previous_gray = None
-027003:                     # Reject any position that jumps impossibly far in one frame (false positive).
-027004:                     # When the tracker is in re-acquisition mode (stuck >= 5 before the call), allow
-027005:                     # a larger jump because the ball may have traveled far while lost.
-027006:                     if tracked_position and prev_ball_center:
-027007:                         jump = math.hypot(tracked_position[0] - prev_ball_center[0],
-027008:                                           tracked_position[1] - prev_ball_center[1])
-027009:                         motion_reacq_this_frame = (
-027010:                             getattr(self, '_last_motion_reacq_frame', -1000000) == self.frame_count and
-027011:                             getattr(self, '_last_motion_reacq_pos', None) == tracked_position
-027012:                         )
-027013:                         trusted_rally_launch = (
-027014:                             getattr(self, '_trusted_rally_launch_frame', -1000000) == self.frame_count and
-027015:                             getattr(self, '_trusted_rally_launch_pos', None) == tracked_position
+026987:                     # V37: once NIGHT LOWER CONTACT LAUNCH has committed a real
+026988:                     # outbound ball, do not let the generic post-track Local-AI hold
+026989:                     # roll that anchor back on the launch frame or on a physically
+026990:                     # coherent immediate continuation.  This is deliberately narrow:
+026991:                     # only the next two frames are eligible, the motion must still be
+026992:                     # upward/netward, and it must agree with the previously committed
+026993:                     # motion vector.  A player/body jump or reversal therefore remains
+026994:                     # eligible for normal Local-AI arbitration.
+026995:                     lower_launch_frame = int(getattr(
+026996:                         self, '_last_verified_lower_contact_launch_frame', -1000000
+026997:                     ))
+026998:                     lower_launch_age = int(self.frame_count) - lower_launch_frame
+026999:                     verified_lower_contact_continuation = False
+027000:                     continuation_step = 0.0
+027001:                     continuation_cos = -1.0
+027002:                     if (
+027003:                         tracked_position is not None and
+027004:                         prev_ball_center is not None and
+027005:                         pre_track_snapshot is not None and
+027006:                         1 <= lower_launch_age <= 2
+027007:                     ):
+027008:                         continuation_dx = (
+027009:                             float(tracked_position[0]) - float(prev_ball_center[0])
+027010:                         )
+027011:                         continuation_dy = (
+027012:                             float(tracked_position[1]) - float(prev_ball_center[1])
+027013:                         )
+027014:                         continuation_step = math.hypot(
+027015:                             continuation_dx, continuation_dy
 027016:                         )
-027017:                         # Allow a larger jump when re-acquiring after being stuck for 5+ frames:
-027018:                         # a racket hit can send the ball 800+ px in one frame, so we use 1500px
-027019:                         # to let motion-based re-acquisition recover across the full court.
-027020:                         max_jump = 1500 if (
-027021:                             prev_stuck >= 5 or prev_top_return_wait or prev_back_return_wait or
-027022:                             motion_reacq_this_frame or trusted_rally_launch
-027023:                         ) else 400
-027024:                         if jump > max_jump:
-027025:                             print(f"[JUMP_REJECTED] f{self.frame_count}: jumped {jump:.0f}px from {prev_ball_center} to {tracked_position} (limit={max_jump}px, prev_stuck={prev_stuck}), keeping previous")
-027026:                             self.ball_center = prev_ball_center
-027027:                             self.stuck_frame_count = max(self.stuck_frame_count, prev_stuck + 1)
-027028:                             tracked_position = prev_ball_center
-027029: 
-027030:                     # Validate only the position that survived the physical
-027031:                     # jump gate above.  Previously the provisional serve
-027032:                     # state consumed a 425px false contour at a prior frame before
-027033:                     # that contour was rejected below.  Its bogus vector then
-027034:                     # hid the real upward reversal at a prior frame.
-027035:                     # Once a far toss is independently marked as caught, it
-027036:                     # becomes a *history* question only.  Do not continue to
-027037:                     # mutate the live provisional flags: the previous attempt
-027038:                     # cleared those flags at a prior frame and changed the otherwise
-027039:                     # stable HSV path of the following real rally.
-027040:                     tainted_far_toss_active = (
-027041:                         isinstance(
-027042:                             getattr(self, '_tainted_provisional_serve_start', None),
-027043:                             dict,
-027044:                         ) and
-027045:                         getattr(self, '_provisional_serve_start_kind', None) ==
-027046:                         'far-top-post-hit'
+027017:                         prior_motion = pre_track_snapshot.get('last_motion') or {}
+027018:                         prior_dx = float(prior_motion.get('dx', 0.0) or 0.0)
+027019:                         prior_dy = float(prior_motion.get('dy', 0.0) or 0.0)
+027020:                         prior_step = float(
+027021:                             prior_motion.get('distance', 0.0) or
+027022:                             math.hypot(prior_dx, prior_dy)
+027023:                         )
+027024:                         if continuation_step > 0.0 and prior_step > 0.0:
+027025:                             continuation_cos = (
+027026:                                 continuation_dx * prior_dx +
+027027:                                 continuation_dy * prior_dy
+027028:                             ) / (continuation_step * prior_step)
+027029:                         continuation_limit = max(
+027030:                             180.0,
+027031:                             min(320.0, prior_step * 2.2 + 60.0),
+027032:                         )
+027033:                         verified_lower_contact_continuation = (
+027034:                             12.0 <= continuation_step <= continuation_limit and
+027035:                             continuation_dy <= -12.0 and
+027036:                             prior_dy <= -8.0 and
+027037:                             continuation_cos >= 0.25
+027038:                         )
+027039: 
+027040:                     verified_lower_contact_post_guard = (
+027041:                         tracked_position is not None and
+027042:                         (
+027043:                             lower_launch_age == 0 or
+027044:                             verified_lower_contact_launch or
+027045:                             verified_lower_contact_continuation
+027046:                         )
 027047:                     )
-027048:                     provisional_kind_before_validation = getattr(
-027049:                         self, '_provisional_serve_start_kind', None
-027050:                     )
-027051:                     provisional_reject_reason = (
-027052:                         None if tainted_far_toss_active else
-027053:                         self._validate_provisional_serve_start(
-027054:                             prev_ball_center, tracked_position
-027055:                         )
-027056:                     )
-027057:                     # A pending far-toss token is solely a fallback for a
-027058:                     # *rejected* practice toss.  Once this tentative flight
-027059:                     # has earned three coherent netward steps, it is a real
-027060:                     # serve (for example a prior frame -> a prior frame) and the token must
-027061:                     # not survive its fault/end state.  Leaving it alive
-027062:                     # caused the local model to re-use that old start at
-027063:                     # a prior frame and inject a second, false point.
-027064:                     if provisional_reject_reason is not None:
-027065:                         provisional_kind = getattr(self, '_provisional_serve_start_kind', None)
-027066:                         rejected_start = self._current_history_serve_start_frame()
-027067:                         if provisional_kind == 'far-top-post-hit':
-027068:                             # This is a caught far-side toss.  Do *not* reset
-027069:                             # to WAITING_FOR_SERVE: that was the rejected
-027070:                             # approach and it changed later, already-verified
-027071:                             # points.  Keep the normal HSV flow alive and ask
-027072:                             # local AI to prove a later outgoing path in
-027073:                             # shadow mode.  Only proven evidence may alter the
-027074:                             # final history/serve-fault interpretation.
-027075:                             self._tainted_provisional_serve_start = {
-027076:                                 'start_frame': rejected_start,
-027077:                                 'detected_frame': int(self.frame_count),
-027078:                                 'anchor': tuple(prev_ball_center),
-027079:                                 'reason': provisional_reject_reason,
-027080:                             }
-027081:                             print(
-027082:                                 f"[SERVE_START_TAINTED] f{self.frame_count}: "
-027083:                                 f"keeping tracker/provisional state for start f{rejected_start}; "
-027084:                                 f"{provisional_reject_reason}"
-027085:                             )
-027086:                         else:
-027087:                             print(
-027088:                                 f"[SERVE_START_REJECTED] f{self.frame_count}: "
-027089:                                 f"discarding provisional start f{rejected_start}; "
-027090:                                 f"{provisional_reject_reason}"
-027091:                             )
-027092:                             self._point_history_current = None
-027093:                             self._provisional_serve_start_kind = None
-027094:                             self._serve_start_requires_confirmation = False
-027095:                             game_state = "WAITING_FOR_SERVE"
-027096:                             clear_waiting_serve_history()
-027097:                             reset_tracking_state()
-027098:                             continue
-027099:                     # Shadow verification is intentionally side-effect free
+027048:                     if verified_lower_contact_post_guard:
+027049:                         guard_kind = (
+027050:                             'launch'
+027051:                             if lower_launch_age == 0 or verified_lower_contact_launch
+027052:                             else 'continuation'
+027053:                         )
+027054:                         print(
+027055:                             f"[VERIFIED-LOWER-CONTACT POST-RECOVERY SKIP] "
+027056:                             f"f{self.frame_count}: kind={guard_kind} age={lower_launch_age} "
+027057:                             f"keeping={tuple(tracked_position)} step={continuation_step:.1f}px "
+027058:                             f"cos={continuation_cos:.3f}"
+027059:                         )
+027060:                     if (
+027061:                         not forced_local_ai and
+027062:                         not contact_local_ai and
+027063:                         not verified_lower_contact_post_guard
+027064:                     ):
+027065:                         tracked_position = self._try_local_ai_recovery(
+027066:                             prev_ball_center, tracked_position, prev_stuck,
+027067:                             pre_track_snapshot=pre_track_snapshot,
+027068:                             frame=frame,
+027069:                         )
+027070:                     self._local_ai_tight_roi_previous_gray = None
+027071:                     # Reject any position that jumps impossibly far in one frame (false positive).
+027072:                     # When the tracker is in re-acquisition mode (stuck >= 5 before the call), allow
+027073:                     # a larger jump because the ball may have traveled far while lost.
+027074:                     if tracked_position and prev_ball_center:
+027075:                         jump = math.hypot(tracked_position[0] - prev_ball_center[0],
+027076:                                           tracked_position[1] - prev_ball_center[1])
+027077:                         motion_reacq_this_frame = (
+027078:                             getattr(self, '_last_motion_reacq_frame', -1000000) == self.frame_count and
+027079:                             getattr(self, '_last_motion_reacq_pos', None) == tracked_position
+027080:                         )
+027081:                         trusted_rally_launch = (
+027082:                             getattr(self, '_trusted_rally_launch_frame', -1000000) == self.frame_count and
+027083:                             getattr(self, '_trusted_rally_launch_pos', None) == tracked_position
+027084:                         )
+027085:                         # Allow a larger jump when re-acquiring after being stuck for 5+ frames:
+027086:                         # a racket hit can send the ball 800+ px in one frame, so we use 1500px
+027087:                         # to let motion-based re-acquisition recover across the full court.
+027088:                         max_jump = 1500 if (
+027089:                             prev_stuck >= 5 or prev_top_return_wait or prev_back_return_wait or
+027090:                             motion_reacq_this_frame or trusted_rally_launch
+027091:                         ) else 400
+027092:                         if jump > max_jump:
+027093:                             print(f"[JUMP_REJECTED] f{self.frame_count}: jumped {jump:.0f}px from {prev_ball_center} to {tracked_position} (limit={max_jump}px, prev_stuck={prev_stuck}), keeping previous")
+027094:                             self.ball_center = prev_ball_center
+027095:                             self.stuck_frame_count = max(self.stuck_frame_count, prev_stuck + 1)
+027096:                             tracked_position = prev_ball_center
+027097: 
+027098:                     # Validate only the position that survived the physical
+027099:                     # jump gate above.  Previously the provisional serve
 ```
