@@ -1,0 +1,34 @@
+name: Apply V37 verified lower-contact continuation guard
+
+on:
+  push:
+    branches:
+      - codex/shallow-serve-turn-candidate
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: codex/shallow-serve-turn-candidate
+          fetch-depth: 0
+      - name: Apply V37 patch
+        run: python tools/apply_v37_verified_lower_contact_continuation_guard.py
+      - name: Compile tracker
+        run: python -m py_compile interactive_ball_analyzer.py
+      - name: Commit tracker change
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add interactive_ball_analyzer.py
+          if git diff --cached --quiet; then
+            echo "No tracker changes"
+            exit 0
+          fi
+          git commit -m "Apply V37 verified lower-contact continuation guard"
+          git push origin HEAD:codex/shallow-serve-turn-candidate
