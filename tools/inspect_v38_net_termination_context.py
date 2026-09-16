@@ -1,5 +1,6 @@
 from pathlib import Path
 
+# V38 source-only inspection helper. It does not modify runtime code.
 SOURCE = Path("interactive_ball_analyzer.py")
 OUT = Path("V38_NET_TERMINATION_CONTEXT.md")
 
