@@ -23764,13 +23764,13 @@ class InteractiveBallAnalyzer:
                             direct_contact_zone
                         )
 
-                        # V38: V37's repaired trajectory reaches the net correctly, but
-                        # its low-speed f322 turn can sit just outside the strict net
-                        # polygon/top-tape gate.  Accept only this very narrow physical
-                        # signature: the ball was crawling immediately before a sharp
-                        # downward turn, both the live point and the direction-change
-                        # point are still within the calibrated near-net polygon, and
-                        # the current step remains slow.  The surrounding branch already
+                        # V39: V37's repaired trajectory reaches the net correctly, but
+                        # its low-speed f322 turn can straddle the strict net boundary:
+                        # the previous turn point may be just outside while the live ball is
+                        # already inside. Accept only this very narrow physical signature:
+                        # the ball was crawling immediately before a sharp downward turn,
+                        # both points are within the calibrated near-net polygon margin, and
+                        # the current step remains slow. The surrounding branch already
                         # excludes recent ground/serve bounces, so ordinary near-net
                         # court bounces keep their existing classification.
                         v38_slow_near_net_turn = (
@@ -23778,7 +23778,6 @@ class InteractiveBallAnalyzer:
                             last_change_geometry is not None and
                             net_geometry.get('near_polygon', False) and
                             last_change_geometry.get('near_polygon', False) and
-                            not direct_contact_zone and
                             prev_dist <= 5.0 and
                             curr_dist <= 15.0 and
                             curr_dy >= 4.0 and
@@ -23787,7 +23786,7 @@ class InteractiveBallAnalyzer:
                         if recent_net_turn or v38_slow_near_net_turn:
                             if v38_slow_near_net_turn and not recent_net_turn:
                                 print(
-                                    f"Frame {self.frame_count}: [V38 SLOW NEAR-NET TURN] "
+                                    f"Frame {self.frame_count}: [V39 SLOW NEAR-NET TURN] "
                                     f"prev_speed={prev_dist:.1f}px curr_speed={curr_dist:.1f}px "
                                     f"curr_dy={curr_dy:.1f}px angle_diff={angle_diff:.1f} "
                                     f"signed_dist={net_geometry.get('signed_dist', 0.0):.1f}px "
