@@ -1378,255 +1378,255 @@
 
 ## 'tracked_position = self._try_local_ai_recovery(' — 1 hit(s)
 ```python
-026995:                     lower_launch_frame = int(getattr(
-026996:                         self, '_last_verified_lower_contact_launch_frame', -1000000
-026997:                     ))
-026998:                     lower_launch_age = int(self.frame_count) - lower_launch_frame
-026999:                     verified_lower_contact_continuation = False
-027000:                     continuation_step = 0.0
-027001:                     continuation_cos = -1.0
-027002:                     if (
-027003:                         tracked_position is not None and
-027004:                         prev_ball_center is not None and
-027005:                         pre_track_snapshot is not None and
-027006:                         1 <= lower_launch_age <= 2
-027007:                     ):
-027008:                         continuation_dx = (
-027009:                             float(tracked_position[0]) - float(prev_ball_center[0])
-027010:                         )
-027011:                         continuation_dy = (
-027012:                             float(tracked_position[1]) - float(prev_ball_center[1])
-027013:                         )
-027014:                         continuation_step = math.hypot(
-027015:                             continuation_dx, continuation_dy
-027016:                         )
-027017:                         prior_motion = pre_track_snapshot.get('last_motion') or {}
-027018:                         prior_dx = float(prior_motion.get('dx', 0.0) or 0.0)
-027019:                         prior_dy = float(prior_motion.get('dy', 0.0) or 0.0)
-027020:                         prior_step = float(
-027021:                             prior_motion.get('distance', 0.0) or
-027022:                             math.hypot(prior_dx, prior_dy)
-027023:                         )
-027024:                         if continuation_step > 0.0 and prior_step > 0.0:
-027025:                             continuation_cos = (
-027026:                                 continuation_dx * prior_dx +
-027027:                                 continuation_dy * prior_dy
-027028:                             ) / (continuation_step * prior_step)
-027029:                         continuation_limit = max(
-027030:                             180.0,
-027031:                             min(320.0, prior_step * 2.2 + 60.0),
-027032:                         )
-027033:                         verified_lower_contact_continuation = (
-027034:                             12.0 <= continuation_step <= continuation_limit and
-027035:                             continuation_dy <= -12.0 and
-027036:                             prior_dy <= -8.0 and
-027037:                             continuation_cos >= 0.25
-027038:                         )
-027039: 
-027040:                     verified_lower_contact_post_guard = (
-027041:                         tracked_position is not None and
-027042:                         (
-027043:                             lower_launch_age == 0 or
-027044:                             verified_lower_contact_launch or
-027045:                             verified_lower_contact_continuation
-027046:                         )
-027047:                     )
-027048:                     if verified_lower_contact_post_guard:
-027049:                         guard_kind = (
-027050:                             'launch'
-027051:                             if lower_launch_age == 0 or verified_lower_contact_launch
-027052:                             else 'continuation'
-027053:                         )
-027054:                         print(
-027055:                             f"[VERIFIED-LOWER-CONTACT POST-RECOVERY SKIP] "
-027056:                             f"f{self.frame_count}: kind={guard_kind} age={lower_launch_age} "
-027057:                             f"keeping={tuple(tracked_position)} step={continuation_step:.1f}px "
-027058:                             f"cos={continuation_cos:.3f}"
-027059:                         )
-027060:                     if (
-027061:                         not forced_local_ai and
-027062:                         not contact_local_ai and
-027063:                         not verified_lower_contact_post_guard
-027064:                     ):
-027065:                         tracked_position = self._try_local_ai_recovery(
-027066:                             prev_ball_center, tracked_position, prev_stuck,
-027067:                             pre_track_snapshot=pre_track_snapshot,
-027068:                             frame=frame,
-027069:                         )
-027070:                     self._local_ai_tight_roi_previous_gray = None
-027071:                     # Reject any position that jumps impossibly far in one frame (false positive).
-027072:                     # When the tracker is in re-acquisition mode (stuck >= 5 before the call), allow
-027073:                     # a larger jump because the ball may have traveled far while lost.
-027074:                     if tracked_position and prev_ball_center:
-027075:                         jump = math.hypot(tracked_position[0] - prev_ball_center[0],
-027076:                                           tracked_position[1] - prev_ball_center[1])
-027077:                         motion_reacq_this_frame = (
-027078:                             getattr(self, '_last_motion_reacq_frame', -1000000) == self.frame_count and
-027079:                             getattr(self, '_last_motion_reacq_pos', None) == tracked_position
-027080:                         )
-027081:                         trusted_rally_launch = (
-027082:                             getattr(self, '_trusted_rally_launch_frame', -1000000) == self.frame_count and
-027083:                             getattr(self, '_trusted_rally_launch_pos', None) == tracked_position
-027084:                         )
-027085:                         # Allow a larger jump when re-acquiring after being stuck for 5+ frames:
-027086:                         # a racket hit can send the ball 800+ px in one frame, so we use 1500px
-027087:                         # to let motion-based re-acquisition recover across the full court.
-027088:                         max_jump = 1500 if (
-027089:                             prev_stuck >= 5 or prev_top_return_wait or prev_back_return_wait or
-027090:                             motion_reacq_this_frame or trusted_rally_launch
-027091:                         ) else 400
-027092:                         if jump > max_jump:
-027093:                             print(f"[JUMP_REJECTED] f{self.frame_count}: jumped {jump:.0f}px from {prev_ball_center} to {tracked_position} (limit={max_jump}px, prev_stuck={prev_stuck}), keeping previous")
-027094:                             self.ball_center = prev_ball_center
-027095:                             self.stuck_frame_count = max(self.stuck_frame_count, prev_stuck + 1)
-027096:                             tracked_position = prev_ball_center
-027097: 
-027098:                     # Validate only the position that survived the physical
-027099:                     # jump gate above.  Previously the provisional serve
-027100:                     # state consumed a 425px false contour at a prior frame before
-027101:                     # that contour was rejected below.  Its bogus vector then
-027102:                     # hid the real upward reversal at a prior frame.
-027103:                     # Once a far toss is independently marked as caught, it
-027104:                     # becomes a *history* question only.  Do not continue to
-027105:                     # mutate the live provisional flags: the previous attempt
-027106:                     # cleared those flags at a prior frame and changed the otherwise
-027107:                     # stable HSV path of the following real rally.
-027108:                     tainted_far_toss_active = (
-027109:                         isinstance(
-027110:                             getattr(self, '_tainted_provisional_serve_start', None),
-027111:                             dict,
-027112:                         ) and
-027113:                         getattr(self, '_provisional_serve_start_kind', None) ==
-027114:                         'far-top-post-hit'
-027115:                     )
-027116:                     provisional_kind_before_validation = getattr(
-027117:                         self, '_provisional_serve_start_kind', None
-027118:                     )
-027119:                     provisional_reject_reason = (
-027120:                         None if tainted_far_toss_active else
-027121:                         self._validate_provisional_serve_start(
-027122:                             prev_ball_center, tracked_position
-027123:                         )
-027124:                     )
-027125:                     # A pending far-toss token is solely a fallback for a
-027126:                     # *rejected* practice toss.  Once this tentative flight
-027127:                     # has earned three coherent netward steps, it is a real
-027128:                     # serve (for example a prior frame -> a prior frame) and the token must
-027129:                     # not survive its fault/end state.  Leaving it alive
-027130:                     # caused the local model to re-use that old start at
-027131:                     # a prior frame and inject a second, false point.
-027132:                     if provisional_reject_reason is not None:
-027133:                         provisional_kind = getattr(self, '_provisional_serve_start_kind', None)
-027134:                         rejected_start = self._current_history_serve_start_frame()
-027135:                         if provisional_kind == 'far-top-post-hit':
-027136:                             # This is a caught far-side toss.  Do *not* reset
-027137:                             # to WAITING_FOR_SERVE: that was the rejected
-027138:                             # approach and it changed later, already-verified
-027139:                             # points.  Keep the normal HSV flow alive and ask
-027140:                             # local AI to prove a later outgoing path in
-027141:                             # shadow mode.  Only proven evidence may alter the
-027142:                             # final history/serve-fault interpretation.
-027143:                             self._tainted_provisional_serve_start = {
-027144:                                 'start_frame': rejected_start,
-027145:                                 'detected_frame': int(self.frame_count),
-027146:                                 'anchor': tuple(prev_ball_center),
-027147:                                 'reason': provisional_reject_reason,
-027148:                             }
-027149:                             print(
-027150:                                 f"[SERVE_START_TAINTED] f{self.frame_count}: "
-027151:                                 f"keeping tracker/provisional state for start f{rejected_start}; "
-027152:                                 f"{provisional_reject_reason}"
-027153:                             )
-027154:                         else:
-027155:                             print(
-027156:                                 f"[SERVE_START_REJECTED] f{self.frame_count}: "
-027157:                                 f"discarding provisional start f{rejected_start}; "
-027158:                                 f"{provisional_reject_reason}"
-027159:                             )
-027160:                             self._point_history_current = None
-027161:                             self._provisional_serve_start_kind = None
-027162:                             self._serve_start_requires_confirmation = False
-027163:                             game_state = "WAITING_FOR_SERVE"
-027164:                             clear_waiting_serve_history()
-027165:                             reset_tracking_state()
-027166:                             continue
-027167:                     # Shadow verification is intentionally side-effect free
-027168:                     # for ball position/game state.  It only supplies a
-027169:                     # later verified launch frame for history/fault scoring.
-027170:                     reconcile_tainted_far_serve_start()
-027171:                     if getattr(self, "_discard_provisional_serve_from_ai", False):
-027172:                         self._discard_provisional_serve_from_ai = False
-027173:                         self._ignore_unconfirmed_serve_start_result(
-027174:                             "local AI rejected repeated all-player-body recovery path"
-027175:                         )
-027176:                         print(
-027177:                             f"[SERVE_START_IGNORED] f{self.frame_count}: "
-027178:                             "discarding false provisional serve after repeated local-AI body paths"
-027179:                         )
-027180:                         game_state = "WAITING_FOR_SERVE"
-027181:                         clear_waiting_serve_history()
-027182:                         reset_tracking_state()
-027183:                         continue
-027184:                 if tracked_position:
-027185:                     vel = self.last_motion['distance'] if self.last_motion else 0
-027186:                     size_text = f"{self.ball_size:.1f}px" if self.ball_size is not None else "unknown"
-027187:                     vel_hist_tail = [round(v, 1) for v in getattr(self, 'ball_velocity_history', [])[-5:]]
-027188:                     print(f"Frame {self.frame_count}: Ball tracked at {tracked_position} - Size: {size_text}")
-027189:                     print(f"[TRACK] f{self.frame_count}: pos={tracked_position} vel={vel:.1f}px stuck={self.stuck_frame_count} vel_hist={vel_hist_tail}")
-027190:                     # Infer a visually missed return before any queued point-end is scored.
-027191:                     self._maybe_infer_return_contact_from_side_recross(tracked_position, frame)
-027192:                     if self._point_history_current is not None:
-027193:                         self._point_history_current.setdefault('tracking_trace', []).append({
-027194:                             'frame': int(self.frame_count),
-027195:                             'pos': [int(tracked_position[0]), int(tracked_position[1])],
-027196:                             'size': float(self.ball_size) if self.ball_size is not None else None,
-027197:                             'stuck': int(self.stuck_frame_count),
-027198:                         })
-027199:                     if self.ball_dataset_exporter is not None:
-027200:                         self.ball_dataset_exporter.write_frame(
-027201:                             frame,
-027202:                             source_frame=self.frame_count,
-027203:                             ball_center=tracked_position,
-027204:                             ball_area=self.ball_size,
-027205:                             stuck_frames=self.stuck_frame_count,
-027206:                             motion_distance=(self.last_motion or {}).get('distance'),
-027207:                             tracking_active=self.tracking,
-027208:                             point_index=(
-027209:                                 self._point_history_current.get('point_index')
-027210:                                 if self._point_history_current is not None else None
-027211:                             ),
-027212:                         )
-027213: 
-027214:                     pending_reason = getattr(self, '_pending_rally_end_reason', None)
-027215:                     if pending_reason and reference_target_hold:
-027216:                         print(
-027217:                             f"Frame {self.frame_count}: [REFERENCE_POINT_HOLD] "
-027218:                             f"discarding premature queued end '{pending_reason}' "
-027219:                             f"until f{reference_target_frame}"
-027220:                         )
-027221:                         self._pending_rally_end_reason = None
-027222:                         self._pending_rally_end_frame = -1
-027223:                         pending_reason = None
-027224:                     if pending_reason:
-027225:                         # Before scoring a service-box fault, prefer a separate
-027226:                         # moving ball that continues the incoming trajectory.
-027227:                         # This catches the f1785 stale-marker regression without
-027228:                         # weakening genuine bounce reversals.
-027229:                         if self._resume_false_serve_bounce_from_motion(
-027230:                             pending_reason, tracked_position
-027231:                         ):
-027232:                             self._pending_rally_end_reason = None
-027233:                             self._pending_rally_end_frame = -1
-027234:                             continue
-027235:                         # Point-end detection can queue an out reason one or
-027236:                         # more frames before the stuck timeout is reached.  If
-027237:                         # this is still an unconfirmed serve toss with no
-027238:                         # racket/net contact and the marker has stopped, drop
-027239:                         # the queued false end instead of writing a bogus row.
-027240:                         suppressed_frame = int(
-027241:                             getattr(self, '_last_out_bounce_suppressed_frame', -1000000)
-027242:                         )
-027243:                         suppressed_point = getattr(self, '_last_out_bounce_suppressed_point', None)
-027244:                         recent_static_serve_abort = (
+027024:                     lower_launch_frame = int(getattr(
+027025:                         self, '_last_verified_lower_contact_launch_frame', -1000000
+027026:                     ))
+027027:                     lower_launch_age = int(self.frame_count) - lower_launch_frame
+027028:                     verified_lower_contact_continuation = False
+027029:                     continuation_step = 0.0
+027030:                     continuation_cos = -1.0
+027031:                     if (
+027032:                         tracked_position is not None and
+027033:                         prev_ball_center is not None and
+027034:                         pre_track_snapshot is not None and
+027035:                         1 <= lower_launch_age <= 2
+027036:                     ):
+027037:                         continuation_dx = (
+027038:                             float(tracked_position[0]) - float(prev_ball_center[0])
+027039:                         )
+027040:                         continuation_dy = (
+027041:                             float(tracked_position[1]) - float(prev_ball_center[1])
+027042:                         )
+027043:                         continuation_step = math.hypot(
+027044:                             continuation_dx, continuation_dy
+027045:                         )
+027046:                         prior_motion = pre_track_snapshot.get('last_motion') or {}
+027047:                         prior_dx = float(prior_motion.get('dx', 0.0) or 0.0)
+027048:                         prior_dy = float(prior_motion.get('dy', 0.0) or 0.0)
+027049:                         prior_step = float(
+027050:                             prior_motion.get('distance', 0.0) or
+027051:                             math.hypot(prior_dx, prior_dy)
+027052:                         )
+027053:                         if continuation_step > 0.0 and prior_step > 0.0:
+027054:                             continuation_cos = (
+027055:                                 continuation_dx * prior_dx +
+027056:                                 continuation_dy * prior_dy
+027057:                             ) / (continuation_step * prior_step)
+027058:                         continuation_limit = max(
+027059:                             180.0,
+027060:                             min(320.0, prior_step * 2.2 + 60.0),
+027061:                         )
+027062:                         verified_lower_contact_continuation = (
+027063:                             12.0 <= continuation_step <= continuation_limit and
+027064:                             continuation_dy <= -12.0 and
+027065:                             prior_dy <= -8.0 and
+027066:                             continuation_cos >= 0.25
+027067:                         )
+027068: 
+027069:                     verified_lower_contact_post_guard = (
+027070:                         tracked_position is not None and
+027071:                         (
+027072:                             lower_launch_age == 0 or
+027073:                             verified_lower_contact_launch or
+027074:                             verified_lower_contact_continuation
+027075:                         )
+027076:                     )
+027077:                     if verified_lower_contact_post_guard:
+027078:                         guard_kind = (
+027079:                             'launch'
+027080:                             if lower_launch_age == 0 or verified_lower_contact_launch
+027081:                             else 'continuation'
+027082:                         )
+027083:                         print(
+027084:                             f"[VERIFIED-LOWER-CONTACT POST-RECOVERY SKIP] "
+027085:                             f"f{self.frame_count}: kind={guard_kind} age={lower_launch_age} "
+027086:                             f"keeping={tuple(tracked_position)} step={continuation_step:.1f}px "
+027087:                             f"cos={continuation_cos:.3f}"
+027088:                         )
+027089:                     if (
+027090:                         not forced_local_ai and
+027091:                         not contact_local_ai and
+027092:                         not verified_lower_contact_post_guard
+027093:                     ):
+027094:                         tracked_position = self._try_local_ai_recovery(
+027095:                             prev_ball_center, tracked_position, prev_stuck,
+027096:                             pre_track_snapshot=pre_track_snapshot,
+027097:                             frame=frame,
+027098:                         )
+027099:                     self._local_ai_tight_roi_previous_gray = None
+027100:                     # Reject any position that jumps impossibly far in one frame (false positive).
+027101:                     # When the tracker is in re-acquisition mode (stuck >= 5 before the call), allow
+027102:                     # a larger jump because the ball may have traveled far while lost.
+027103:                     if tracked_position and prev_ball_center:
+027104:                         jump = math.hypot(tracked_position[0] - prev_ball_center[0],
+027105:                                           tracked_position[1] - prev_ball_center[1])
+027106:                         motion_reacq_this_frame = (
+027107:                             getattr(self, '_last_motion_reacq_frame', -1000000) == self.frame_count and
+027108:                             getattr(self, '_last_motion_reacq_pos', None) == tracked_position
+027109:                         )
+027110:                         trusted_rally_launch = (
+027111:                             getattr(self, '_trusted_rally_launch_frame', -1000000) == self.frame_count and
+027112:                             getattr(self, '_trusted_rally_launch_pos', None) == tracked_position
+027113:                         )
+027114:                         # Allow a larger jump when re-acquiring after being stuck for 5+ frames:
+027115:                         # a racket hit can send the ball 800+ px in one frame, so we use 1500px
+027116:                         # to let motion-based re-acquisition recover across the full court.
+027117:                         max_jump = 1500 if (
+027118:                             prev_stuck >= 5 or prev_top_return_wait or prev_back_return_wait or
+027119:                             motion_reacq_this_frame or trusted_rally_launch
+027120:                         ) else 400
+027121:                         if jump > max_jump:
+027122:                             print(f"[JUMP_REJECTED] f{self.frame_count}: jumped {jump:.0f}px from {prev_ball_center} to {tracked_position} (limit={max_jump}px, prev_stuck={prev_stuck}), keeping previous")
+027123:                             self.ball_center = prev_ball_center
+027124:                             self.stuck_frame_count = max(self.stuck_frame_count, prev_stuck + 1)
+027125:                             tracked_position = prev_ball_center
+027126: 
+027127:                     # Validate only the position that survived the physical
+027128:                     # jump gate above.  Previously the provisional serve
+027129:                     # state consumed a 425px false contour at a prior frame before
+027130:                     # that contour was rejected below.  Its bogus vector then
+027131:                     # hid the real upward reversal at a prior frame.
+027132:                     # Once a far toss is independently marked as caught, it
+027133:                     # becomes a *history* question only.  Do not continue to
+027134:                     # mutate the live provisional flags: the previous attempt
+027135:                     # cleared those flags at a prior frame and changed the otherwise
+027136:                     # stable HSV path of the following real rally.
+027137:                     tainted_far_toss_active = (
+027138:                         isinstance(
+027139:                             getattr(self, '_tainted_provisional_serve_start', None),
+027140:                             dict,
+027141:                         ) and
+027142:                         getattr(self, '_provisional_serve_start_kind', None) ==
+027143:                         'far-top-post-hit'
+027144:                     )
+027145:                     provisional_kind_before_validation = getattr(
+027146:                         self, '_provisional_serve_start_kind', None
+027147:                     )
+027148:                     provisional_reject_reason = (
+027149:                         None if tainted_far_toss_active else
+027150:                         self._validate_provisional_serve_start(
+027151:                             prev_ball_center, tracked_position
+027152:                         )
+027153:                     )
+027154:                     # A pending far-toss token is solely a fallback for a
+027155:                     # *rejected* practice toss.  Once this tentative flight
+027156:                     # has earned three coherent netward steps, it is a real
+027157:                     # serve (for example a prior frame -> a prior frame) and the token must
+027158:                     # not survive its fault/end state.  Leaving it alive
+027159:                     # caused the local model to re-use that old start at
+027160:                     # a prior frame and inject a second, false point.
+027161:                     if provisional_reject_reason is not None:
+027162:                         provisional_kind = getattr(self, '_provisional_serve_start_kind', None)
+027163:                         rejected_start = self._current_history_serve_start_frame()
+027164:                         if provisional_kind == 'far-top-post-hit':
+027165:                             # This is a caught far-side toss.  Do *not* reset
+027166:                             # to WAITING_FOR_SERVE: that was the rejected
+027167:                             # approach and it changed later, already-verified
+027168:                             # points.  Keep the normal HSV flow alive and ask
+027169:                             # local AI to prove a later outgoing path in
+027170:                             # shadow mode.  Only proven evidence may alter the
+027171:                             # final history/serve-fault interpretation.
+027172:                             self._tainted_provisional_serve_start = {
+027173:                                 'start_frame': rejected_start,
+027174:                                 'detected_frame': int(self.frame_count),
+027175:                                 'anchor': tuple(prev_ball_center),
+027176:                                 'reason': provisional_reject_reason,
+027177:                             }
+027178:                             print(
+027179:                                 f"[SERVE_START_TAINTED] f{self.frame_count}: "
+027180:                                 f"keeping tracker/provisional state for start f{rejected_start}; "
+027181:                                 f"{provisional_reject_reason}"
+027182:                             )
+027183:                         else:
+027184:                             print(
+027185:                                 f"[SERVE_START_REJECTED] f{self.frame_count}: "
+027186:                                 f"discarding provisional start f{rejected_start}; "
+027187:                                 f"{provisional_reject_reason}"
+027188:                             )
+027189:                             self._point_history_current = None
+027190:                             self._provisional_serve_start_kind = None
+027191:                             self._serve_start_requires_confirmation = False
+027192:                             game_state = "WAITING_FOR_SERVE"
+027193:                             clear_waiting_serve_history()
+027194:                             reset_tracking_state()
+027195:                             continue
+027196:                     # Shadow verification is intentionally side-effect free
+027197:                     # for ball position/game state.  It only supplies a
+027198:                     # later verified launch frame for history/fault scoring.
+027199:                     reconcile_tainted_far_serve_start()
+027200:                     if getattr(self, "_discard_provisional_serve_from_ai", False):
+027201:                         self._discard_provisional_serve_from_ai = False
+027202:                         self._ignore_unconfirmed_serve_start_result(
+027203:                             "local AI rejected repeated all-player-body recovery path"
+027204:                         )
+027205:                         print(
+027206:                             f"[SERVE_START_IGNORED] f{self.frame_count}: "
+027207:                             "discarding false provisional serve after repeated local-AI body paths"
+027208:                         )
+027209:                         game_state = "WAITING_FOR_SERVE"
+027210:                         clear_waiting_serve_history()
+027211:                         reset_tracking_state()
+027212:                         continue
+027213:                 if tracked_position:
+027214:                     vel = self.last_motion['distance'] if self.last_motion else 0
+027215:                     size_text = f"{self.ball_size:.1f}px" if self.ball_size is not None else "unknown"
+027216:                     vel_hist_tail = [round(v, 1) for v in getattr(self, 'ball_velocity_history', [])[-5:]]
+027217:                     print(f"Frame {self.frame_count}: Ball tracked at {tracked_position} - Size: {size_text}")
+027218:                     print(f"[TRACK] f{self.frame_count}: pos={tracked_position} vel={vel:.1f}px stuck={self.stuck_frame_count} vel_hist={vel_hist_tail}")
+027219:                     # Infer a visually missed return before any queued point-end is scored.
+027220:                     self._maybe_infer_return_contact_from_side_recross(tracked_position, frame)
+027221:                     if self._point_history_current is not None:
+027222:                         self._point_history_current.setdefault('tracking_trace', []).append({
+027223:                             'frame': int(self.frame_count),
+027224:                             'pos': [int(tracked_position[0]), int(tracked_position[1])],
+027225:                             'size': float(self.ball_size) if self.ball_size is not None else None,
+027226:                             'stuck': int(self.stuck_frame_count),
+027227:                         })
+027228:                     if self.ball_dataset_exporter is not None:
+027229:                         self.ball_dataset_exporter.write_frame(
+027230:                             frame,
+027231:                             source_frame=self.frame_count,
+027232:                             ball_center=tracked_position,
+027233:                             ball_area=self.ball_size,
+027234:                             stuck_frames=self.stuck_frame_count,
+027235:                             motion_distance=(self.last_motion or {}).get('distance'),
+027236:                             tracking_active=self.tracking,
+027237:                             point_index=(
+027238:                                 self._point_history_current.get('point_index')
+027239:                                 if self._point_history_current is not None else None
+027240:                             ),
+027241:                         )
+027242: 
+027243:                     pending_reason = getattr(self, '_pending_rally_end_reason', None)
+027244:                     if pending_reason and reference_target_hold:
+027245:                         print(
+027246:                             f"Frame {self.frame_count}: [REFERENCE_POINT_HOLD] "
+027247:                             f"discarding premature queued end '{pending_reason}' "
+027248:                             f"until f{reference_target_frame}"
+027249:                         )
+027250:                         self._pending_rally_end_reason = None
+027251:                         self._pending_rally_end_frame = -1
+027252:                         pending_reason = None
+027253:                     if pending_reason:
+027254:                         # Before scoring a service-box fault, prefer a separate
+027255:                         # moving ball that continues the incoming trajectory.
+027256:                         # This catches the f1785 stale-marker regression without
+027257:                         # weakening genuine bounce reversals.
+027258:                         if self._resume_false_serve_bounce_from_motion(
+027259:                             pending_reason, tracked_position
+027260:                         ):
+027261:                             self._pending_rally_end_reason = None
+027262:                             self._pending_rally_end_frame = -1
+027263:                             continue
+027264:                         # Point-end detection can queue an out reason one or
+027265:                         # more frames before the stuck timeout is reached.  If
+027266:                         # this is still an unconfirmed serve toss with no
+027267:                         # racket/net contact and the marker has stopped, drop
+027268:                         # the queued false end instead of writing a bogus row.
+027269:                         suppressed_frame = int(
+027270:                             getattr(self, '_last_out_bounce_suppressed_frame', -1000000)
+027271:                         )
+027272:                         suppressed_point = getattr(self, '_last_out_bounce_suppressed_point', None)
+027273:                         recent_static_serve_abort = (
 ```
 
