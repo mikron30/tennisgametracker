@@ -1,0 +1,61 @@
+name: Inspect V26 ball evidence state
+
+on:
+  push:
+    branches:
+      - codex/shallow-serve-turn-candidate
+    paths:
+      - .github/workflows/inspect-v26-ball-evidence.yml
+
+permissions:
+  contents: write
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: codex/shallow-serve-turn-candidate
+          fetch-depth: 0
+
+      - name: Extract ball evidence context
+        shell: python
+        run: |
+          from pathlib import Path
+          lines = Path('interactive_ball_analyzer.py').read_text(encoding='utf-8').splitlines()
+          needles = ['HSV: H=', 'Ball at (', 'last_ball_size', 'ball_size']
+          hit_indexes = []
+          for needle in needles:
+              for i, line in enumerate(lines):
+                  if needle in line:
+                      hit_indexes.append(i)
+          if not hit_indexes:
+              raise SystemExit('ball evidence markers not found')
+          ranges = []
+          for i in sorted(set(hit_indexes)):
+              ranges.append([max(0, i-45), min(len(lines), i+46)])
+          merged=[]
+          for lo,hi in ranges:
+              if merged and lo <= merged[-1][1]:
+                  merged[-1][1]=max(merged[-1][1],hi)
+              else:
+                  merged.append([lo,hi])
+          out=['# V26 ball evidence source context','']
+          for lo,hi in merged:
+              out.append(f'## Lines {lo+1}-{hi}')
+              out.append('```python')
+              for j in range(lo,hi):
+                  out.append(f'{j+1:06d}: {lines[j]}')
+              out.append('```')
+              out.append('')
+          Path('V26_BALL_EVIDENCE_CONTEXT.md').write_text('\n'.join(out), encoding='utf-8')
+
+      - name: Commit source context
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add V26_BALL_EVIDENCE_CONTEXT.md
+          git commit -m "Record V26 ball evidence source context"
+          git push origin HEAD:codex/shallow-serve-turn-candidate

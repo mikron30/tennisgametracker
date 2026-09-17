@@ -462,21 +462,35 @@ def _write_endpoint_html(output_dir, endpoint_rows):
     return path
 
 
-def _decode_window(video_path, start_frame, end_frame):
+def _decode_event_windows(video_path, windows, progress=None):
+    """Yield tracker-indexed windows from one forward decode (tracker N = raw N-1)."""
+    windows = [(max(1, int(start)), int(end)) for start, end in windows]
+    if any(end < start for start, end in windows):
+        raise ValueError("Invalid event frame window")
+    if any(windows[i][0] < windows[i-1][0] for i in range(1, len(windows))):
+        raise ValueError("Event windows must be ordered by start frame")
+    if not windows:
+        return
     cap = cv2.VideoCapture(str(video_path))
-    if not cap.isOpened():
-        raise RuntimeError(f"Could not open video: {video_path}")
-    cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, int(start_frame)))
-    frames = {}
-    index = max(0, int(start_frame))
-    while index <= int(end_frame):
-        ok, frame = cap.read()
-        if not ok:
-            break
-        frames[index] = frame.copy()
-        index += 1
-    cap.release()
-    return frames
+    try:
+        if not cap.isOpened():
+            raise RuntimeError(f"Could not open video: {video_path}")
+        decoded = 0
+        cache = {}
+        for start, end in windows:
+            cache = {number: frame for number, frame in cache.items() if number >= start}
+            while decoded < end:
+                ok, frame = cap.read()
+                if not ok:
+                    raise RuntimeError(f"Video decode stopped before tracker frame {decoded + 1}")
+                decoded += 1
+                if decoded >= start:
+                    cache[decoded] = frame
+                if progress is not None and decoded % 250 == 0:
+                    progress.update(message=f"Sequential event decode: frame {decoded}")
+            yield {number: frame for number, frame in cache.items() if number <= end}
+    finally:
+        cap.release()
 
 
 def _marker(frame, point, color):
@@ -791,10 +805,13 @@ def main(argv=None):
         events_total=len(events),
         message=f"Rendering {len(events)} suspicious windows",
     )
-    for completed_count, event in enumerate(events, start=1):
-        start = max(0, event["start_frame"] - args.window)
-        end = event["end_frame"] + args.window
-        frames = _decode_window(video, start, end)
+    events.sort(key=lambda event: event["start_frame"])
+    windows = [(max(1, event["start_frame"] - args.window),
+                event["end_frame"] + args.window) for event in events]
+    decoded_windows = _decode_event_windows(video, windows, progress)
+    for completed_count, (event, bounds, frames) in enumerate(
+            zip(events, windows, decoded_windows), start=1):
+        start, end = bounds
         sheet_path = images_dir / f"event_{event['event_index']:04d}_f{event['center_frame']}.jpg"
         _contact_sheet(frames, tracks, start, end, sheet_path)
         event["sheet"] = str(sheet_path.relative_to(output_dir)).replace("\\", "/")
@@ -824,7 +841,9 @@ def main(argv=None):
         "endpoint_audit": len(endpoint_rows),
     }
     (output_dir / "tracking_audit.json").write_text(
-        json.dumps({"summary": summary, "events": events}, indent=2), encoding="utf-8"
+        json.dumps({"summary": summary, "events": events,
+                    "frame_mapping": "tracker N = raw decoded frame N-1",
+                    "event_decode": "sequential_from_start"}, indent=2), encoding="utf-8"
     )
     (output_dir / "tracking_trace.jsonl").write_text(
         "".join(json.dumps(tracks[frame]) + "\n" for frame in sorted(tracks)), encoding="utf-8"

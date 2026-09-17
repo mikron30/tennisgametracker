@@ -1,0 +1,61 @@
+name: Inspect V26 evidence targets
+
+on:
+  push:
+    branches:
+      - codex/shallow-serve-turn-candidate
+    paths:
+      - .github/workflows/inspect-v26-evidence-targets.yml
+
+permissions:
+  contents: write
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: codex/shallow-serve-turn-candidate
+          fetch-depth: 0
+
+      - name: Extract exact target contexts
+        shell: python
+        run: |
+          from pathlib import Path
+          lines = Path('interactive_ball_analyzer.py').read_text(encoding='utf-8').splitlines()
+          needles = [
+              '_pending_night_static_out = {',
+              'HSV: H=',
+              'last_ball_size',
+              'ball_size =',
+              'current_ball_size',
+          ]
+          hits=[]
+          for needle in needles:
+              found=[]
+              for i,line in enumerate(lines):
+                  if needle in line:
+                      found.append(i)
+              hits.extend((needle,i) for i in found[:8])
+          out=['# V26 exact evidence targets','']
+          if not hits:
+              out.append('No targets found')
+          for needle,i in hits:
+              lo=max(0,i-35); hi=min(len(lines),i+36)
+              out.append(f'## {needle!r} at line {i+1}')
+              out.append('```python')
+              for j in range(lo,hi):
+                  out.append(f'{j+1:06d}: {lines[j]}')
+              out.append('```')
+              out.append('')
+          Path('V26_EVIDENCE_TARGETS.md').write_text('\n'.join(out),encoding='utf-8')
+
+      - name: Commit context
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add V26_EVIDENCE_TARGETS.md
+          git commit -m "Record V26 exact evidence targets"
+          git push origin HEAD:codex/shallow-serve-turn-candidate

@@ -1,0 +1,51 @@
+name: Refine V26 pending OUT tracked evidence
+
+on:
+  push:
+    branches:
+      - codex/shallow-serve-turn-candidate
+    paths:
+      - .github/workflows/refine-v26-pending-out-tracked-evidence.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out branch
+        uses: actions/checkout@v4
+        with:
+          ref: codex/shallow-serve-turn-candidate
+          fetch-depth: 0
+
+      - name: Refine V26 patch
+        run: python tools/refine_v26_pending_out_tracked_evidence.py
+
+      - name: Validate tracker
+        shell: bash
+        run: |
+          python -m py_compile interactive_ball_analyzer.py
+          python - <<'PY'
+          from pathlib import Path
+          text = Path('interactive_ball_analyzer.py').read_text(encoding='utf-8')
+          assert "tracked_hsv = getattr(self, 'ball_hsv', None)" in text
+          assert "current_rebound_size <= 30.0" in text
+          assert "OUT-BOUNCE PENDING VISIBLE-CONFLICT REJECT" in text
+          print('Refined V26 guard present')
+          PY
+          git diff --check
+
+      - name: Commit refined tracker
+        shell: bash
+        run: |
+          if git diff --quiet -- interactive_ball_analyzer.py; then
+            echo "No tracker changes to commit"
+            exit 1
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add interactive_ball_analyzer.py
+          git commit -m "Refine V26 pending OUT tracked evidence"
+          git push origin HEAD:codex/shallow-serve-turn-candidate
