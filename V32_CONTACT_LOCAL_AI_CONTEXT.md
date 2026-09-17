@@ -625,355 +625,355 @@
 001771:                 continuity_rejected += 1
 ```
 
-## Lines 26751-27099
+## Lines 26780-27128
 ```python
-026751:                             )
-026752:                         elif recent_bounce_hold:
-026753:                             last_bounce_frame = getattr(self, '_recent_return_bounce_recover_frame', self.frame_count)
-026754:                             frames_since_bounce = max(0, self.frame_count - last_bounce_frame)
-026755:                             print(
-026756:                                 f"Frame {self.frame_count}: delaying point timeout after recent bounce recover "
-026757:                                 f"({frames_since_bounce}f ago)"
-026758:                             )
-026759:                         elif recent_return_hold:
-026760:                             last_return_frame = getattr(self, '_recent_offscreen_return_frame', self.frame_count)
-026761:                             frames_since_return = max(0, self.frame_count - last_return_frame)
-026762:                             print(
-026763:                                 f"Frame {self.frame_count}: delaying point timeout after recent offscreen return "
-026764:                                 f"re-entry ({frames_since_return}f ago)"
-026765:                             )
-026766:                         else:
-026767:                             print(
-026768:                                 f"Frame {self.frame_count}: delaying point timeout while ball is still actively tracked "
-026769:                                 f"(seen {frames_since_seen}f ago, motion={last_motion_distance:.1f}px)"
-026770:                             )
-026771:                     else:
-026772:                         if self._ignore_unresolved_timeout_if_game_decider(
-026773:                             "POINT_TIMEOUT", end_position=self.ball_center, frame=frame
-026774:                         ):
-026775:                             print(
-026776:                                 f"[POINT_IGNORED] f{self.frame_count}: reason=POINT_TIMEOUT "
-026777:                                 f"duration={dur}f would decide game without a located ball"
-026778:                             )
-026779:                         else:
-026780:                             timeout_reason = "POINT_TIMEOUT"
-026781:                             if self._in_court_timeout_landing_outcome(self.ball_center, frame) is not None:
-026782:                                 timeout_reason = "Ball stopped on player side"
-026783:                             # A duration timeout is only a fallback inference.  The
-026784:                             # terminal verifier can still see a compact moving ball
-026785:                             # in the just-decoded frame pair; continue the rally
-026786:                             # rather than scoring a false timeout in that case.
-026787:                             if self._resume_from_terminal_motion_candidate(
-026788:                                 timeout_reason, self.ball_center, frame=frame
-026789:                             ):
-026790:                                 continue
+026780:                             )
+026781:                         elif recent_bounce_hold:
+026782:                             last_bounce_frame = getattr(self, '_recent_return_bounce_recover_frame', self.frame_count)
+026783:                             frames_since_bounce = max(0, self.frame_count - last_bounce_frame)
+026784:                             print(
+026785:                                 f"Frame {self.frame_count}: delaying point timeout after recent bounce recover "
+026786:                                 f"({frames_since_bounce}f ago)"
+026787:                             )
+026788:                         elif recent_return_hold:
+026789:                             last_return_frame = getattr(self, '_recent_offscreen_return_frame', self.frame_count)
+026790:                             frames_since_return = max(0, self.frame_count - last_return_frame)
 026791:                             print(
-026792:                                 f"[POINT_END] f{self.frame_count}: reason={timeout_reason} "
-026793:                                 f"duration={dur}f — returning to serve detection"
+026792:                                 f"Frame {self.frame_count}: delaying point timeout after recent offscreen return "
+026793:                                 f"re-entry ({frames_since_return}f ago)"
 026794:                             )
-026795:                             self._record_point_result(timeout_reason, end_position=self.ball_center, frame=frame)
-026796:                         game_state = "WAITING_FOR_SERVE"
-026797:                         reset_tracking_state(hold_end_marker=True)
-026798: 
-026799:                 # Track ball through the point
-026800:                 tracked_position = None
-026801:                 if self.tracking and self.hsv_lower is not None and self.ball_center is not None:
-026802:                     prev_ball_center = self.ball_center
-026803:                     prev_stuck = self.stuck_frame_count
-026804:                     prev_top_return_wait = self._top_return_wait_active()
-026805:                     prev_back_return_wait = self._back_return_wait_active()
-026806:                     pre_track_snapshot = self._snapshot_tracking_state_for_provisional_guard()
-026807:                     self._local_ai_tight_roi_previous_gray = (
-026808:                         pre_track_snapshot.get('_prev_frame_gray')
-026809:                     )
-026810:                     forced_local_ai = False
-026811:                     contact_local_ai = False
-026812:                     # V36: protect an explicitly verified NIGHT LOWER CONTACT LAUNCH
-026813:                     # from later same-frame post-track recovery arbitration.
-026814:                     verified_lower_contact_launch = False
-026815:                     tracked_position = self._force_local_ai_frame(frame, prev_ball_center)
-026816:                     if tracked_position is not None:
-026817:                         forced_local_ai = True
-026818:                     else:
-026819:                         # Once armed, contact Local AI owns the next few frames
-026820:                         # before HSV is allowed to mutate the anchor again.
-026821:                         tracked_position = self._run_contact_local_ai_frame(
-026822:                             frame, prev_ball_center
-026823:                         )
-026824:                         if tracked_position is not None:
-026825:                             contact_local_ai = True
-026826:                         else:
-026827:                             tracked_position = self.track_ball_in_frame(frame)
-026828:                             verified_lower_contact_launch = (
-026829:                                 tracked_position is not None and
-026830:                                 int(getattr(
-026831:                                     self,
-026832:                                     '_last_verified_lower_contact_launch_frame',
-026833:                                     -1000000,
-026834:                                 )) == int(self.frame_count)
-026835:                             )
-026836:                             if verified_lower_contact_launch:
-026837:                                 # A dedicated NIGHT LOWER CONTACT LAUNCH has already
-026838:                                 # committed a geometrically verified outbound ball.
-026839:                                 # Do not let a Contact Local-AI miss restore the stale
-026840:                                 # pre-contact anchor on this exact frame.
-026841:                                 self._contact_local_ai_state = None
-026842:                                 self._contact_local_ai_cooldown_until_frame = max(
-026843:                                     int(getattr(
-026844:                                         self,
-026845:                                         '_contact_local_ai_cooldown_until_frame',
-026846:                                         -1000000,
-026847:                                     )),
-026848:                                     int(self.frame_count) + 2,
-026849:                                 )
-026850:                                 self._contact_normal_fallback_path = []
-026851:                                 contact_reason = None
-026852:                                 print(
-026853:                                     f"[CONTACT_LOCAL_AI VERIFIED-LOWER-LAUNCH RELEASE] "
-026854:                                     f"f{self.frame_count}: preserving normal launch="
-026855:                                     f"{tuple(tracked_position)}"
-026856:                                 )
-026857:                             else:
-026858:                                 contact_reason = self._contact_local_ai_trigger(
-026859:                                     prev_ball_center, tracked_position, pre_track_snapshot
-026860:                                 )
-026861:                             if contact_reason is not None:
-026862:                                 rejected_hsv = (
-026863:                                     tuple(tracked_position)
-026864:                                     if tracked_position is not None else None
-026865:                                 )
-026866:                                 post_track_snapshot = self._snapshot_tracking_state_for_provisional_guard()
-026867:                                 self._restore_tracking_state_for_provisional_guard(
-026868:                                     pre_track_snapshot
-026869:                                 )
-026870:                                 self._local_ai_tight_roi_previous_gray = (
-026871:                                     pre_track_snapshot.get('_prev_frame_gray')
-026872:                                 )
-026873:                                 # Debug only: preserve the normal detector's contact
-026874:                                 # hypothesis long enough to print candidate agreement.
-026875:                                 self._contact_local_ai_debug_normal_candidate = rejected_hsv
-026876:                                 tracked_position = self._run_contact_local_ai_frame(
-026877:                                     frame, prev_ball_center, arm_reason=contact_reason
+026795:                         else:
+026796:                             print(
+026797:                                 f"Frame {self.frame_count}: delaying point timeout while ball is still actively tracked "
+026798:                                 f"(seen {frames_since_seen}f ago, motion={last_motion_distance:.1f}px)"
+026799:                             )
+026800:                     else:
+026801:                         if self._ignore_unresolved_timeout_if_game_decider(
+026802:                             "POINT_TIMEOUT", end_position=self.ball_center, frame=frame
+026803:                         ):
+026804:                             print(
+026805:                                 f"[POINT_IGNORED] f{self.frame_count}: reason=POINT_TIMEOUT "
+026806:                                 f"duration={dur}f would decide game without a located ball"
+026807:                             )
+026808:                         else:
+026809:                             timeout_reason = "POINT_TIMEOUT"
+026810:                             if self._in_court_timeout_landing_outcome(self.ball_center, frame) is not None:
+026811:                                 timeout_reason = "Ball stopped on player side"
+026812:                             # A duration timeout is only a fallback inference.  The
+026813:                             # terminal verifier can still see a compact moving ball
+026814:                             # in the just-decoded frame pair; continue the rally
+026815:                             # rather than scoring a false timeout in that case.
+026816:                             if self._resume_from_terminal_motion_candidate(
+026817:                                 timeout_reason, self.ball_center, frame=frame
+026818:                             ):
+026819:                                 continue
+026820:                             print(
+026821:                                 f"[POINT_END] f{self.frame_count}: reason={timeout_reason} "
+026822:                                 f"duration={dur}f — returning to serve detection"
+026823:                             )
+026824:                             self._record_point_result(timeout_reason, end_position=self.ball_center, frame=frame)
+026825:                         game_state = "WAITING_FOR_SERVE"
+026826:                         reset_tracking_state(hold_end_marker=True)
+026827: 
+026828:                 # Track ball through the point
+026829:                 tracked_position = None
+026830:                 if self.tracking and self.hsv_lower is not None and self.ball_center is not None:
+026831:                     prev_ball_center = self.ball_center
+026832:                     prev_stuck = self.stuck_frame_count
+026833:                     prev_top_return_wait = self._top_return_wait_active()
+026834:                     prev_back_return_wait = self._back_return_wait_active()
+026835:                     pre_track_snapshot = self._snapshot_tracking_state_for_provisional_guard()
+026836:                     self._local_ai_tight_roi_previous_gray = (
+026837:                         pre_track_snapshot.get('_prev_frame_gray')
+026838:                     )
+026839:                     forced_local_ai = False
+026840:                     contact_local_ai = False
+026841:                     # V36: protect an explicitly verified NIGHT LOWER CONTACT LAUNCH
+026842:                     # from later same-frame post-track recovery arbitration.
+026843:                     verified_lower_contact_launch = False
+026844:                     tracked_position = self._force_local_ai_frame(frame, prev_ball_center)
+026845:                     if tracked_position is not None:
+026846:                         forced_local_ai = True
+026847:                     else:
+026848:                         # Once armed, contact Local AI owns the next few frames
+026849:                         # before HSV is allowed to mutate the anchor again.
+026850:                         tracked_position = self._run_contact_local_ai_frame(
+026851:                             frame, prev_ball_center
+026852:                         )
+026853:                         if tracked_position is not None:
+026854:                             contact_local_ai = True
+026855:                         else:
+026856:                             tracked_position = self.track_ball_in_frame(frame)
+026857:                             verified_lower_contact_launch = (
+026858:                                 tracked_position is not None and
+026859:                                 int(getattr(
+026860:                                     self,
+026861:                                     '_last_verified_lower_contact_launch_frame',
+026862:                                     -1000000,
+026863:                                 )) == int(self.frame_count)
+026864:                             )
+026865:                             if verified_lower_contact_launch:
+026866:                                 # A dedicated NIGHT LOWER CONTACT LAUNCH has already
+026867:                                 # committed a geometrically verified outbound ball.
+026868:                                 # Do not let a Contact Local-AI miss restore the stale
+026869:                                 # pre-contact anchor on this exact frame.
+026870:                                 self._contact_local_ai_state = None
+026871:                                 self._contact_local_ai_cooldown_until_frame = max(
+026872:                                     int(getattr(
+026873:                                         self,
+026874:                                         '_contact_local_ai_cooldown_until_frame',
+026875:                                         -1000000,
+026876:                                     )),
+026877:                                     int(self.frame_count) + 2,
 026878:                                 )
-026879:                                 self._contact_local_ai_debug_normal_candidate = None
-026880:                                 if tracked_position is not None:
-026881:                                     contact_local_ai = True
-026882: 
-026883:                                     # V35_HOTSPOT_ONLY_CONTACT_HANDOFF
-026884:                                     # Preserve the pre-handoff motion only for the
-026885:                                     # trajectory-hotspot takeover that caused the
-026886:                                     # false f4303 OUT reversal. Normal contact-stall
-026887:                                     # and contact-jump replacements must retain the
-026888:                                     # proven V32 behavior and commit the AI step.
-026889:                                     if str(contact_reason or '').startswith(
-026890:                                         'trajectory-hotspot-turn:'
-026891:                                     ):
-026892:                                         # V34: this exact frame is a detector handoff, not a
-026893:                                         # second physical ball observation.  The normal HSV
-026894:                                         # candidate was already rolled back above; Local AI
-026895:                                         # may legitimately choose a different anchor around
-026896:                                         # racket contact.  Keep that AI anchor, but do not let
-026897:                                         # the anchor displacement become last_motion and fake
-026898:                                         # a ground-bounce reversal on the same frame.
-026899:                                         ai_anchor = tuple(tracked_position)
-026900:                                         ai_ball_size = self.ball_size
-026901:                                         ai_ball_hsv = self.ball_hsv
-026902:                                         if pre_track_snapshot is not None:
-026903:                                             if 'prev_motion' in pre_track_snapshot:
-026904:                                                 prior_prev_motion = pre_track_snapshot.get('prev_motion')
-026905:                                                 self.prev_motion = (
-026906:                                                     dict(prior_prev_motion)
-026907:                                                     if isinstance(prior_prev_motion, dict)
-026908:                                                     else prior_prev_motion
-026909:                                                 )
-026910:                                             if 'last_motion' in pre_track_snapshot:
-026911:                                                 prior_last_motion = pre_track_snapshot.get('last_motion')
-026912:                                                 self.last_motion = (
-026913:                                                     dict(prior_last_motion)
-026914:                                                     if isinstance(prior_last_motion, dict)
-026915:                                                     else prior_last_motion
-026916:                                                 )
-026917:                                             if 'last_nonzero_motion' in pre_track_snapshot:
-026918:                                                 prior_nonzero = pre_track_snapshot.get('last_nonzero_motion')
-026919:                                                 self.last_nonzero_motion = (
-026920:                                                     dict(prior_nonzero)
-026921:                                                     if isinstance(prior_nonzero, dict)
-026922:                                                     else prior_nonzero
-026923:                                                 )
-026924:                                             if 'last_delta' in pre_track_snapshot:
-026925:                                                 self.last_delta = pre_track_snapshot.get('last_delta')
-026926:                                             if 'last_direction' in pre_track_snapshot:
-026927:                                                 self.last_direction = pre_track_snapshot.get('last_direction')
-026928:                                             if 'ball_velocity_history' in pre_track_snapshot:
-026929:                                                 self.ball_velocity_history = list(
-026930:                                                     pre_track_snapshot.get('ball_velocity_history') or []
-026931:                                                 )[-5:]
-026932:                                             if 'direction_change_streak' in pre_track_snapshot:
-026933:                                                 self.direction_change_streak = int(
-026934:                                                     pre_track_snapshot.get('direction_change_streak') or 0
-026935:                                                 )
-026936: 
-026937:                                         # Re-assert the accepted AI observation after the
-026938:                                         # motion-state repair.  Contact Local-AI keeps its own
-026939:                                         # validated history, so the next frame can still follow
-026940:                                         # the outgoing trajectory from this anchor.
-026941:                                         self.ball_center = ai_anchor
-026942:                                         self.ball_size = ai_ball_size
-026943:                                         self.ball_hsv = ai_ball_hsv
-026944:                                         self.last_seen_frame = self.frame_count
-026945:                                         self.stuck_frame_count = 0
-026946:                                         self._pending_rally_end_reason = None
-026947:                                         self._pending_rally_end_frame = -1
-026948:                                         if frame is not None:
-026949:                                             try:
-026950:                                                 self._prev_frame_gray = cv2.cvtColor(
-026951:                                                     frame, cv2.COLOR_BGR2GRAY
+026879:                                 self._contact_normal_fallback_path = []
+026880:                                 contact_reason = None
+026881:                                 print(
+026882:                                     f"[CONTACT_LOCAL_AI VERIFIED-LOWER-LAUNCH RELEASE] "
+026883:                                     f"f{self.frame_count}: preserving normal launch="
+026884:                                     f"{tuple(tracked_position)}"
+026885:                                 )
+026886:                             else:
+026887:                                 contact_reason = self._contact_local_ai_trigger(
+026888:                                     prev_ball_center, tracked_position, pre_track_snapshot
+026889:                                 )
+026890:                             if contact_reason is not None:
+026891:                                 rejected_hsv = (
+026892:                                     tuple(tracked_position)
+026893:                                     if tracked_position is not None else None
+026894:                                 )
+026895:                                 post_track_snapshot = self._snapshot_tracking_state_for_provisional_guard()
+026896:                                 self._restore_tracking_state_for_provisional_guard(
+026897:                                     pre_track_snapshot
+026898:                                 )
+026899:                                 self._local_ai_tight_roi_previous_gray = (
+026900:                                     pre_track_snapshot.get('_prev_frame_gray')
+026901:                                 )
+026902:                                 # Debug only: preserve the normal detector's contact
+026903:                                 # hypothesis long enough to print candidate agreement.
+026904:                                 self._contact_local_ai_debug_normal_candidate = rejected_hsv
+026905:                                 tracked_position = self._run_contact_local_ai_frame(
+026906:                                     frame, prev_ball_center, arm_reason=contact_reason
+026907:                                 )
+026908:                                 self._contact_local_ai_debug_normal_candidate = None
+026909:                                 if tracked_position is not None:
+026910:                                     contact_local_ai = True
+026911: 
+026912:                                     # V35_HOTSPOT_ONLY_CONTACT_HANDOFF
+026913:                                     # Preserve the pre-handoff motion only for the
+026914:                                     # trajectory-hotspot takeover that caused the
+026915:                                     # false f4303 OUT reversal. Normal contact-stall
+026916:                                     # and contact-jump replacements must retain the
+026917:                                     # proven V32 behavior and commit the AI step.
+026918:                                     if str(contact_reason or '').startswith(
+026919:                                         'trajectory-hotspot-turn:'
+026920:                                     ):
+026921:                                         # V34: this exact frame is a detector handoff, not a
+026922:                                         # second physical ball observation.  The normal HSV
+026923:                                         # candidate was already rolled back above; Local AI
+026924:                                         # may legitimately choose a different anchor around
+026925:                                         # racket contact.  Keep that AI anchor, but do not let
+026926:                                         # the anchor displacement become last_motion and fake
+026927:                                         # a ground-bounce reversal on the same frame.
+026928:                                         ai_anchor = tuple(tracked_position)
+026929:                                         ai_ball_size = self.ball_size
+026930:                                         ai_ball_hsv = self.ball_hsv
+026931:                                         if pre_track_snapshot is not None:
+026932:                                             if 'prev_motion' in pre_track_snapshot:
+026933:                                                 prior_prev_motion = pre_track_snapshot.get('prev_motion')
+026934:                                                 self.prev_motion = (
+026935:                                                     dict(prior_prev_motion)
+026936:                                                     if isinstance(prior_prev_motion, dict)
+026937:                                                     else prior_prev_motion
+026938:                                                 )
+026939:                                             if 'last_motion' in pre_track_snapshot:
+026940:                                                 prior_last_motion = pre_track_snapshot.get('last_motion')
+026941:                                                 self.last_motion = (
+026942:                                                     dict(prior_last_motion)
+026943:                                                     if isinstance(prior_last_motion, dict)
+026944:                                                     else prior_last_motion
+026945:                                                 )
+026946:                                             if 'last_nonzero_motion' in pre_track_snapshot:
+026947:                                                 prior_nonzero = pre_track_snapshot.get('last_nonzero_motion')
+026948:                                                 self.last_nonzero_motion = (
+026949:                                                     dict(prior_nonzero)
+026950:                                                     if isinstance(prior_nonzero, dict)
+026951:                                                     else prior_nonzero
 026952:                                                 )
-026953:                                             except cv2.error:
-026954:                                                 pass
-026955:                                         self._contact_local_ai_anchor_handoff_frame = int(
-026956:                                             self.frame_count
-026957:                                         )
-026958:                                         prior_motion = self.last_motion or {}
-026959:                                         print(
-026960:                                             f"[CONTACT_LOCAL_AI_ANCHOR_HANDOFF] f{self.frame_count}: "
-026961:                                             f"anchor={ai_anchor} preserving prior motion="
-026962:                                             f"({float(prior_motion.get('dx', 0.0) or 0.0):.1f},"
-026963:                                             f"{float(prior_motion.get('dy', 0.0) or 0.0):.1f}) "
-026964:                                             f"vel_hist={[round(float(v), 1) for v in self.ball_velocity_history[-5:]]}"
-026965:                                         )
-026966:                                     print(
-026967:                                         f"[CONTACT_LOCAL_AI_REPLACE] f{self.frame_count}: "
-026968:                                         f"HSV={rejected_hsv} -> AI={tracked_position}"
-026969:                                     )
-026970:                                 else:
-026971:                                     # AI is an assist: if it has no accepted candidate,
-026972:                                     # keep the normal tracker result for this frame.
-026973:                                     self._restore_tracking_state_for_provisional_guard(
-026974:                                         pre_track_snapshot
-026975:                                     )
-026976:                                     tracked_position = prev_ball_center
-026977:                                     contact_local_ai = False
-026978:                                     print(
-026979:                                         f"[CONTACT_LOCAL_AI_FALLBACK] f{self.frame_count}: "
-026980:                                         f"AI miss; preserving trusted position={tracked_position}"
-026981:                                     )
-026982:                     if self.local_ai_recovery is not None and self._local_ai_frame_buffer:
-026983:                         self._local_ai_frame_buffer[-1]["normal_position"] = (
-026984:                             tuple(tracked_position) if tracked_position is not None else None
-026985:                         )
-026986:                     self._debug_local_ai_shadow_frame(frame, prev_ball_center, tracked_position)
-026987:                     # V37: once NIGHT LOWER CONTACT LAUNCH has committed a real
-026988:                     # outbound ball, do not let the generic post-track Local-AI hold
-026989:                     # roll that anchor back on the launch frame or on a physically
-026990:                     # coherent immediate continuation.  This is deliberately narrow:
-026991:                     # only the next two frames are eligible, the motion must still be
-026992:                     # upward/netward, and it must agree with the previously committed
-026993:                     # motion vector.  A player/body jump or reversal therefore remains
-026994:                     # eligible for normal Local-AI arbitration.
-026995:                     lower_launch_frame = int(getattr(
-026996:                         self, '_last_verified_lower_contact_launch_frame', -1000000
-026997:                     ))
-026998:                     lower_launch_age = int(self.frame_count) - lower_launch_frame
-026999:                     verified_lower_contact_continuation = False
-027000:                     continuation_step = 0.0
-027001:                     continuation_cos = -1.0
-027002:                     if (
-027003:                         tracked_position is not None and
-027004:                         prev_ball_center is not None and
-027005:                         pre_track_snapshot is not None and
-027006:                         1 <= lower_launch_age <= 2
-027007:                     ):
-027008:                         continuation_dx = (
-027009:                             float(tracked_position[0]) - float(prev_ball_center[0])
-027010:                         )
-027011:                         continuation_dy = (
-027012:                             float(tracked_position[1]) - float(prev_ball_center[1])
-027013:                         )
-027014:                         continuation_step = math.hypot(
-027015:                             continuation_dx, continuation_dy
-027016:                         )
-027017:                         prior_motion = pre_track_snapshot.get('last_motion') or {}
-027018:                         prior_dx = float(prior_motion.get('dx', 0.0) or 0.0)
-027019:                         prior_dy = float(prior_motion.get('dy', 0.0) or 0.0)
-027020:                         prior_step = float(
-027021:                             prior_motion.get('distance', 0.0) or
-027022:                             math.hypot(prior_dx, prior_dy)
-027023:                         )
-027024:                         if continuation_step > 0.0 and prior_step > 0.0:
-027025:                             continuation_cos = (
-027026:                                 continuation_dx * prior_dx +
-027027:                                 continuation_dy * prior_dy
-027028:                             ) / (continuation_step * prior_step)
-027029:                         continuation_limit = max(
-027030:                             180.0,
-027031:                             min(320.0, prior_step * 2.2 + 60.0),
-027032:                         )
-027033:                         verified_lower_contact_continuation = (
-027034:                             12.0 <= continuation_step <= continuation_limit and
-027035:                             continuation_dy <= -12.0 and
-027036:                             prior_dy <= -8.0 and
-027037:                             continuation_cos >= 0.25
-027038:                         )
-027039: 
-027040:                     verified_lower_contact_post_guard = (
-027041:                         tracked_position is not None and
-027042:                         (
-027043:                             lower_launch_age == 0 or
-027044:                             verified_lower_contact_launch or
-027045:                             verified_lower_contact_continuation
-027046:                         )
-027047:                     )
-027048:                     if verified_lower_contact_post_guard:
-027049:                         guard_kind = (
-027050:                             'launch'
-027051:                             if lower_launch_age == 0 or verified_lower_contact_launch
-027052:                             else 'continuation'
-027053:                         )
-027054:                         print(
-027055:                             f"[VERIFIED-LOWER-CONTACT POST-RECOVERY SKIP] "
-027056:                             f"f{self.frame_count}: kind={guard_kind} age={lower_launch_age} "
-027057:                             f"keeping={tuple(tracked_position)} step={continuation_step:.1f}px "
-027058:                             f"cos={continuation_cos:.3f}"
-027059:                         )
-027060:                     if (
-027061:                         not forced_local_ai and
-027062:                         not contact_local_ai and
-027063:                         not verified_lower_contact_post_guard
-027064:                     ):
-027065:                         tracked_position = self._try_local_ai_recovery(
-027066:                             prev_ball_center, tracked_position, prev_stuck,
-027067:                             pre_track_snapshot=pre_track_snapshot,
-027068:                             frame=frame,
-027069:                         )
-027070:                     self._local_ai_tight_roi_previous_gray = None
-027071:                     # Reject any position that jumps impossibly far in one frame (false positive).
-027072:                     # When the tracker is in re-acquisition mode (stuck >= 5 before the call), allow
-027073:                     # a larger jump because the ball may have traveled far while lost.
-027074:                     if tracked_position and prev_ball_center:
-027075:                         jump = math.hypot(tracked_position[0] - prev_ball_center[0],
-027076:                                           tracked_position[1] - prev_ball_center[1])
-027077:                         motion_reacq_this_frame = (
-027078:                             getattr(self, '_last_motion_reacq_frame', -1000000) == self.frame_count and
-027079:                             getattr(self, '_last_motion_reacq_pos', None) == tracked_position
-027080:                         )
-027081:                         trusted_rally_launch = (
-027082:                             getattr(self, '_trusted_rally_launch_frame', -1000000) == self.frame_count and
-027083:                             getattr(self, '_trusted_rally_launch_pos', None) == tracked_position
-027084:                         )
-027085:                         # Allow a larger jump when re-acquiring after being stuck for 5+ frames:
-027086:                         # a racket hit can send the ball 800+ px in one frame, so we use 1500px
-027087:                         # to let motion-based re-acquisition recover across the full court.
-027088:                         max_jump = 1500 if (
-027089:                             prev_stuck >= 5 or prev_top_return_wait or prev_back_return_wait or
-027090:                             motion_reacq_this_frame or trusted_rally_launch
-027091:                         ) else 400
-027092:                         if jump > max_jump:
-027093:                             print(f"[JUMP_REJECTED] f{self.frame_count}: jumped {jump:.0f}px from {prev_ball_center} to {tracked_position} (limit={max_jump}px, prev_stuck={prev_stuck}), keeping previous")
-027094:                             self.ball_center = prev_ball_center
-027095:                             self.stuck_frame_count = max(self.stuck_frame_count, prev_stuck + 1)
-027096:                             tracked_position = prev_ball_center
-027097: 
-027098:                     # Validate only the position that survived the physical
-027099:                     # jump gate above.  Previously the provisional serve
+026953:                                             if 'last_delta' in pre_track_snapshot:
+026954:                                                 self.last_delta = pre_track_snapshot.get('last_delta')
+026955:                                             if 'last_direction' in pre_track_snapshot:
+026956:                                                 self.last_direction = pre_track_snapshot.get('last_direction')
+026957:                                             if 'ball_velocity_history' in pre_track_snapshot:
+026958:                                                 self.ball_velocity_history = list(
+026959:                                                     pre_track_snapshot.get('ball_velocity_history') or []
+026960:                                                 )[-5:]
+026961:                                             if 'direction_change_streak' in pre_track_snapshot:
+026962:                                                 self.direction_change_streak = int(
+026963:                                                     pre_track_snapshot.get('direction_change_streak') or 0
+026964:                                                 )
+026965: 
+026966:                                         # Re-assert the accepted AI observation after the
+026967:                                         # motion-state repair.  Contact Local-AI keeps its own
+026968:                                         # validated history, so the next frame can still follow
+026969:                                         # the outgoing trajectory from this anchor.
+026970:                                         self.ball_center = ai_anchor
+026971:                                         self.ball_size = ai_ball_size
+026972:                                         self.ball_hsv = ai_ball_hsv
+026973:                                         self.last_seen_frame = self.frame_count
+026974:                                         self.stuck_frame_count = 0
+026975:                                         self._pending_rally_end_reason = None
+026976:                                         self._pending_rally_end_frame = -1
+026977:                                         if frame is not None:
+026978:                                             try:
+026979:                                                 self._prev_frame_gray = cv2.cvtColor(
+026980:                                                     frame, cv2.COLOR_BGR2GRAY
+026981:                                                 )
+026982:                                             except cv2.error:
+026983:                                                 pass
+026984:                                         self._contact_local_ai_anchor_handoff_frame = int(
+026985:                                             self.frame_count
+026986:                                         )
+026987:                                         prior_motion = self.last_motion or {}
+026988:                                         print(
+026989:                                             f"[CONTACT_LOCAL_AI_ANCHOR_HANDOFF] f{self.frame_count}: "
+026990:                                             f"anchor={ai_anchor} preserving prior motion="
+026991:                                             f"({float(prior_motion.get('dx', 0.0) or 0.0):.1f},"
+026992:                                             f"{float(prior_motion.get('dy', 0.0) or 0.0):.1f}) "
+026993:                                             f"vel_hist={[round(float(v), 1) for v in self.ball_velocity_history[-5:]]}"
+026994:                                         )
+026995:                                     print(
+026996:                                         f"[CONTACT_LOCAL_AI_REPLACE] f{self.frame_count}: "
+026997:                                         f"HSV={rejected_hsv} -> AI={tracked_position}"
+026998:                                     )
+026999:                                 else:
+027000:                                     # AI is an assist: if it has no accepted candidate,
+027001:                                     # keep the normal tracker result for this frame.
+027002:                                     self._restore_tracking_state_for_provisional_guard(
+027003:                                         pre_track_snapshot
+027004:                                     )
+027005:                                     tracked_position = prev_ball_center
+027006:                                     contact_local_ai = False
+027007:                                     print(
+027008:                                         f"[CONTACT_LOCAL_AI_FALLBACK] f{self.frame_count}: "
+027009:                                         f"AI miss; preserving trusted position={tracked_position}"
+027010:                                     )
+027011:                     if self.local_ai_recovery is not None and self._local_ai_frame_buffer:
+027012:                         self._local_ai_frame_buffer[-1]["normal_position"] = (
+027013:                             tuple(tracked_position) if tracked_position is not None else None
+027014:                         )
+027015:                     self._debug_local_ai_shadow_frame(frame, prev_ball_center, tracked_position)
+027016:                     # V37: once NIGHT LOWER CONTACT LAUNCH has committed a real
+027017:                     # outbound ball, do not let the generic post-track Local-AI hold
+027018:                     # roll that anchor back on the launch frame or on a physically
+027019:                     # coherent immediate continuation.  This is deliberately narrow:
+027020:                     # only the next two frames are eligible, the motion must still be
+027021:                     # upward/netward, and it must agree with the previously committed
+027022:                     # motion vector.  A player/body jump or reversal therefore remains
+027023:                     # eligible for normal Local-AI arbitration.
+027024:                     lower_launch_frame = int(getattr(
+027025:                         self, '_last_verified_lower_contact_launch_frame', -1000000
+027026:                     ))
+027027:                     lower_launch_age = int(self.frame_count) - lower_launch_frame
+027028:                     verified_lower_contact_continuation = False
+027029:                     continuation_step = 0.0
+027030:                     continuation_cos = -1.0
+027031:                     if (
+027032:                         tracked_position is not None and
+027033:                         prev_ball_center is not None and
+027034:                         pre_track_snapshot is not None and
+027035:                         1 <= lower_launch_age <= 2
+027036:                     ):
+027037:                         continuation_dx = (
+027038:                             float(tracked_position[0]) - float(prev_ball_center[0])
+027039:                         )
+027040:                         continuation_dy = (
+027041:                             float(tracked_position[1]) - float(prev_ball_center[1])
+027042:                         )
+027043:                         continuation_step = math.hypot(
+027044:                             continuation_dx, continuation_dy
+027045:                         )
+027046:                         prior_motion = pre_track_snapshot.get('last_motion') or {}
+027047:                         prior_dx = float(prior_motion.get('dx', 0.0) or 0.0)
+027048:                         prior_dy = float(prior_motion.get('dy', 0.0) or 0.0)
+027049:                         prior_step = float(
+027050:                             prior_motion.get('distance', 0.0) or
+027051:                             math.hypot(prior_dx, prior_dy)
+027052:                         )
+027053:                         if continuation_step > 0.0 and prior_step > 0.0:
+027054:                             continuation_cos = (
+027055:                                 continuation_dx * prior_dx +
+027056:                                 continuation_dy * prior_dy
+027057:                             ) / (continuation_step * prior_step)
+027058:                         continuation_limit = max(
+027059:                             180.0,
+027060:                             min(320.0, prior_step * 2.2 + 60.0),
+027061:                         )
+027062:                         verified_lower_contact_continuation = (
+027063:                             12.0 <= continuation_step <= continuation_limit and
+027064:                             continuation_dy <= -12.0 and
+027065:                             prior_dy <= -8.0 and
+027066:                             continuation_cos >= 0.25
+027067:                         )
+027068: 
+027069:                     verified_lower_contact_post_guard = (
+027070:                         tracked_position is not None and
+027071:                         (
+027072:                             lower_launch_age == 0 or
+027073:                             verified_lower_contact_launch or
+027074:                             verified_lower_contact_continuation
+027075:                         )
+027076:                     )
+027077:                     if verified_lower_contact_post_guard:
+027078:                         guard_kind = (
+027079:                             'launch'
+027080:                             if lower_launch_age == 0 or verified_lower_contact_launch
+027081:                             else 'continuation'
+027082:                         )
+027083:                         print(
+027084:                             f"[VERIFIED-LOWER-CONTACT POST-RECOVERY SKIP] "
+027085:                             f"f{self.frame_count}: kind={guard_kind} age={lower_launch_age} "
+027086:                             f"keeping={tuple(tracked_position)} step={continuation_step:.1f}px "
+027087:                             f"cos={continuation_cos:.3f}"
+027088:                         )
+027089:                     if (
+027090:                         not forced_local_ai and
+027091:                         not contact_local_ai and
+027092:                         not verified_lower_contact_post_guard
+027093:                     ):
+027094:                         tracked_position = self._try_local_ai_recovery(
+027095:                             prev_ball_center, tracked_position, prev_stuck,
+027096:                             pre_track_snapshot=pre_track_snapshot,
+027097:                             frame=frame,
+027098:                         )
+027099:                     self._local_ai_tight_roi_previous_gray = None
+027100:                     # Reject any position that jumps impossibly far in one frame (false positive).
+027101:                     # When the tracker is in re-acquisition mode (stuck >= 5 before the call), allow
+027102:                     # a larger jump because the ball may have traveled far while lost.
+027103:                     if tracked_position and prev_ball_center:
+027104:                         jump = math.hypot(tracked_position[0] - prev_ball_center[0],
+027105:                                           tracked_position[1] - prev_ball_center[1])
+027106:                         motion_reacq_this_frame = (
+027107:                             getattr(self, '_last_motion_reacq_frame', -1000000) == self.frame_count and
+027108:                             getattr(self, '_last_motion_reacq_pos', None) == tracked_position
+027109:                         )
+027110:                         trusted_rally_launch = (
+027111:                             getattr(self, '_trusted_rally_launch_frame', -1000000) == self.frame_count and
+027112:                             getattr(self, '_trusted_rally_launch_pos', None) == tracked_position
+027113:                         )
+027114:                         # Allow a larger jump when re-acquiring after being stuck for 5+ frames:
+027115:                         # a racket hit can send the ball 800+ px in one frame, so we use 1500px
+027116:                         # to let motion-based re-acquisition recover across the full court.
+027117:                         max_jump = 1500 if (
+027118:                             prev_stuck >= 5 or prev_top_return_wait or prev_back_return_wait or
+027119:                             motion_reacq_this_frame or trusted_rally_launch
+027120:                         ) else 400
+027121:                         if jump > max_jump:
+027122:                             print(f"[JUMP_REJECTED] f{self.frame_count}: jumped {jump:.0f}px from {prev_ball_center} to {tracked_position} (limit={max_jump}px, prev_stuck={prev_stuck}), keeping previous")
+027123:                             self.ball_center = prev_ball_center
+027124:                             self.stuck_frame_count = max(self.stuck_frame_count, prev_stuck + 1)
+027125:                             tracked_position = prev_ball_center
+027126: 
+027127:                     # Validate only the position that survived the physical
+027128:                     # jump gate above.  Previously the provisional serve
 ```
