@@ -1,6 +1,6 @@
 {
   "video": "04_Left_Court_tennis_20260623220627_20260623222559_1274169779.mp4",
-  "updated_at": "2026-07-20T18:36:00+03:00",
+  "updated_at": "2026-09-19T16:25:00+03:00",
   "scope": "Persistent visual endpoint regression ledger",
   "frame_numbering": {
     "tracker_to_zero_based_video_offset": -1,
@@ -11,7 +11,10 @@
       "point_index": 1,
       "serve_start_frame": 22,
       "point_end_frame": 322,
-      "end_position": [2022, 513],
+      "end_position": [
+        2022,
+        513
+      ],
       "end_reason": "Ball hit the net",
       "category": "net_error",
       "winner": "P2",
@@ -19,7 +22,17 @@
       "status": "validated_correct",
       "visual_evidence": {
         "decoded_video_frame": 321,
-        "reviewed_video_frames": [318, 319, 320, 321, 322, 323, 324, 325, 326],
+        "reviewed_video_frames": [
+          318,
+          319,
+          320,
+          321,
+          322,
+          323,
+          324,
+          325,
+          326
+        ],
         "finding": "The ball enters the net mesh at decoded frame 321 and continues downward inside the net afterward."
       },
       "regression": {
@@ -29,8 +42,291 @@
         "endpoint_unchanged": true,
         "contact_flight_fixed": "Frames 104 and 105 now track (1519,1053) and (1574,908) instead of holding the player-associated marker."
       }
+    },
+    {
+      "point_index": 2,
+      "serve_start_frame": 696,
+      "point_end_frame": 749,
+      "end_position": [
+        2575,
+        478
+      ],
+      "end_reason": "Serve bounce outside singles court (right sideline)",
+      "category": "first_serve_fault",
+      "winner": "",
+      "point_awarded": "no",
+      "rally_shots": 0,
+      "status": "validated_correct",
+      "visual_evidence": {
+        "decoded_video_frame": 748,
+        "reviewed_video_frames": [
+          713,
+          714,
+          715,
+          716,
+          717,
+          718,
+          719,
+          720,
+          721,
+          722,
+          723,
+          724,
+          725,
+          726,
+          727,
+          728,
+          729,
+          730,
+          731,
+          732,
+          733,
+          734,
+          735,
+          736,
+          737,
+          738,
+          739,
+          740,
+          741,
+          742,
+          743,
+          744,
+          745,
+          746,
+          747,
+          748,
+          749,
+          750,
+          751,
+          752
+        ],
+        "finding": "Sequential source frames show a clean net crossing with no deflection, followed by an outside-right bounce between raw frames 747 and 748. Tracker f749 is the first confirmed upward reversal; the older f751 net-touch reference is stale."
+      },
+      "regression": {
+        "output_directory": "tmp/regression/v39_full_auto",
+        "history": "tmp/regression/v39_full_auto/point_history_20260918_000338.csv",
+        "previous_expected_point_end_frame": 751,
+        "previous_expected_end_reason": "Serve net then bounce outside singles court (right sideline)",
+        "endpoint_corrected_after_sequential_review": true
+      }
+    },
+    {
+      "point_index": 5,
+      "serve_start_frame": 2780,
+      "point_end_frame": 2901,
+      "end_position": [
+        2188,
+        63
+      ],
+      "end_reason": "Ball bounce outside singles court (far baseline)",
+      "category": "out_error",
+      "winner": "P2",
+      "point_awarded": "yes",
+      "rally_shots": 2,
+      "status": "validated_correct",
+      "visual_evidence": {
+        "decoded_video_frame": 2900,
+        "reviewed_video_frames": [
+          2873,
+          2874,
+          2875,
+          2876,
+          2877,
+          2878,
+          2879,
+          2880,
+          2881,
+          2882,
+          2883,
+          2884,
+          2885,
+          2886,
+          2887,
+          2888,
+          2889,
+          2890,
+          2891,
+          2892,
+          2893,
+          2894,
+          2895,
+          2896,
+          2897,
+          2898,
+          2899,
+          2900,
+          2901,
+          2902,
+          2903,
+          2904,
+          2905
+        ],
+        "finding": "The near player returns the ball after f2876. Motion-confirmed recovery follows the real ball from tracker f2883 at (2160,349) through f2887 at (2188,63), beyond the far baseline and out of the image. No ball re-enters during the 14-frame confirmation grace."
+      },
+      "regression": {
+        "output_directory": "tmp/regression/v40d_focus_2700_2920",
+        "history": "tmp/regression/v40d_focus_2700_2920/point_history_20260918_090713.csv",
+        "endpoint_audit": "tmp/regression/v40d_focus_2700_2920/endpoint_audit.json",
+        "previous_failure": "The Contact Local-AI fallback repeatedly restored the stale (2057,1510) player marker, later producing a serve let at f3104 and a duplicate history row.",
+        "validated_result": "One row only: 2780->2901, winner P2, two hits, out_error, score 0:0 0:15."
+      }
+    },
+    {
+      "point_index": 6,
+      "serve_start_frame": 4074,
+      "point_end_frame": 4256,
+      "end_position": [
+        2754,
+        684
+      ],
+      "end_reason": "Ball bounced out of court (right sideline)",
+      "category": "out_error",
+      "winner": "P1",
+      "point_awarded": "yes",
+      "rally_shots": 3,
+      "status": "validated_correct",
+      "visual_evidence": {
+        "reviewed_tracker_frames": [
+          4244,
+          4245,
+          4246,
+          4247,
+          4248,
+          4249,
+          4250,
+          4251,
+          4252,
+          4253,
+          4254,
+          4255,
+          4256
+        ],
+        "finding": "Contact Local-AI follows a continuous rightward/downward flight to (2754,684), then confirms the upward rebound at (2758,667). The bounce point is outside the right singles sideline."
+      },
+      "regression": {
+        "output_directory": "tmp/regression/v40h_point_4074",
+        "history": "tmp/regression/v40h_point_4074/point_history_20260919_104515.csv",
+        "previous_failure": "The normal tracker accepted a large post-contact jump back to a player region and ended falsely at f4159.",
+        "historical_reference_revised": "The older f4260 endpoint at (2648,711) was a stale player marker. The physical bounce is f4255, confirmed by its f4256 rebound.",
+        "validated_result": "One row only: 4074->4256, winner P1, three hits, out_error, score 0:0 15:0."
+      }
+    },
+    {
+      "point_index": 7,
+      "serve_start_frame": 4566,
+      "point_end_frame": 4654,
+      "end_position": [
+        970,
+        837
+      ],
+      "end_reason": "Ball bounced out of court (left sideline)",
+      "category": "out_error",
+      "winner": "P1",
+      "point_awarded": "yes",
+      "rally_shots": 1,
+      "status": "validated_correct",
+      "visual_evidence": {
+        "reviewed_source_frames": [
+          4566,
+          4639,
+          4640,
+          4641,
+          4642,
+          4643,
+          4644,
+          4645,
+          4646,
+          4647,
+          4648,
+          4649,
+          4650,
+          4651,
+          4654
+        ],
+        "finding": "Source f4566 shows a genuine P1 service toss. The ball travels continuously from f4639 toward the left sideline, reaches (970,837) outside it at f4650, and the f4654 upward rebound confirms the bounce."
+      },
+      "regression": {
+        "output_directory": "tmp/regression/v40m_point_4566",
+        "history": "tmp/regression/v40m_point_4566/point_history_20260919_154121.csv",
+        "previous_failure": "The deep static-side filter rejected the continuous small-ball exit and tracking later latched onto player and foot artifacts until f4838.",
+        "historical_reference_revised": "The older reference omitted this genuine point.",
+        "validated_result": "One row only: 4566->4654, winner P1, one shot, out_error, score 0:0 15:0."
+      }
+    },
+    {
+      "point_index": 8,
+      "serve_start_frame": 4870,
+      "point_end_frame": 5123,
+      "physical_bounce_frame": 5121,
+      "end_position": [
+        1612,
+        245
+      ],
+      "end_reason": "Ball bounce outside singles court (far baseline)",
+      "category": "out_error",
+      "winner": "P1",
+      "point_awarded": "yes",
+      "rally_shots": 3,
+      "status": "validated_correct",
+      "visual_evidence": {
+        "reviewed_source_frames": [
+          4865,
+          4870,
+          4871,
+          4878,
+          4951,
+          4952,
+          4953,
+          4954,
+          4955,
+          4956,
+          4957,
+          5110,
+          5113,
+          5116,
+          5118,
+          5119,
+          5120,
+          5121,
+          5122,
+          5123
+        ],
+        "finding": "P1's genuine toss starts at f4870. The recovered track remains on the physical ball through its net transit. At f5121 the ball is beyond the far baseline at (1612,245); its upward motion at f5123 confirms that bounce."
+      },
+      "regression": {
+        "output_directory": "tmp/regression/v40s_sequence_4566_4871_extension",
+        "history": "tmp/regression/v40s_sequence_4566_4871_extension/point_history_20260919_161726.csv",
+        "previous_failure": "The stance guard discarded the real pre-serve toss until player reacquisition, and the Contact Local-AI handoff then occurred inside the net corridor, causing HSV to latch onto a static upper-court artifact.",
+        "historical_reference_revised": "The older 4871->5034 endpoint was premature. The continuous physical rally ends at f5123 after the f5121 far-baseline bounce.",
+        "validated_result": "One row only: 4870->5123, winner P1, three hits, out_error. The CSV records the rebound position (1612,227); the ledger preserves the physical bounce point (1612,245)."
+      }
+    },
+    {
+      "point_index": 9,
+      "serve_start_frame": 5540,
+      "point_end_frame": 5578,
+      "end_position": [
+        2035,
+        483
+      ],
+      "end_reason": "Ball hit the net",
+      "category": "first_serve_fault",
+      "winner": "",
+      "point_awarded": "no",
+      "rally_shots": 0,
+      "status": "validated_correct",
+      "visual_evidence": {
+        "reviewed_source_frames": [5560, 5565, 5570, 5572, 5573, 5574, 5575, 5576, 5577, 5578, 5579, 5580],
+        "finding": "The serve travels from P1 toward the net and reaches its mesh at f5578; no rally begins afterward."
+      },
+      "regression": {
+        "output_directory": "tmp/regression/v40u_point_5543",
+        "history": "tmp/regression/v40u_point_5543/point_history_20260919_195231.csv",
+        "validated_result": "One row: 5540->5578, no point awarded, first_serve_fault, Ball hit the net."
+      }
     }
   ],
   "false_points": [],
-  "pending_points": "All later points await the next full-video regression and visual review."
+  "pending_points": "Continue chronological focused review from the next genuine serve at f5882."
 }

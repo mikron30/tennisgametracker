@@ -18,7 +18,10 @@ import numpy as np
 # Follow the serve far enough past toss/contact to expose a racket or player-body
 # takeover during the first airborne handoff.
 START_OFFSETS = (-6, -2, 0, 4, 8, 14, 22, 32)
-END_OFFSETS = (-14, -8, -4, -1, 0, 2, 6, 12)
+# A point result must survive the immediately adjacent source images.  Keep
+# this window intentionally local: two frames before through two after the
+# recorded endpoint.
+END_OFFSETS = (-2, -1, 0, 1, 2)
 VISION_VERDICTS = (
     "correct",
     "wrong_start",
@@ -63,6 +66,7 @@ class PointVisualAuditAgent:
         point_indices=None,
         max_points=0,
         tracking_traces=None,
+        from_game=1,
     ):
         self.video_path = Path(video_path)
         self.point_history_path = Path(point_history_path)
@@ -74,6 +78,7 @@ class PointVisualAuditAgent:
         self.point_indices = set(point_indices or [])
         self.max_points = max(0, int(max_points or 0))
         self.tracking_traces = self._normalize_tracking_traces(tracking_traces)
+        self.from_game = max(1, int(from_game or 1))
         default_output = Path("tmp") / "point_audits" / self.point_history_path.stem
         self.output_dir = Path(output_dir) if output_dir else default_output
         self.images_dir = self.output_dir / "images"
@@ -138,6 +143,13 @@ class PointVisualAuditAgent:
 
         selected = []
         for row_number, row in enumerate(rows, start=1):
+            score_prefix = str(row.get("current_score", "")).split(maxsplit=1)[0]
+            try:
+                games = [int(value) for value in score_prefix.split(":", 1)]
+            except ValueError:
+                games = []
+            if len(games) != 2 or sum(games) + 1 < self.from_game:
+                continue
             point_index = parse_int(row.get("point_index"), row_number)
             start_frame = parse_int(row.get("serve_start_frame"))
             end_frame = parse_int(row.get("point_end_frame"))
@@ -939,6 +951,8 @@ def main():
     parser.add_argument("--to-frame", type=int)
     parser.add_argument("--points", help="Comma-separated point indices")
     parser.add_argument("--max-points", type=int, default=0)
+    parser.add_argument("--from-game", type=int, default=1,
+                        help="Audit from this 1-based game number (2 skips the first game)")
     parser.add_argument("--fail-on-review", action="store_true")
     args = parser.parse_args()
 
@@ -953,6 +967,7 @@ def main():
         to_frame=args.to_frame,
         point_indices=parse_point_indices(args.points),
         max_points=args.max_points,
+        from_game=args.from_game,
     )
     summary = agent.run()
     if args.fail_on_review and summary["needs_review"]:

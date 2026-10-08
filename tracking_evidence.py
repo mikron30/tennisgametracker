@@ -1,5 +1,6 @@
 """Image and trajectory evidence for ambiguous tracking decisions."""
 import cv2
+import math
 import numpy as np
 
 
@@ -26,3 +27,36 @@ def unsupported_size_collapse(override_area, current_area, current, override):
                 and od>cd+35 and current.get('motion_max',0)>=20
                 and not current.get('static_hotspot',False)
                 and not current.get('frame0_background',False))
+
+
+def unsupported_fragment_jump(previous_area, candidate_area, metrics, frame_height,
+                              previous_pos=None, candidate_pos=None, previous_motion=None):
+    """Require motion or trajectory support for a distant, much smaller fragment.
+
+    Compare against the previous tracked ball, independently of whether another
+    HSV filter finds a usable candidate in this frame. Strongly moving or
+    prediction-consistent small balls remain eligible for recovery.
+    """
+    if previous_area is None or candidate_area is None:
+        return False
+    step = float(metrics.get('prev_distance', 0.0))
+    predicted_distance = metrics.get('predicted_distance')
+    if previous_pos is not None and candidate_pos is not None:
+        # A widened search forecast is not evidence that a one-frame teleport
+        # is plausible. Use the last measured motion, or require image support.
+        predicted_distance = None
+        if previous_motion is not None:
+            predicted_distance = math.hypot(
+                candidate_pos[0] - previous_pos[0] - previous_motion.get('dx', 0.0),
+                candidate_pos[1] - previous_pos[1] - previous_motion.get('dy', 0.0),
+            )
+    return bool(
+        previous_area >= 8.0
+        and candidate_area <= 10.0
+        and candidate_area <= previous_area * 0.35
+        and step >= max(90.0, float(frame_height) * 0.075)
+        and metrics.get('motion_mean', 0.0) < 12.0
+        and metrics.get('motion_max', 0.0) < 60.0
+        and (predicted_distance is None
+             or predicted_distance > max(45.0, step * 0.35))
+    )

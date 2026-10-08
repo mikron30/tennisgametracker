@@ -46,6 +46,47 @@ class OutBounceMotionConsistencyTests(unittest.TestCase):
         self.a.last_motion['direction_deg'] += 360
         self.assertTrue(self.a._detect_out_of_court_bounce((2912, 700), self.frame)[0])
 
+    def test_deep_continuous_sideline_exit_ends_without_waiting_for_stuck_timeout(self):
+        self.a._point_hit_count = 1
+        self.a._awaiting_serve_bounce = False
+        self.a._back_return_wait_frames = 0
+        self.a._back_return_anchor = None
+        self.a._back_return_reentry_grace_frames = 0
+        self.a._recent_offscreen_return_frame = -1000000
+        self.a.ball_center = (97, 1276)
+        self.a._point_outside_singles_sidelines = lambda p, f: (True, 'left', 700.0, 2600.0)
+        self.a.prev_motion = self.motion(-67, 39)
+        self.a.last_motion = self.motion(-63, 45)
+
+        self.assertEqual(
+            self.a._confirmed_outbound_sideline_exit((34, 1321), self.frame),
+            (True, 'Ball bounced out of court (left sideline)'),
+        )
+
+    def test_sideline_exit_requires_rally_and_continuing_outward_motion(self):
+        self.a._point_hit_count = 0
+        self.a._awaiting_serve_bounce = False
+        self.a._back_return_wait_frames = 0
+        self.a._back_return_anchor = None
+        self.a._back_return_reentry_grace_frames = 0
+        self.a._recent_offscreen_return_frame = -1000000
+        self.a.ball_center = (97, 1276)
+        self.a._point_outside_singles_sidelines = lambda p, f: (True, 'left', 700.0, 2600.0)
+        self.a.prev_motion = self.motion(-67, 39)
+        self.a.last_motion = self.motion(-63, 45)
+
+        self.assertEqual(
+            self.a._confirmed_outbound_sideline_exit((34, 1321), self.frame),
+            (False, None),
+        )
+
+        self.a._point_hit_count = 1
+        self.a.last_motion = self.motion(63, 45)
+        self.assertEqual(
+            self.a._confirmed_outbound_sideline_exit((34, 1321), self.frame),
+            (False, None),
+        )
+
 
     def test_v14_deep_static_descent_arms_pending_out(self):
         self.a.frame_count = 4284
