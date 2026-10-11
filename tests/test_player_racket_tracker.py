@@ -11,6 +11,23 @@ from interactive_ball_analyzer import InteractiveBallAnalyzer
 
 
 class PlayerRacketTrackerTests(unittest.TestCase):
+    def test_sparse_hsv_mask_supports_wrapped_hue_range(self):
+        analyzer = InteractiveBallAnalyzer.__new__(InteractiveBallAnalyzer)
+        hsv = np.full((12, 12, 3), (90, 50, 200), dtype=np.uint8)
+        hsv[2, 2] = (110, 50, 200)
+        hsv[8, 8] = (40, 50, 200)
+        hsv[2, 8] = (90, 50, 200)
+        hsv[8, 2] = (110, 41, 200)
+        lower = np.array((103, 42, 125), dtype=np.uint8)
+        upper = np.array((77, 67, 255), dtype=np.uint8)
+
+        mask = analyzer._build_sparse_low_s_mask(hsv, lower, upper)
+
+        self.assertGreater(np.count_nonzero(mask[1:4, 1:4]), 0)
+        self.assertGreater(np.count_nonzero(mask[7:10, 7:10]), 0)
+        self.assertEqual(np.count_nonzero(mask[1:4, 7:10]), 0)
+        self.assertEqual(np.count_nonzero(mask[7:10, 1:4]), 0)
+
     def test_accessory_penalty_does_not_reject_strong_round_ball(self):
         tracker = PlayerRacketTracker(learning_enabled=False)
         tracker.tracks["far"] = PlayerTrack(

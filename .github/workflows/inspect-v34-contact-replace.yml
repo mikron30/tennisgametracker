@@ -1,0 +1,27 @@
+name: Inspect V34 contact replacement
+
+on:
+  push:
+    branches:
+      - codex/shallow-serve-turn-candidate
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: codex/shallow-serve-turn-candidate
+          fetch-depth: 0
+      - name: Record context
+        run: python tools/inspect_v34_contact_replace.py
+      - name: Upload context artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: v34-contact-replace-context
+          path: V34_CONTACT_REPLACE_CONTEXT.md
+          if-no-files-found: error

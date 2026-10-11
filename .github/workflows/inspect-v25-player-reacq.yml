@@ -1,0 +1,76 @@
+name: Inspect V25 player reacquisition
+
+on:
+  push:
+    branches:
+      - codex/shallow-serve-turn-candidate
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Extract reacquisition context
+        shell: python
+        run: |
+          from pathlib import Path
+
+          source = Path('interactive_ball_analyzer.py')
+          lines = source.read_text(encoding='utf-8').splitlines()
+          needles = [
+              'PLAYER-REACQ MOTION CONFIRMED',
+              'PLAYER-REACQ WEAK-JUMP REJECT',
+              'PLAYER-REACQ WEAK-JUMP VISIBLE BALL',
+          ]
+
+          hits = []
+          for needle in needles:
+              for i, line in enumerate(lines):
+                  if needle in line:
+                      hits.append((needle, i))
+
+          if not hits:
+              raise SystemExit('reacquisition markers not found')
+
+          ranges = []
+          for _, i in hits:
+              ranges.append([max(0, i - 110), min(len(lines), i + 111)])
+          ranges.sort()
+          merged = []
+          for lo, hi in ranges:
+              if merged and lo <= merged[-1][1]:
+                  merged[-1][1] = max(merged[-1][1], hi)
+              else:
+                  merged.append([lo, hi])
+
+          out = []
+          out.append('# Exact V20/V25 player-reacquisition source context')
+          out.append('')
+          out.append('Generated from `interactive_ball_analyzer.py` on this branch for V25 diagnosis.')
+          out.append('')
+          for lo, hi in merged:
+              out.append(f'## Lines {lo + 1}-{hi}')
+              out.append('```python')
+              for j in range(lo, hi):
+                  out.append(f'{j + 1:06d}: {lines[j]}')
+              out.append('```')
+              out.append('')
+
+          Path('V25_REACQ_SOURCE_CONTEXT.md').write_text('\n'.join(out) + '\n', encoding='utf-8')
+
+      - name: Commit source context when changed
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add V25_REACQ_SOURCE_CONTEXT.md
+          if git diff --cached --quiet; then
+            echo "Context unchanged"
+            exit 0
+          fi
+          git commit -m "Record V25 reacquisition source context"
+          git push

@@ -1,0 +1,51 @@
+name: Apply V20 pending OUT player rebound guard
+
+on:
+  push:
+    branches:
+      - codex/shallow-serve-turn-candidate
+    paths:
+      - .github/workflows/apply-v20-pending-out-player-rebound.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out branch
+        uses: actions/checkout@v4
+        with:
+          ref: codex/shallow-serve-turn-candidate
+          fetch-depth: 0
+
+      - name: Apply V20 patch
+        run: python tools/apply_v20_pending_out_player_rebound_guard.py
+
+      - name: Validate patched tracker
+        shell: bash
+        run: |
+          python -m py_compile interactive_ball_analyzer.py
+          python - <<'PY'
+          from pathlib import Path
+          text = Path('interactive_ball_analyzer.py').read_text(encoding='utf-8')
+          assert 'OUT-BOUNCE PENDING REBOUND REJECT' in text
+          assert "rebound_player_zone = self._player_point_zone(ball_position)" in text
+          print('V20 guard present')
+          PY
+          git diff --check
+          git diff -- interactive_ball_analyzer.py
+
+      - name: Commit patched tracker
+        shell: bash
+        run: |
+          if git diff --quiet -- interactive_ball_analyzer.py; then
+            echo "No tracker changes to commit"
+            exit 1
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add interactive_ball_analyzer.py
+          git commit -m "Apply V20 pending OUT player rebound guard"
+          git push origin HEAD:codex/shallow-serve-turn-candidate

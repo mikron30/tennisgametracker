@@ -1,0 +1,48 @@
+name: Inspect V16 recovery paths
+
+on:
+  push:
+    branches:
+      - codex/shallow-serve-turn-candidate
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Print recovery and endpoint contexts
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('interactive_ball_analyzer.py')
+          lines = p.read_text(encoding='utf-8').splitlines()
+          needles = [
+              'STUCK_RECOVER',
+              'STUCK RECOVER',
+              'stuck_recover',
+              'double bounce',
+              'DOUBLE BOUNCE',
+              'Ball hit the net',
+              '_player_point_zone',
+              'STUCK_TIMEOUT',
+          ]
+          seen = []
+          for needle in needles:
+              hits = [i for i, line in enumerate(lines) if needle.lower() in line.lower()]
+              print(f'\n===== {needle!r}: {len(hits)} hits =====')
+              for i in hits:
+                  lo, hi = max(0, i-70), min(len(lines), i+110)
+                  key = (lo, hi)
+                  if key in seen:
+                      continue
+                  seen.append(key)
+                  print(f'\n--- lines {lo+1}-{hi} (hit {i+1}) ---')
+                  for n in range(lo, hi):
+                      print(f'{n+1:05d}: {lines[n]}')
+          PY
+
+      - name: List related tests
+        shell: bash
+        run: |
+          grep -RniE 'STUCK_RECOVER|double bounce|Ball hit the net|player_point_zone|STUCK_TIMEOUT' tests || true

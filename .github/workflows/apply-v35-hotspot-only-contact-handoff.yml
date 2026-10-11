@@ -1,0 +1,42 @@
+name: Apply V35 hotspot-only contact handoff
+
+on:
+  push:
+    branches:
+      - codex/shallow-serve-turn-candidate
+    paths:
+      - tools/apply_v35_hotspot_only_contact_handoff.py
+      - .github/workflows/apply-v35-hotspot-only-contact-handoff.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: codex/shallow-serve-turn-candidate
+          fetch-depth: 0
+      - name: Apply V35
+        run: python tools/apply_v35_hotspot_only_contact_handoff.py
+      - name: Validate syntax and diff
+        run: |
+          python -m py_compile interactive_ball_analyzer.py
+          git diff --check
+      - name: Commit V35 runtime change
+        shell: bash
+        run: |
+          if git diff --quiet -- interactive_ball_analyzer.py; then
+            echo "No runtime change needed"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add interactive_ball_analyzer.py
+          git commit -m "Apply V35 hotspot-only Contact Local-AI handoff"
+          git pull --rebase origin codex/shallow-serve-turn-candidate
+          git push origin HEAD:codex/shallow-serve-turn-candidate

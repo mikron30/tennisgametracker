@@ -1,0 +1,54 @@
+name: Apply V31 player reacquisition spiky hold
+
+on:
+  push:
+    branches:
+      - codex/shallow-serve-turn-candidate
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out branch
+        uses: actions/checkout@v4
+        with:
+          ref: codex/shallow-serve-turn-candidate
+          fetch-depth: 0
+
+      - name: Apply V31 patch
+        run: python tools/fix_v31_player_reacq_spiky_hold.py
+
+      - name: Validate patched tracker
+        shell: bash
+        run: |
+          python -m py_compile interactive_ball_analyzer.py
+          python - <<'PY'
+          from pathlib import Path
+          text = Path('interactive_ball_analyzer.py').read_text(encoding='utf-8')
+          assert '[PLAYER-REACQ VISIBLE-CONFLICT HOLD]' in text
+          assert 'player_reacq_spiky_visible_conflict_hold' in text
+          assert 'motion_mean < 30.0' in text
+          assert 'motion_max >= 80.0' in text
+          assert 'actual_distance >= max(280.0, float(frame.shape[1]) * 0.07)' in text
+          assert 'selected_predicted_distance >= 130.0' in text
+          print('V31 narrow spiky player-reacquisition hold present')
+          PY
+          git diff --check
+          git diff -- interactive_ball_analyzer.py
+
+      - name: Commit patched tracker
+        shell: bash
+        run: |
+          if git diff --quiet -- interactive_ball_analyzer.py; then
+            echo "No tracker changes to commit"
+            exit 1
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add interactive_ball_analyzer.py
+          git commit -m "Apply V31 player reacquisition spiky visible-conflict hold"
+          git push origin HEAD:codex/shallow-serve-turn-candidate

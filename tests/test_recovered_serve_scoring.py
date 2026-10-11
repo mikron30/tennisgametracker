@@ -317,6 +317,50 @@ def test_continuous_side_recross_still_infers_return(analyzer):
     assert analyzer._point_hit_count == 1
 
 
+def test_held_exit_marker_does_not_create_opponent_observations(analyzer):
+    start(analyzer, 100, (1800, 900))
+    analyzer._last_racket_contact_player = 0
+    analyzer._last_racket_contact_frame = 100
+    analyzer._player_index_at_point = lambda point, frame=None: 1
+    analyzer._reset_side_recross_watch(0)
+    frame = np.zeros((2160, 3840, 3), np.uint8)
+    for number in range(110, 150):
+        analyzer.frame_count = number
+        assert not analyzer._maybe_infer_return_contact_from_side_recross(
+            (1800, 30), frame, previous_position=(1800, 30))
+    assert analyzer._side_recross_opponent_frames == 0
+    assert analyzer._side_recross_opponent_last_frame == -1
+
+
+def test_measured_incoming_lane_can_prove_return_during_reentry_grace(analyzer):
+    start(analyzer, 100, (1800, 900))
+    analyzer.max_ball_speed = 400
+    analyzer._last_racket_contact_player = 0
+    analyzer._last_racket_contact_frame = 100
+    analyzer._last_racket_contact_point = (1800, 800)
+    analyzer._recent_offscreen_return_frame = 108
+    analyzer._player_index_at_point = lambda point, frame=None: 1 if point[1] < 500 else 0
+    analyzer._player_point_zone = lambda point: None
+    analyzer.ball_size = 36
+    analyzer.ball_velocity_history = [40, 40, 40]
+    analyzer._terminal_previous_gray = np.zeros((2160, 3840), np.uint8)
+    previous = (1800, 310)
+    answers = []
+    for number, point in ((110, (1800,350)), (111, (1805,390)),
+                          (112, (1810,430)), (113, (1815,510)), (114, (1820,540))):
+        frame = np.zeros((2160, 3840, 3), np.uint8)
+        x, y = point
+        frame[y-3:y+4, x-3:x+4] = 255
+        analyzer.frame_count = number
+        answers.append(analyzer._maybe_infer_return_contact_from_side_recross(
+            point, frame, previous_position=previous))
+        analyzer._terminal_previous_gray = frame[:,:,0].copy()
+        previous = point
+    assert answers == [False, False, False, False, True]
+    assert analyzer._last_racket_contact_player == 1
+    assert analyzer._point_hit_count == 1
+
+
 def test_shallow_net_recross_does_not_infer_return(analyzer):
     start(analyzer, 290, (1150, 825))
     analyzer.max_ball_speed = 400
@@ -346,3 +390,57 @@ def test_shallow_net_recross_does_not_infer_return(analyzer):
     assert analyzer._last_racket_contact_player == 0
     assert analyzer._last_racket_contact_frame == 290
     assert analyzer._point_hit_count == 6
+
+
+def test_continuously_recovered_ground_rebound_is_not_a_racket_return(analyzer):
+    start(analyzer, 100)
+    analyzer._last_racket_contact_player = 0
+    analyzer._last_racket_contact_frame = 100
+    analyzer.last_ground_bounce_frame = 109
+    analyzer._player_index_at_point = lambda point, frame=None: 1 if point[1] < 500 else 0
+    for number, point in ((110, (1800,350)), (111, (1800,390)),
+                          (112, (1800,430)), (113, (1800,510)), (114, (1800,540))):
+        analyzer.frame_count = analyzer._causal_flight_anchor_frame = number
+        assert not analyzer._maybe_infer_return_contact_from_side_recross(point)
+    assert analyzer._last_racket_contact_player == 0
+    assert analyzer._side_recross_opponent_frames == 0
+
+
+def test_second_bounce_outside_is_unreturned_not_hitter_error(analyzer):
+    start(analyzer, 100)
+    analyzer.frame_count = 180
+    analyzer._serve_phase_active = analyzer._awaiting_serve_bounce = False
+    analyzer._last_racket_contact_player = 0
+    analyzer._last_racket_contact_frame = 110
+    analyzer._last_racket_contact_point = (1800, 350)
+    analyzer.ground_bounce_count = 2
+    analyzer._classify_ground_bounce = lambda *a, **k: (False, 'Ball bounced out of court (right sideline)', (0,0,255))
+    analyzer._handle_ground_bounce_event((2800, 700), np.zeros((2160,3840,3), np.uint8))
+    assert analyzer._pending_rally_end_reason == 'Ball bounced twice on court'
+    result = analyzer._infer_point_outcome(analyzer._pending_rally_end_reason, (2800,700))
+    assert result['winner_idx'] == 0
+    assert result['category'] == 'unreturned'
+
+
+def test_late_inferred_contact_keeps_measured_next_receiver_samples(analyzer):
+    start(analyzer,100)
+    analyzer._last_racket_contact_player=0
+    analyzer._last_racket_contact_frame=100
+    analyzer._player_index_at_point=lambda point,frame=None: 1 if point[1]<500 else 0
+    frame=np.zeros((2160,3840,3),np.uint8)
+    for number,point in ((110,(1800,350)),(111,(1800,390)),(112,(1800,430)),
+                         (113,(1800,580)),(114,(1800,620))):
+        analyzer.frame_count=number
+        analyzer._maybe_infer_return_contact_from_side_recross(point,frame)
+    assert analyzer._last_racket_contact_player==1
+    # The confirmation sample and two following visible samples belong to
+    # the next receiver, including during the contact cooldown.
+    for number,point in ((115,(1800,660)),(116,(1800,700))):
+        analyzer.frame_count=number
+        assert not analyzer._maybe_infer_return_contact_from_side_recross(point,frame)
+    analyzer.frame_count=120
+    assert not analyzer._maybe_infer_return_contact_from_side_recross((1800,440),frame)
+    analyzer.frame_count=121
+    assert analyzer._maybe_infer_return_contact_from_side_recross((1800,400),frame)
+    assert analyzer._last_racket_contact_player==0
+    assert analyzer._point_hit_count==2

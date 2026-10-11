@@ -1,0 +1,53 @@
+name: Apply V25 extreme reacquisition prediction guard
+
+on:
+  push:
+    branches:
+      - codex/shallow-serve-turn-candidate
+    paths:
+      - .github/workflows/apply-v25-player-reacq.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out branch
+        uses: actions/checkout@v4
+        with:
+          ref: codex/shallow-serve-turn-candidate
+          fetch-depth: 0
+
+      - name: Apply V25 patch
+        run: python tools/apply_v25_extreme_reacq_prediction_guard.py
+
+      - name: Validate patched tracker
+        shell: bash
+        run: |
+          python -m py_compile interactive_ball_analyzer.py
+          python - <<'PY'
+          from pathlib import Path
+          text = Path('interactive_ball_analyzer.py').read_text(encoding='utf-8')
+          assert '[PLAYER-REACQ EXTREME-PREDICTION REJECT]' in text
+          assert 'player_reacq_extreme_prediction_conflict = (' in text
+          assert 'not top_return_search_context' in text
+          assert 'not back_return_search_context' in text
+          print('V25 guard present and tracker compiles')
+          PY
+          git diff --check
+          git diff -- interactive_ball_analyzer.py
+
+      - name: Commit patched tracker
+        shell: bash
+        run: |
+          if git diff --quiet -- interactive_ball_analyzer.py; then
+            echo "No tracker changes to commit"
+            exit 1
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add interactive_ball_analyzer.py
+          git commit -m "Apply V25 extreme reacquisition prediction guard"
+          git push origin HEAD:codex/shallow-serve-turn-candidate

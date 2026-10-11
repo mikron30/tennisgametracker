@@ -1,4 +1,8 @@
-from serve_side_consistency import ServeSideConsistencyGuard, expected_serve_side
+from serve_side_consistency import (
+    ServeSideConsistencyGuard,
+    audit_file,
+    expected_serve_side,
+)
 
 
 def test_score_parity_maps_to_tennis_service_side():
@@ -59,3 +63,18 @@ def test_second_serve_stays_on_same_side():
     second = checks[1]
     assert second.observed == "right"
     assert second.status == "OK"
+
+
+def test_audit_file_accepts_analyzer_string_history_path(tmp_path):
+    history = tmp_path / "point_history.csv"
+    history.write_text(
+        "current_score,server,serve_attempt,point_index,serve_start_frame,"
+        "serve_player_side,serve_ball_position\n"
+        "0:0 15:0,P1,1st,1,10,near,\"(2400,1000)\"\n"
+        "0:0 15:15,P1,1st,2,20,near,\"(1700,1000)\"\n"
+        "0:0 30:15,P1,1st,3,30,near,\"(2420,1000)\"\n"
+        "0:0 30:30,P1,1st,4,40,near,\"(1680,1000)\"\n",
+        encoding="utf-8",
+    )
+
+    assert audit_file(str(history), only_problems=True) == 0

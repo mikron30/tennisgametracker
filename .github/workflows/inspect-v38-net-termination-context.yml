@@ -1,0 +1,41 @@
+name: Inspect V38 net termination context
+
+on:
+  push:
+    branches:
+      - codex/shallow-serve-turn-candidate
+    paths:
+      - tools/inspect_v38_net_termination_context.py
+      - .github/workflows/inspect-v38-net-termination-context.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  inspect:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout branch
+        uses: actions/checkout@v4
+        with:
+          ref: codex/shallow-serve-turn-candidate
+          fetch-depth: 0
+
+      - name: Generate V38 source context
+        run: python tools/inspect_v38_net_termination_context.py
+
+      - name: Commit generated context
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add V38_NET_TERMINATION_CONTEXT.md
+          if git diff --cached --quiet; then
+            echo "No context changes to commit"
+            exit 0
+          fi
+          git commit -m "Generate V38 net termination context"
+          git push origin HEAD:codex/shallow-serve-turn-candidate

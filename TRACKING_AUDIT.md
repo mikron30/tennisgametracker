@@ -70,3 +70,15 @@ both the tracker frame and zero-based raw video frame. Green is the live ball
 tracker marker; red is the stored point endpoint. The source is decoded once
 from the beginning, so no random HEVC seek is used for these images. Progress
 is visible in `progress.txt` throughout the decode.
+
+## Event-sheet decoding correction (September 10)
+
+Suspicious-event sheets now use one continuous forward decode from source
+frame zero, retaining overlapping windows without seeking. Tracker frame N
+is mapped to decoded source N-1, matching endpoint sheets. The old event
+reader sought to source N and could produce grey HEVC frames and a one-frame
+marker offset. This changes report generation only, not the tracker trajectory.
+
+Existing logs/history can be reviewed again with `--skip-run`; no new tracker
+run is needed. Progress updates during the sequential decode. Premature decode
+failure now raises an error instead of producing apparently complete sheets.

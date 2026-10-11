@@ -555,8 +555,24 @@ def print_report(checks: Sequence[ServeCheck], only_problems: bool = False) -> i
     return problem_serves
 
 
-def audit_file(path: Path, only_problems: bool = False) -> int:
+def audit_file(path: Path, only_problems: bool = False, from_game: int = 1) -> int:
+    # The analyzer retains its history filename as a string while the
+    # standalone CLI supplies a Path. Accept either entry point so the
+    # automatic end-of-run audit cannot fail after the visual audit succeeds.
+    path = Path(path)
     rows = read_point_history(path)
+    minimum_game = max(1, int(from_game or 1))
+    if minimum_game > 1:
+        filtered_rows = []
+        for row in rows:
+            score_prefix = str(row.get("current_score", "")).split(maxsplit=1)[0]
+            try:
+                games = [int(value) for value in score_prefix.split(":", 1)]
+            except ValueError:
+                continue
+            if len(games) == 2 and sum(games) + 1 >= minimum_game:
+                filtered_rows.append(row)
+        rows = filtered_rows
     guard = ServeSideConsistencyGuard()
     return print_report(guard.audit_rows(rows), only_problems=only_problems)
 
@@ -569,10 +585,12 @@ def main() -> int:
     parser.add_argument("--watch", action="store_true", help="recheck a growing CSV while tracker is still running")
     parser.add_argument("--interval", type=float, default=2.0, help="watch polling interval in seconds")
     parser.add_argument("--problems-only", action="store_true", help="show only true mismatch rows plus summary")
+    parser.add_argument("--from-game", type=int, default=1,
+                        help="Check from this 1-based game number")
     args = parser.parse_args()
 
     if not args.watch:
-        return 1 if audit_file(args.csv, args.problems_only) else 0
+        return 1 if audit_file(args.csv, args.problems_only, args.from_game) else 0
 
     last_signature = None
     try:
@@ -583,7 +601,7 @@ def main() -> int:
                 if signature != last_signature:
                     print("\n" + "=" * 80)
                     print(f"[SERVE_SIDE_WATCH] {args.csv} size={stat.st_size}")
-                    audit_file(args.csv, args.problems_only)
+                    audit_file(args.csv, args.problems_only, args.from_game)
                     last_signature = signature
             except FileNotFoundError:
                 print(f"[SERVE_SIDE_WATCH] waiting for {args.csv}")
