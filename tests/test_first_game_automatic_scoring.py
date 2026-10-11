@@ -19,6 +19,17 @@ def tracker(monkeypatch,tmp_path):
     return obj
 
 
+def test_confirmed_live_reentry_precedes_stale_anchor_hsv_search(tracker):
+    tracker.tracking=True
+    tracker.hsv_lower=np.array([20,50,130])
+    tracker.ball_center=(1300,12)
+    tracker._recover_live_ball_beyond_weak_top_anchor=MagicMock(return_value=(1900,1000))
+    tracker._recover_local_ball_flight=MagicMock()
+    assert tracker.track_ball_in_frame(np.zeros((2160,3840,3),np.uint8))==(1900,1000)
+    tracker._recover_live_ball_beyond_weak_top_anchor.assert_called_once()
+    tracker._recover_local_ball_flight.assert_not_called()
+
+
 @pytest.mark.parametrize('offset',[0,11000])
 def test_fault_sequence_then_rallies_complete_first_game(tracker,offset):
     # Physical outcomes, rather than stored frame endpoints, drive the scorer.

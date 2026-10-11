@@ -13,6 +13,7 @@ import math
 import subprocess
 import sys
 import tempfile
+import time
 from collections import deque
 from pathlib import Path
 from typing import Callable, Iterable, Optional
@@ -21,6 +22,7 @@ import cv2
 import numpy as np
 
 from ball_ai_recovery_probe import DEFAULT_MODES, collect_candidates
+from local_ai_budget import InferenceBudget
 
 
 def validate_ai_step(point, frame, history, *, prior_speed=0.0, motion=None):
@@ -104,6 +106,23 @@ class LocalBallAIRecovery:
         if frame_index <= int(getattr(self, "_urgent_retry_until_frame", -1_000_000)):
             return True
         return frame_index - self.last_attempt_frame >= self.cooldown_frames
+
+    def scoring_ready(self, frame_index: int) -> bool:
+        """One shared budget for contact, tight-ROI and buffered recovery."""
+        if not hasattr(self, '_inference_budget'):
+            self._inference_budget = InferenceBudget()
+        return self._inference_budget.ready(frame_index)
+
+    def _begin_inference(self, frame_index):
+        self.scoring_ready(frame_index)
+        if not getattr(self, '_diagnostic_unthrottled', False) and not self._inference_budget.reserve(frame_index):
+            self.last_rejection = 'inference-budget'
+            return False
+        return True
+
+    def _record_inference(self, frame_index, kind, candidates, started):
+        self._write_event(dict(type='inference', frame=int(frame_index), kind=kind,
+                               candidates=int(candidates), elapsed_seconds=time.perf_counter()-started))
 
     @staticmethod
     def _distance(point_a, point_b) -> float:
@@ -220,6 +239,9 @@ class LocalBallAIRecovery:
     def _score(self, image: np.ndarray, source_frame: int, candidates: list[dict]) -> list[dict]:
         if not candidates:
             return []
+        if not self._begin_inference(source_frame):
+            return []
+        started = time.perf_counter()
         self._sequence += 1
         stem = f"f{int(source_frame):08d}_{self._sequence:04d}"
         image_path = self.work_dir / f"{stem}.jpg"
@@ -246,11 +268,16 @@ class LocalBallAIRecovery:
             # durable source-frame retention.
             image_path.unlink(missing_ok=True)
             candidate_path.unlink(missing_ok=True)
+            self._record_inference(source_frame, 'single', len(candidates), started)
 
     def _score_batch(self, samples: list[tuple[np.ndarray, int, list[dict]]]) -> list[list[dict]]:
         """Score a short temporal window with one model/runtime startup."""
         if not samples:
             return []
+        frame_index = max(int(sample[1]) for sample in samples)
+        if not self._begin_inference(frame_index):
+            return [[] for _ in samples]
+        started = time.perf_counter()
         self._sequence += 1
         stem = f"batch_{self._sequence:04d}"
         request_path = self.work_dir / f"{stem}.json"
@@ -282,6 +309,7 @@ class LocalBallAIRecovery:
             request_path.unlink(missing_ok=True)
             for image_path in image_paths:
                 image_path.unlink(missing_ok=True)
+            self._record_inference(frame_index, 'batch', sum(len(sample[2]) for sample in samples), started)
 
     def rank_local_roi_candidates(
         self,

@@ -41,6 +41,42 @@ def test_static_yellow_hotspot_is_not_motion_evidence():
                            (100,100),{'dx':12,'dy':16},66,FILTERS) is None
 
 
+def test_visible_ball_slowing_into_bounce_stays_in_local_flight():
+    before=np.full((240,320,3),30,np.uint8)
+    after=before.copy()
+    cv2.circle(before,(100,100),5,(20,210,210),-1)
+    cv2.circle(after,(102,114),5,(20,210,210),-1)
+    found=find_local_ball(after,cv2.cvtColor(before,cv2.COLOR_BGR2GRAY),
+                          (100,100),{'dx':1,'dy':39},66,FILTERS)
+    assert found is not None
+    assert np.linalg.norm(np.array(found['pos'])-np.array([102,114]))<=2
+
+
+def test_full_rebound_beats_smaller_fragment_near_old_position():
+    before=np.full((240,320,3),30,np.uint8)
+    after=before.copy()
+    cv2.circle(before,(100,140),6,(20,210,210),-1)
+    cv2.circle(after,(110,115),6,(20,210,210),-1)
+    cv2.circle(after,(93,136),3,(20,210,210),-1)
+    found=find_local_ball(after,cv2.cvtColor(before,cv2.COLOR_BGR2GRAY),
+                          (100,140),{'dx':5,'dy':14},96,FILTERS)
+    assert found is not None
+    assert np.linalg.norm(np.array(found['pos'])-np.array([110,115]))<=2
+
+
+def test_slow_distant_rebound_requires_explicit_recovery_context():
+    before=np.full((240,320,3),30,np.uint8)
+    after=before.copy()
+    cv2.circle(before,(100,100),3,(20,210,210),-1)
+    cv2.circle(after,(99,94),3,(20,210,210),-1)
+    gray=cv2.cvtColor(before,cv2.COLOR_BGR2GRAY)
+    args=(after,gray,(100,100),{'dx':-2,'dy':4},20,FILTERS)
+    assert find_local_ball(*args) is None
+    found=find_local_ball(*args,minimum_speed=2)
+    assert found is not None
+    assert np.linalg.norm(np.array(found['pos'])-np.array([99,94]))<=2
+
+
 @pytest.mark.parametrize('case',['no_reference','wrong_shape','no_size','fast_contact'])
 def test_unsupported_recovery_context_is_left_to_existing_tracker(case):
     before,after=scene()

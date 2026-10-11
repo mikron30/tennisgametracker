@@ -46,6 +46,15 @@ class OutBounceMotionConsistencyTests(unittest.TestCase):
         self.a.last_motion['direction_deg'] += 360
         self.assertTrue(self.a._detect_out_of_court_bounce((2912, 700), self.frame)[0])
 
+    def test_held_selection_cannot_reuse_old_outward_bounce_motion(self):
+        self.a.prev_motion = self.motion(20, 30)
+        self.a.last_motion = self.motion(20, -30)
+        self.a.stuck_frame_count = 0
+        self.assertTrue(self.a._detect_out_of_court_bounce((2912,700), self.frame)[0])
+        self.a.frame_count += 2
+        self.a.stuck_frame_count = 2
+        self.assertEqual(self.a._detect_out_of_court_bounce((2912,700), self.frame), (False,None))
+
     def test_deep_continuous_sideline_exit_ends_without_waiting_for_stuck_timeout(self):
         self.a._point_hit_count = 1
         self.a._awaiting_serve_bounce = False

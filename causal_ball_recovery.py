@@ -5,14 +5,14 @@ import cv2
 import numpy as np
 
 
-def find_local_ball(frame, previous_gray, position, motion, previous_area, filters):
+def find_local_ball(frame, previous_gray, position, motion, previous_area, filters, *, minimum_speed=5, maximum_speed=90):
     if previous_gray is None or position is None or not motion or previous_area is None:
         return None
     if previous_gray.shape != frame.shape[:2] or previous_area < 8:
         return None
     dx, dy = float(motion.get('dx', 0)), float(motion.get('dy', 0))
     speed = math.hypot(dx, dy)
-    if not 5 <= speed <= 90:
+    if not max(2, minimum_speed) <= speed <= maximum_speed:
         return None
     predicted = (position[0] + dx, position[1] + dy)
     radius = int(max(28, min(65, speed * 1.5)))
@@ -42,10 +42,10 @@ def find_local_ball(frame, previous_gray, position, motion, previous_area, filte
     candidates=[]
     for contour in contours:
         area=cv2.contourArea(contour)
-        if not max(6, previous_area * .12) <= area <= min(450, previous_area * 2.5):
+        if not max(6, previous_area * .12) <= area <= min(1500 if maximum_speed > 90 else 450, previous_area * 2.5):
             continue
         _,_,w,h=cv2.boundingRect(contour)
-        if max(w,h) > max(8, min(w,h)*3):
+        if max(w,h) > max(8, min(w,h)*(4 if maximum_speed > 90 else 3)):
             continue
         m=cv2.moments(contour)
         if not m['m00']:
@@ -54,14 +54,14 @@ def find_local_ball(frame, previous_gray, position, motion, previous_area, filte
         distance=math.hypot(cx-predicted[0],cy-predicted[1])
         previous_distance=math.hypot(cx-position[0],cy-position[1])
         if (min(distance,previous_distance) > radius or
-                math.hypot(cx-position[0],cy-position[1]) < max(4, speed*.4) or
+                math.hypot(cx-position[0],cy-position[1]) < max(4, speed*.25) or
                 int(hsv[cy-y1,cx-x1,1]) < 45):
             continue
         patch=diff[max(0,cy-y1-8):cy-y1+9,max(0,cx-x1-8):cx-x1+9]
         mean, peak=float(patch.mean()),float(patch.max())
         if mean < 6 or peak < 35:
             continue
-        score=min(distance,previous_distance+speed*.5) + abs(math.log(area/previous_area))*10
+        score=min(distance,previous_distance+speed*.5) + abs(math.log(area/previous_area))*20
         candidates.append((score, {'pos':(cx,cy),'area':area,'hsv':hsv[cy-y1,cx-x1],
                                   'motion_mean':mean,'motion_max':peak}))
     return min(candidates,key=lambda item:item[0])[1] if candidates else None
