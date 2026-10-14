@@ -1,8 +1,8 @@
 """Retrospective serve-let rollback for the live tennis scorer.
 
-Normal points are always scored immediately.  A rare missed let is confirmed
-retrospectively only when the immediately following serve is by the same server
-and starts from the same *server-position* service side.
+Normal points are always scored immediately. A rare missed let needs recorded
+net-touch evidence during the original serve, a legal landing/receiver return,
+and a following serve by the same server from the same service side.
 
 The important distinction is deliberate: service side is inferred from the
 server player's X position, not from the ball/toss X.  Toss/contact positions
@@ -265,6 +265,26 @@ def _let_window_open(obj, rally_shots, server_idx, events=None):
     return shooter != server_name
 
 
+def _serve_net_touch_evidence(obj, events):
+    """A replayed service side cannot substitute for a measured serve net touch."""
+    start = _safe_int(getattr(obj, 'point_start_frame_internal', None), -1)
+    contact = _safe_int(getattr(obj, '_serve_net_contact_frame', None), -1)
+    position = getattr(obj, '_serve_net_contact_point', None)
+    if start < 0 or not 6 <= contact - start <= 45:
+        return None
+    if not isinstance(position, (tuple, list)) or len(position) < 2:
+        return None
+    if contact > _safe_int(getattr(obj, 'frame_count', -1), -1):
+        return None
+    # A later rally net error, including a receiver return into the net, is
+    # not a let. The touch must precede every post-serve racket contact.
+    for event in events:
+        event_frame = _safe_int(event.get('frame'), -1) if isinstance(event, dict) else -1
+        if event_frame < 0 or contact >= event_frame:
+            return None
+    return {'frame': contact, 'position': tuple(position)}
+
+
 def _server_idx_for_current_context(obj):
     context = _point_context(obj)
     if isinstance(context, dict):
@@ -431,7 +451,7 @@ def _rewrite_history_row_as_let(obj, pending):
             return
         updates = {
             "end_reason": "Serve let (retrospective same-side replay)",
-            "why": "short nonfault rally + immediate same-server service-side replay",
+            "why": "recorded serve net touch + legal serve + same-server service-side replay",
             "category": "serve_let",
             "point_awarded": "no",
             "winner": "",
@@ -503,6 +523,8 @@ def _evaluate_pending(obj, *, final=False):
         return "none"
 
     frame_now = int(getattr(obj, "frame_count", -1))
+    if not pending.get('net_touch_evidence'):
+        return _discard_pending(obj, pending, 'no recorded serve net touch', frame_now)
     gap = frame_now - int(pending.get("end_frame", frame_now))
     if gap < 0 or gap > _MAX_REPLAY_GAP_FRAMES:
         return _discard_pending(obj, pending, f"gap={gap}f", frame_now)
@@ -567,6 +589,7 @@ def _patch_tracker_class(cls):
         rally_events = _rally_shot_events(self)
         rally_shots = _rally_shots(self)
         let_window_open = _let_window_open(self, rally_shots, server_idx, rally_events)
+        net_touch_evidence = _serve_net_touch_evidence(self, rally_events)
         snapshot = _score_snapshot(self)
         pre_scored_frame = getattr(self, "_last_scored_point_end_frame", None)
         serve_stat_counted = bool(getattr(self, "_serve_landed_in_current_attempt", False))
@@ -609,7 +632,8 @@ def _patch_tracker_class(cls):
         # legal landing or a positively identified receiver return before a
         # later same-side serve may roll back this point as a let.
         positive_serve_in = serve_stat_counted or (short and rally_shots == 1)
-        if awarded and nonfault and short and positive_serve_in and isinstance(observation, dict):
+        if (awarded and nonfault and short and positive_serve_in and
+                net_touch_evidence is not None and isinstance(observation, dict)):
             if rally_shots >= 1:
                 in_evidence = "receiver-returned-serve"
             else:
@@ -628,6 +652,7 @@ def _patch_tracker_class(cls):
                 "reason": str(reason or ""),
                 "in_evidence": in_evidence,
                 "serve_stat_counted": bool(serve_stat_counted),
+                "net_touch_evidence": net_touch_evidence,
             }
             print(
                 f"[RETRO_LET_CANDIDATE] f{frame_now}: "

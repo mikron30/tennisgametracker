@@ -5,8 +5,8 @@ is available, require evidence that the player on the serving end is standing
 behind the physical baseline and that the serve candidate is horizontally
 consistent with that player.
 
-The rule is frame-independent. The night near baseline uses local image segments
-to accommodate lens curvature. Other court geometry is read from the calibrated
+The rule is frame-independent. The night baselines use image markings, with a
+curve at the near end to accommodate lens curvature. Other court geometry is read from the calibrated
 ``adjusted_court_points.txt`` file. In that layout points 1-2 are the far
 baseline endpoints and points 3-4 are the near baseline endpoints. The
 player's feet/bottom-of-box are compared with the appropriate perspective
@@ -286,6 +286,19 @@ def evaluate_serve_stance(analyzer, serve_position, frame) -> Dict:
             return result
         c2, c1, c0 = model['curve']
         baseline_y = c2 * feet[0] ** 2 + c1 * feet[0] + c0
+    elif night and side == 'far':
+        from night_serve_geometry import far_baseline
+        cache = getattr(analyzer, '_night_far_serve_baseline', None)
+        if cache is None or cache[0] != frame.shape[:2]:
+            model = far_baseline(frame)
+            if model is not None:
+                analyzer._night_far_serve_baseline = (frame.shape[:2], model)
+        else:
+            model = cache[1]
+        if model is None:
+            result.update(decision='hold', reason='night far baseline not visible')
+            return result
+        baseline_y = model['a'] * feet[0] + model['b']
     else:
         geometry_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "adjusted_court_points.txt")
         points = _load_full_frame_points(geometry_path)

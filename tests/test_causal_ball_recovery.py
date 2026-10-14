@@ -2,7 +2,30 @@ import cv2
 import numpy as np
 import pytest
 
+import math
 from causal_ball_recovery import find_local_ball
+
+
+def test_verified_contact_window_finds_outgoing_ball_over_tiny_racket_fragment():
+    before = np.zeros((600, 1000, 3), np.uint8)
+    after = before.copy()
+    cv2.circle(after, (500, 270), 8, (0, 240, 240), -1)
+    cv2.circle(after, (500, 430), 3, (0, 240, 240), -1)
+    args = (after, cv2.cvtColor(before, cv2.COLOR_BGR2GRAY), (500, 400),
+            {'dx': 0, 'dy': 70}, 90, [((20, 50, 130), (85, 255, 255))])
+    result = find_local_ball(*args, contact_window=True)
+    assert result is not None and math.dist(result['pos'], (500, 270)) <= 2
+    assert result['verified_contact_departure']
+    normal = find_local_ball(*args)
+    assert normal is None or math.dist(normal['pos'], (500, 270)) > 2
+
+
+def test_contact_window_does_not_recover_stationary_background():
+    image = np.zeros((600, 1000, 3), np.uint8)
+    cv2.circle(image, (500, 270), 8, (0, 240, 240), -1)
+    assert find_local_ball(image, cv2.cvtColor(image, cv2.COLOR_BGR2GRAY),
+        (500, 400), {'dx': 0, 'dy': 70}, 90,
+        [((20, 50, 130), (85, 255, 255))], contact_window=True) is None
 
 
 FILTERS=[(np.array([15,40,100],np.uint8),np.array([85,255,255],np.uint8))]

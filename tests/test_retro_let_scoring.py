@@ -204,3 +204,57 @@ def test_provisional_serve_context_does_not_resolve_pending(monkeypatch):
 
     assert calls == []
     assert tracker._retro_let_pending == {"sentinel": True}
+
+
+def test_net_error_after_receiver_return_is_not_a_serve_let():
+    from retro_let_scoring import _serve_net_touch_evidence
+    state = _State()
+    state.point_start_frame_internal = 100
+    state.frame_count = 200
+    state._serve_net_contact_point = (1900,480)
+    events = [{'frame':130,'player':'P2'}]
+    state._serve_net_contact_frame = 140
+    assert _serve_net_touch_evidence(state,events) is None
+    state._serve_net_contact_frame = 120
+    assert _serve_net_touch_evidence(state,events)['frame'] == 120
+    state._serve_net_contact_frame = 90
+    assert _serve_net_touch_evidence(state,events) is None
+    state._serve_net_contact_frame = 160
+    assert _serve_net_touch_evidence(state,[]) is None
+
+
+def test_same_side_replay_without_net_touch_cannot_remove_game_point():
+    from retro_let_scoring import _evaluate_pending
+    state = _State()
+    state.frame_count = 300
+    state.score_points = [0,3]
+    state.score_games = [0,0]
+    state._retro_let_pending = {'end_frame':200, 'server_idx':0,
+                               'observation':_observation(1901)}
+    assert _evaluate_pending(state,final=True) == 'discarded'
+    assert state.score_points == [0,3]
+    assert state.score_games == [0,0]
+    assert state._retro_let_pending is None
+
+
+def test_measured_net_touch_and_same_side_replay_still_restore_let():
+    from retro_let_scoring import _evaluate_pending
+    state = _State()
+    state.score_points = [0,2]
+    state.score_games = [0,0]
+    state.score_game_index = 0
+    state.current_serve_attempt = 1
+    snapshot = _score_snapshot(state)
+    state.score_points = [0,3]
+    state.frame_count = 300
+    state.player_names = ['P1','P2']
+    state._current_server_index = lambda:0
+    state._point_history_current = {
+        'server_idx':0,
+        'serve_context':{'player_position':[1830,1500], 'player_side':'near'}}
+    state._retro_let_pending = {
+        'snapshot':snapshot,'server_idx':0,'attempt':1,
+        'observation':_observation(1901),'end_frame':200,'hits':0,
+        'net_touch_evidence':{'frame':120,'position':(1900,480)}}
+    assert _evaluate_pending(state,final=True) == 'confirmed'
+    assert state.score_points == [0,2]

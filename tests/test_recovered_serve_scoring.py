@@ -5,6 +5,7 @@ scorer. This does not substitute for rerunning pixel detection on the video.
 """
 import csv
 import math
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -181,19 +182,24 @@ def test_first_fault_second_fault_then_rally_reaches_zero_forty(analyzer):
 
 
 @pytest.mark.parametrize('known_in', [False, True])
-def test_same_side_replay_requires_in_serve_evidence(analyzer, known_in):
+@pytest.mark.parametrize('net_touch', [False, True])
+def test_same_side_replay_requires_in_serve_and_net_touch_evidence(analyzer, known_in, net_touch):
     analyzer.score_points = [0, 1]
     start(analyzer, 699)
     analyzer.frame_count = 795
     if known_in:
         analyzer._record_serve_in()
+    if net_touch:
+        analyzer._serve_net_contact_frame = 719
+        analyzer._serve_net_contact_point = (1900,480)
     analyzer._record_point_result('Ball bounced out of court (right sideline)', (3563, 505))
-    assert (getattr(analyzer, '_retro_let_pending', None) is not None) == known_in
+    assert (getattr(analyzer, '_retro_let_pending', None) is not None) == (known_in and net_touch)
     start(analyzer, 1245)
     analyzer.frame_count = 1283
-    # A legitimate known-IN short serve still supports the existing let rule.
-    assert retro._evaluate_pending(analyzer, final=True) == ('confirmed' if known_in else 'none')
-    assert analyzer.score_points == ([0, 1] if known_in else [1, 1])
+    # A measured net touch plus legal landing still supports a real let replay.
+    confirmed = known_in and net_touch
+    assert retro._evaluate_pending(analyzer, final=True) == ('confirmed' if confirmed else 'none')
+    assert analyzer.score_points == ([0, 1] if confirmed else [1, 1])
 
 
 def test_offline_audit_does_not_treat_unknown_serve_as_in():
@@ -317,6 +323,44 @@ def test_continuous_side_recross_still_infers_return(analyzer):
     assert analyzer._point_hit_count == 1
 
 
+@pytest.mark.parametrize('contact_opportunity', [False, True])
+def test_side_recross_requires_opponent_contact_opportunity(analyzer, contact_opportunity):
+    start(analyzer, 100, (1800, 900))
+    analyzer.max_ball_speed = 400
+    analyzer._last_racket_contact_player = 0
+    analyzer._last_racket_contact_frame = 100
+    analyzer._last_racket_contact_point = (1800, 800)
+    analyzer._point_hit_count = 0
+    analyzer._point_history_current['shot_events'] = []
+    analyzer._player_index_on_court_end = lambda side: 0 if side == 'near' else 1
+    analyzer._player_index_at_point = lambda point, frame=None: 1 if point[1] < 500 else 0
+    opponent_track = SimpleNamespace(
+        side='far', bbox=(1500, 100, 300, 300), center=(1650, 250),
+        confidence=0.8, last_frame=114,
+    )
+
+    class PlayerTracker:
+        tracks = {'far': opponent_track}
+        detection_interval = 5
+        last_frame = 114
+
+        def _track_for_point(self, point):
+            return opponent_track if contact_opportunity else None
+
+    analyzer.player_tracker = PlayerTracker()
+    frame = np.zeros((2160, 3840, 3), dtype=np.uint8)
+    result = False
+    for number, point in ((110, (1800, 350)), (111, (1805, 390)),
+                          (112, (1810, 430)), (113, (1815, 510)),
+                          (114, (1820, 540))):
+        analyzer.frame_count = number
+        opponent_track.last_frame = number
+        analyzer.player_tracker.last_frame = number
+        result = analyzer._maybe_infer_return_contact_from_side_recross(point, frame)
+
+    assert result is contact_opportunity
+
+
 def test_held_exit_marker_does_not_create_opponent_observations(analyzer):
     start(analyzer, 100, (1800, 900))
     analyzer._last_racket_contact_player = 0
@@ -406,6 +450,43 @@ def test_continuously_recovered_ground_rebound_is_not_a_racket_return(analyzer):
     assert analyzer._side_recross_opponent_frames == 0
 
 
+def test_ground_bounce_on_last_hitter_side_blocks_later_side_recross_return(analyzer):
+    start(analyzer, 100)
+    analyzer._last_racket_contact_player = 0
+    analyzer._last_racket_contact_frame = 100
+    analyzer.last_ground_bounce_frame = 109
+    analyzer._ground_bounce_origin = (1800, 540)
+    analyzer._player_index_at_point = lambda point, frame=None: 1 if point[1] < 500 else 0
+    frame = np.zeros((2160, 3840, 3), dtype=np.uint8)
+
+    for number, point in ((110, (1800, 350)), (111, (1805, 390)),
+                          (112, (1810, 430)), (113, (1815, 510)),
+                          (114, (1820, 540))):
+        analyzer.frame_count = number
+        assert not analyzer._maybe_infer_return_contact_from_side_recross(point, frame)
+
+    assert analyzer._last_racket_contact_player == 0
+    assert analyzer._point_hit_count == 0
+
+
+def test_ground_bounce_on_opponent_side_still_allows_hidden_return_inference(analyzer):
+    start(analyzer, 100)
+    analyzer._last_racket_contact_player = 0
+    analyzer._last_racket_contact_frame = 100
+    analyzer.last_ground_bounce_frame = 109
+    analyzer._ground_bounce_origin = (1800, 350)
+    analyzer._player_index_at_point = lambda point, frame=None: 1 if point[1] < 500 else 0
+    frame = np.zeros((2160, 3840, 3), dtype=np.uint8)
+
+    for number, point in ((110, (1800, 350)), (111, (1805, 390)),
+                          (112, (1810, 430)), (113, (1815, 510))):
+        analyzer.frame_count = number
+        assert not analyzer._maybe_infer_return_contact_from_side_recross(point, frame)
+    analyzer.frame_count = 114
+    assert analyzer._maybe_infer_return_contact_from_side_recross((1820, 540), frame)
+    assert analyzer._last_racket_contact_player == 1
+
+
 def test_second_bounce_outside_is_unreturned_not_hitter_error(analyzer):
     start(analyzer, 100)
     analyzer.frame_count = 180
@@ -444,3 +525,36 @@ def test_late_inferred_contact_keeps_measured_next_receiver_samples(analyzer):
     assert analyzer._maybe_infer_return_contact_from_side_recross((1800,400),frame)
     assert analyzer._last_racket_contact_player==0
     assert analyzer._point_hit_count==2
+
+
+@pytest.mark.parametrize('previous,current,net_hit', [
+    ((-16, -317), (22, -75), False),
+    ((16, -317), (-22, -75), False),
+    ((-30, -10), (15, -5), True),
+    ((0, -30), (0, 15), True),
+])
+def test_net_impact_requires_flight_reversal_not_minor_lateral_sign_change(analyzer, previous, current, net_hit):
+    start(analyzer, 10)
+    analyzer.frame_count = 100
+    analyzer.ball_center = (1737, 417)
+    analyzer.ball_size = 140
+    analyzer._serve_phase_active = analyzer._awaiting_serve_bounce = False
+    analyzer._contact_visible_recovery_far_exit_end_candidate = lambda *args: (False, None)
+    analyzer._confirmed_outbound_sideline_exit = lambda *args: (False, None)
+    analyzer._top_far_baseline_fall_out_candidate = lambda *args: (False, None)
+    analyzer._upper_fence_fall_end_candidate = lambda *args: False
+    analyzer._detect_out_of_court_bounce = lambda *args: (False, None)
+    analyzer._mark_serve_net_contact_candidate = lambda *args: False
+    analyzer._same_side_pre_net_bounce_candidate = lambda *args: (False, None)
+    analyzer._net_contact_geometry = lambda point: {
+        'inside': True, 'near_polygon': True, 'near_top_tape': False,
+        'near_hull': True, 'signed_dist': 0,
+    }
+    def motion(delta):
+        dx, dy = delta
+        return {'dx': dx, 'dy': dy, 'distance': math.hypot(dx, dy),
+                'direction_deg': math.degrees(math.atan2(dy, dx))}
+    analyzer.prev_motion = motion(previous)
+    analyzer.last_motion = motion(current)
+    result, reason = analyzer.detect_point_end(analyzer.ball_center, np.zeros((2160, 3840, 3), np.uint8))
+    assert (result and reason == 'Ball hit the net') is net_hit

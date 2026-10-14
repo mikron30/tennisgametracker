@@ -65,6 +65,17 @@ def test_accepted_launches_still_register_double_bounce(analyzer):
     assert len(analyzer._ground_bounce_debug_history) == 2
 
 
+def test_predicted_launch_cannot_register_ground_bounce_on_racket_contact_frame(analyzer):
+    analyzer._last_racket_contact_frame = 4663
+
+    assert not register(analyzer, 4663)
+    assert analyzer.ground_bounce_count == 0
+    assert analyzer.last_ground_bounce_frame == -1000000
+
+    assert register(analyzer, 4664)
+    assert analyzer.ground_bounce_count == 1
+
+
 def test_rejection_preserves_previously_accepted_bounce(analyzer):
     a = analyzer
     assert register(a, 4663)

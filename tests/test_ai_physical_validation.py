@@ -38,6 +38,45 @@ class PhysicalValidationTests(unittest.TestCase):
         self.assertEqual(validate_ai_step((800, 80), 12, self.history, motion=self.motion),
                          'unsupported-jump')
 
+    def test_rejected_tracking_jump_rolls_back_ai_motion_and_handoff(self):
+        analyzer = InteractiveBallAnalyzer.__new__(InteractiveBallAnalyzer)
+        analyzer.frame_count = 4154
+        analyzer.ball_center = (1642, 669)
+        analyzer.ball_size = 226.5
+        analyzer.last_motion = {
+            'dx': 5.0, 'dy': 76.0, 'distance': 76.2, 'direction_deg': 86.2,
+        }
+        analyzer.ball_velocity_history = [50.0, 54.0, 62.1, 68.1, 76.2]
+        analyzer.stuck_frame_count = 0
+        analyzer._local_ai_recovery_count = 0
+        analyzer._local_ai_follow_until_frame = -1
+        analyzer._local_ai_handoff_deadline_frame = -1
+        analyzer._last_motion_reacq_frame = 4154
+        analyzer._last_motion_reacq_pos = (1212, 508)
+        snapshot = analyzer._snapshot_tracking_state_for_provisional_guard()
+
+        analyzer.ball_center = (1212, 508)
+        analyzer.ball_size = 9.0
+        analyzer.last_motion = {
+            'dx': -435.0, 'dy': -161.0, 'distance': 459.2, 'direction_deg': -159.7,
+        }
+        analyzer.ball_velocity_history = [50.0, 54.0, 62.1, 68.1, 459.2]
+        analyzer._local_ai_recovery_count = 1
+        analyzer._local_ai_follow_until_frame = 4158
+        analyzer._local_ai_handoff_deadline_frame = 4168
+
+        analyzer._rollback_rejected_tracking_jump(snapshot, previous_stuck=0)
+
+        self.assertEqual(analyzer.ball_center, (1642, 669))
+        self.assertEqual(analyzer.ball_size, 226.5)
+        self.assertEqual(analyzer.last_motion['distance'], 76.2)
+        self.assertEqual(analyzer.ball_velocity_history, [50.0, 54.0, 62.1, 68.1, 76.2])
+        self.assertEqual(analyzer.stuck_frame_count, 1)
+        self.assertEqual(analyzer._local_ai_recovery_count, 0)
+        self.assertEqual(analyzer._local_ai_follow_until_frame, -1)
+        self.assertEqual(analyzer._local_ai_handoff_deadline_frame, -1)
+        self.assertEqual(analyzer._last_motion_reacq_frame, -1000000)
+
     def test_forced_high_score_rejection_preserves_motion_and_history(self):
         analyzer = InteractiveBallAnalyzer.__new__(InteractiveBallAnalyzer)
         analyzer._force_local_ai_range = (12, 20)

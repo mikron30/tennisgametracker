@@ -107,15 +107,20 @@ class LocalBallAIRecovery:
             return True
         return frame_index - self.last_attempt_frame >= self.cooldown_frames
 
-    def scoring_ready(self, frame_index: int) -> bool:
+    def scoring_ready(self, frame_index: int, *, contact_loss=False) -> bool:
         """One shared budget for contact, tight-ROI and buffered recovery."""
         if not hasattr(self, '_inference_budget'):
             self._inference_budget = InferenceBudget()
-        return self._inference_budget.ready(frame_index)
+        urgent = contact_loss or getattr(self, '_contact_loss_scoring_frame', None) == frame_index
+        ready = self._inference_budget.ready(frame_index, minimum_interval=4 if urgent else None)
+        if contact_loss and ready:
+            self._contact_loss_scoring_frame = int(frame_index)
+        return ready
 
     def _begin_inference(self, frame_index):
         self.scoring_ready(frame_index)
-        if not getattr(self, '_diagnostic_unthrottled', False) and not self._inference_budget.reserve(frame_index):
+        interval = 4 if getattr(self, '_contact_loss_scoring_frame', None) == frame_index else None
+        if not getattr(self, '_diagnostic_unthrottled', False) and not self._inference_budget.reserve(frame_index, minimum_interval=interval):
             self.last_rejection = 'inference-budget'
             return False
         return True

@@ -9,16 +9,17 @@ class InferenceBudget:
         self.maximum = max(1, int(maximum_calls))
         self.frames = deque()
 
-    def ready(self, frame):
+    def ready(self, frame, *, minimum_interval=None):
         frame = int(frame)
         if self.frames and frame < self.frames[-1]:
             self.frames.clear()  # Interactive seek starts a new video interval.
         while self.frames and frame - self.frames[0] >= self.window:
             self.frames.popleft()
-        return (not self.frames or frame - self.frames[-1] >= self.interval) and len(self.frames) < self.maximum
+        interval = self.interval if minimum_interval is None else max(1, int(minimum_interval))
+        return (not self.frames or frame - self.frames[-1] >= interval) and len(self.frames) < self.maximum
 
-    def reserve(self, frame):
-        if not self.ready(frame):
+    def reserve(self, frame, *, minimum_interval=None):
+        if not self.ready(frame, minimum_interval=minimum_interval):
             return False
         self.frames.append(int(frame))
         return True

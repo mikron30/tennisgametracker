@@ -24,6 +24,63 @@ def test_same_frame_cannot_start_two_scorers_and_seek_resets_budget():
     assert not budget.reserve(11)
 
 
+def test_player_loss_retry_can_run_after_four_frames_without_raising_window_limit():
+    recovery = LocalBallAIRecovery.__new__(LocalBallAIRecovery)
+    assert recovery._begin_inference(100)
+    assert not recovery.scoring_ready(103, contact_loss=True)
+    assert not recovery.scoring_ready(104)
+    assert recovery.scoring_ready(104, contact_loss=True)
+    assert recovery._begin_inference(104)
+    assert not recovery._begin_inference(104)
+    assert not recovery.scoring_ready(108, contact_loss=True)
+    assert recovery.scoring_ready(125)
+
+
+def test_automatic_player_loss_requests_bounded_urgent_retry():
+    analyzer = InteractiveBallAnalyzer.__new__(InteractiveBallAnalyzer)
+    analyzer.frame_count = 104
+    analyzer.ball_center = (50,50)
+    analyzer.stuck_frame_count = 2
+    analyzer._player_point_zone = lambda pos:'player_body'
+    recovery = LocalBallAIRecovery.__new__(LocalBallAIRecovery)
+    recovery._begin_inference(100)
+    analyzer.local_ai_recovery = recovery
+    assert analyzer._automatic_local_ai_scoring_ready()
+    assert recovery._begin_inference(104)
+
+
+def test_healthy_or_clear_held_position_keeps_normal_cooldown():
+    analyzer = InteractiveBallAnalyzer.__new__(InteractiveBallAnalyzer)
+    analyzer.frame_count = 104
+    analyzer.ball_center = (50,50)
+    recovery = LocalBallAIRecovery.__new__(LocalBallAIRecovery)
+    recovery._begin_inference(100)
+    analyzer.local_ai_recovery = recovery
+    analyzer.stuck_frame_count = 0
+    analyzer._player_point_zone = lambda pos:'player_body'
+    assert not analyzer._automatic_local_ai_scoring_ready()
+    analyzer.stuck_frame_count = 3
+    analyzer._player_point_zone = lambda pos:None
+    assert not analyzer._automatic_local_ai_scoring_ready()
+
+
+def test_pre_track_player_loss_survives_a_reacquisition_stuck_reset():
+    analyzer = InteractiveBallAnalyzer.__new__(InteractiveBallAnalyzer)
+    analyzer.frame_count=104
+    analyzer.ball_center=(50,50)
+    analyzer.ball_size=36
+    analyzer.stuck_frame_count=0
+    analyzer._player_point_zone=lambda point:'player_body'
+    analyzer._normal_ball_evidence_is_strong=lambda *args:False
+    analyzer._point_in_player_contact_corridor=lambda point:True
+    recovery=LocalBallAIRecovery.__new__(LocalBallAIRecovery)
+    recovery._begin_inference(100)
+    analyzer.local_ai_recovery=recovery
+    snapshot={'stuck_frame_count':3,'last_motion':{'dx':0,'dy':20,'distance':20},'ball_size':36}
+    assert analyzer._contact_local_ai_trigger((50,50),(50,50),snapshot) is not None
+    assert recovery._begin_inference(104)
+
+
 def test_throttled_scorers_do_not_start_processes_or_serialize_images():
     recovery = LocalBallAIRecovery.__new__(LocalBallAIRecovery)
     assert recovery._begin_inference(100)

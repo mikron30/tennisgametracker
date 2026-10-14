@@ -35,6 +35,23 @@ class _DeterministicRecovery(LocalBallAIRecovery):
 
 
 class LocalBallAIRecoveryTests(unittest.TestCase):
+    def test_post_contact_reversed_body_candidate_triggers_ai_despite_strong_normal_path(self):
+        analyzer = InteractiveBallAnalyzer.__new__(InteractiveBallAnalyzer)
+        analyzer.frame_count = 4155
+        analyzer.local_ai_recovery = object()
+        analyzer._contact_local_ai_cooldown_until_frame = -1
+        analyzer._post_contact_player_body_reversal_frame = 4155
+        analyzer._post_contact_player_body_reversal_candidate = (1669, 813)
+        analyzer._player_point_zone = lambda point: 'player_body'
+        analyzer._normal_ball_evidence_is_strong = lambda *args: True
+        analyzer._automatic_local_ai_scoring_ready = lambda: True
+
+        reason = analyzer._contact_local_ai_trigger(
+            (1647, 745), (1680, 830), {}, frame=np.zeros((2160, 3840, 3), dtype=np.uint8)
+        )
+
+        self.assertEqual(reason, 'post-contact-body-reversal')
+
     @staticmethod
     def _tight_roi_analyzer(frame_index=4126):
         analyzer = InteractiveBallAnalyzer.__new__(InteractiveBallAnalyzer)
