@@ -169,7 +169,8 @@ def find_receiver_ball(analyzer, frame, allow_far_receiver=True, allow_near_net=
         cx,cy=int(m['m10']/m['m00']),int(m['m01']/m['m00'])
         choices.append(dict(pos=(cx+x1,cy+y1),area=area,hsv=tuple(int(v) for v in hsv[cy,cx]),
                             source='receiver_temporal',recovery_label='RECEIVER TEMPORAL RECOVER'))
-    candidate = _moving_pair(analyzer, frame, choices, '_receiver_ball_probe', 65.0)
+    candidate = _moving_pair(analyzer, frame, choices, '_receiver_ball_probe', 65.0,
+                             preserve_local_motion=True)
     if candidate is None:
         return None
 

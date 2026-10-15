@@ -558,3 +558,18 @@ def test_net_impact_requires_flight_reversal_not_minor_lateral_sign_change(analy
     analyzer.last_motion = motion(current)
     result, reason = analyzer.detect_point_end(analyzer.ball_center, np.zeros((2160, 3840, 3), np.uint8))
     assert (result and reason == 'Ball hit the net') is net_hit
+
+
+def test_verified_receiver_second_bounce_keeps_physical_endpoint(analyzer):
+    start(analyzer, 10)
+    analyzer.frame_count = 100
+    analyzer._serve_phase_active = analyzer._awaiting_serve_bounce = False
+    analyzer._receiver_bounce_terminal = {
+        'confirmed_frame':100, 'frame':99, 'position':(50,70), 'point_start':10}
+    analyzer._terminal_player_overlap_position = MagicMock(
+        side_effect=AssertionError('Verified bounce must not search for another ball'))
+    analyzer._record_point_result('Ball bounced twice on court', end_position=(48,60))
+    analyzer._terminal_player_overlap_position.assert_not_called()
+    rows = list(csv.DictReader(open(analyzer.point_history_file, encoding='utf-8-sig')))
+    assert rows[-1]['point_end_frame'] == '99'
+    assert rows[-1]['end_position'] == '(50,70)'

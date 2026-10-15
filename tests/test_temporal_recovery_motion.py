@@ -1,3 +1,5 @@
+import numpy as np
+import pytest
 from interactive_ball_analyzer import InteractiveBallAnalyzer
 
 
@@ -50,3 +52,43 @@ def test_ai_motion_override_without_temporal_pair_keeps_contact_motion():
     observation.pop('temporal_history_entry')
     analyzer._commit_night_visible_ball_recovery(observation, None)
     assert analyzer.prev_motion['dy'] == 151
+
+
+def test_single_image_recovery_cannot_teleport_to_other_player():
+    analyzer = recovering_tracker()
+    analyzer.motion_history = [{'frame': 99, 'pos': analyzer.ball_center}]
+    analyzer.stuck_frame_count = 1
+    observation = dict(pos=(2062, 200), area=24, hsv=(35, 160, 220))
+    assert analyzer._commit_night_visible_ball_recovery(observation, None) == (2104, 1124)
+    assert analyzer.ball_center == (2104, 1124)
+    assert analyzer.stuck_frame_count == 2
+    assert analyzer.last_motion['dy'] == 151
+
+
+def test_recovery_speed_limit_accounts_for_frames_with_missing_ball():
+    analyzer = recovering_tracker()
+    analyzer.motion_history = [{'frame':99, 'pos':analyzer.ball_center}]
+    analyzer.stuck_frame_count = 5
+    observation = {'pos':(500,300), 'area':24, 'hsv':(35,160,220)}
+    assert analyzer._commit_night_visible_ball_recovery(observation, None) == (500,300)
+
+
+@pytest.mark.parametrize('case', ['bounce', 'racket', 'fast_return', 'no_first_bounce',
+                                 'stale_pair', 'weak_image', 'gap'])
+def test_verified_receiver_recovery_preserves_second_bounce(case):
+    a = recovering_tracker()
+    a.ball_center = (50,70)
+    a.motion_history = [{'frame':97,'pos':(60,40)}, {'frame':98,'pos':(55,55)},
+                        {'frame':99,'pos':(50,70)}]
+    a.ground_bounce_count = 0 if case == 'no_first_bounce' else 1
+    a.last_ground_bounce_frame = 75
+    a._last_racket_contact_frame = 90 if case == 'racket' else 60
+    a._get_ground_bounce_context = lambda *args, **kwargs: {'origin':(50,70)}
+    candidate = {'source':'receiver_temporal','pos':(48,60),'area':30,
+                 'motion_frames':(99,100),'motion_mean':24,'motion_max':120}
+    if case == 'fast_return': candidate['pos'] = (48,20)
+    if case == 'stale_pair': candidate['motion_frames'] = (98,100)
+    if case == 'weak_image': candidate['motion_mean'] = 1
+    if case == 'gap': a.motion_history[1]['frame'] = 97
+    result = a._receiver_second_bounce_context(candidate, np.zeros((500,500,3),dtype=np.uint8))
+    assert (result is not None) == (case == 'bounce')

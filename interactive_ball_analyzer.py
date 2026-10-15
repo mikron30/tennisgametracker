@@ -1341,8 +1341,31 @@ class InteractiveBallAnalyzer:
             # Motion on a racket/string fragment is not proof of ball continuity.
             return False
         zone = self._player_point_zone(tracked_position)
-        if zone is not None and not (zone == 'player_body' and
-                self._compact_body_overlap_flight_is_coherent(previous_position, tracked_position, snapshot)):
+        ground_overlap = False
+        if (zone == 'player_shoes' and
+                int(getattr(self, 'last_ground_bounce_frame', -1)) == self.frame_count and
+                int(getattr(self, 'stuck_frame_count', 0)) == 0 and
+                int((snapshot or {}).get('stuck_frame_count', 0)) == 0 and
+                8 <= previous_size <= 80 and
+                previous_size * .5 <= float(getattr(self, 'ball_size', 0)) <= previous_size * 3):
+            history = (snapshot or {}).get('motion_history')
+            if history is None:
+                history = [entry for entry in getattr(self, 'motion_history', [])
+                           if entry.get('frame', self.frame_count) < self.frame_count]
+            if len(history) >= 3:
+                samples = history[-3:]
+                if ([entry.get('frame') for entry in samples] ==
+                        list(range(self.frame_count - 3, self.frame_count)) and
+                        tuple(samples[-1]['pos']) == tuple(previous_position)):
+                    a, b, c = [entry['pos'] for entry in samples]
+                    dx = tracked_position[0] - c[0]
+                    dy = tracked_position[1] - c[1]
+                    ground_overlap = (6 <= b[1] - a[1] <= 40 and
+                        6 <= c[1] - b[1] <= 40 and -40 <= dy <= -6 and
+                        abs(dx - (c[0] - b[0])) <= 10 and
+                        abs((c[0] - b[0]) - (b[0] - a[0])) <= 10)
+        if zone is not None and not (ground_overlap or (zone == 'player_body' and
+                self._compact_body_overlap_flight_is_coherent(previous_position, tracked_position, snapshot))):
             return False
         step = math.dist(previous_position, tracked_position)
         speeds = (snapshot or {}).get('ball_velocity_history', [])[-5:]
@@ -1363,7 +1386,7 @@ class InteractiveBallAnalyzer:
             return False
         patch = cv2.cvtColor(frame[top:bottom, left:right], cv2.COLOR_BGR2GRAY)
         arrival = patch.astype(np.int16) - previous_gray[top:bottom, left:right].astype(np.int16)
-        return float(np.mean(np.maximum(arrival, 0))) >= 10.0 and float(np.max(arrival)) >= 60.0
+        return float(np.mean(np.maximum(arrival, 0))) >= (4.0 if ground_overlap else 10.0) and float(np.max(arrival)) >= 60.0
 
     def _repair_tiny_fragment_from_visible_flight(self, frame, previous_position, tracked_position, snapshot):
         """Search fresh ball pixels before asking AI to replace a tiny fragment."""
@@ -8345,6 +8368,37 @@ class InteractiveBallAnalyzer:
         )
         return min(candidates, key=lambda item: item[:3])[3]
 
+    def _receiver_second_bounce_context(self, candidate, frame):
+        """Keep ground impacts observable during a verified receiver recovery."""
+        if (frame is None or candidate.get('source') != 'receiver_temporal' or
+                candidate.get('motion_frames') != (self.frame_count - 1, self.frame_count) or
+                candidate.get('motion_mean', 0) < 12 or candidate.get('motion_max', 0) < 60 or
+                int(getattr(self, 'ground_bounce_count', 0)) != 1 or
+                getattr(self, '_awaiting_serve_bounce', False)):
+            return None
+        first = int(getattr(self, 'last_ground_bounce_frame', -1000000))
+        if not 8 <= self.frame_count - first <= 90 or int(getattr(
+                self, '_last_racket_contact_frame', -1000000)) >= first:
+            return None
+        history = [entry for entry in getattr(self, 'motion_history', [])
+                   if entry.get('frame', self.frame_count) < self.frame_count]
+        if len(history) < 3:
+            return None
+        history = history[-3:]
+        if ([entry.get('frame') for entry in history] !=
+                list(range(self.frame_count - 3, self.frame_count)) or
+                tuple(history[-1]['pos']) != tuple(self.ball_center)):
+            return None
+        a, b, c = [entry['pos'] for entry in history]
+        dx, dy = candidate['pos'][0] - c[0], candidate['pos'][1] - c[1]
+        incoming = math.dist(b, c)
+        if not (8 <= candidate['area'] <= 80 and c[1] <= frame.shape[0] * .3 and
+                6 <= b[1] - a[1] <= 40 and 6 <= c[1] - b[1] <= 40 and
+                -30 <= dy <= -4 and 5 <= math.hypot(dx, dy) <= min(30, incoming * 1.3) and
+                abs(dx - (c[0] - b[0])) <= 15):
+            return None
+        return self._get_ground_bounce_context(frame.shape, allow_near_net=True)
+
     def _commit_night_visible_ball_recovery(self, candidate, frame):
         if (self._delayed_literal_top_return_context() and
                 candidate.get('source') not in ('local_ai_tight_roi', 'temporal_top_return')):
@@ -8365,6 +8419,20 @@ class InteractiveBallAnalyzer:
             )
         prev_pos = self.ball_center
         new_pos = candidate['pos']
+        receiver_bounce = self._receiver_second_bounce_context(candidate, frame)
+        if prev_pos is not None and candidate.get('source') not in (
+                'receiver_temporal', 'night_visible_temporal', 'temporal_top_return', 'local_ai_tight_roi'):
+            history = getattr(self, 'motion_history', [])
+            last_frame = history[-1].get('frame', self.frame_count - 1) if history else self.frame_count - 1
+            elapsed = max(1, min(8, int(self.frame_count) - int(last_frame)),
+                          min(8, int(getattr(self, 'stuck_frame_count', 0))))
+            limit = float(getattr(self, 'max_ball_speed', 400)) * elapsed
+            jump = math.dist(prev_pos, new_pos)
+            if jump > limit:
+                self.stuck_frame_count = int(getattr(self, 'stuck_frame_count', 0)) + 1
+                print(f"[VISIBLE_RECOVERY_JUMP_REJECT] f{self.frame_count}: "
+                      f"jump={jump:.1f}px limit={limit:.1f}px; keeping {prev_pos}")
+                return prev_pos
         # A visible outbound flight is physical evidence even when the optional
         # AI owner is unavailable. Arm the existing multi-frame far-exit check
         # from a protected lower-player anchor; it still requires an upward
@@ -8461,6 +8529,16 @@ class InteractiveBallAnalyzer:
             self._pending_rally_end_reason = None
             self._pending_rally_end_frame = -1
         self._activate_regular_hsv()
+        if receiver_bounce is not None:
+            self._register_ground_bounce_from_context(receiver_bounce, frame, 'measured local flight')
+            if self.ground_bounce_count >= 2:
+                self._pending_rally_end_reason = 'Ball bounced twice on court'
+                self._pending_rally_end_frame = self.frame_count
+                self._verified_receiver_bounce = {'frame': self.frame_count, 'pos': tuple(new_pos)}
+                self._receiver_bounce_terminal = {
+                    'confirmed_frame': self.frame_count, 'frame': self.frame_count - 1,
+                    'position': tuple(receiver_bounce['origin']),
+                    'point_start': self.point_start_frame_internal}
         if candidate.get('lower_contact_approach', False):
             # Keep a tightly bounded launch prediction for the frame after
             # the incoming ball overlaps the player's racket.
@@ -12725,6 +12803,12 @@ class InteractiveBallAnalyzer:
                 own_bounce['point_start'] == self.point_start_frame_internal):
             confirmed_pending_endpoint = own_bounce['position']
             requested_history_end_frame = own_bounce['frame']
+        receiver_bounce = getattr(self, '_receiver_bounce_terminal', None)
+        if (reason_lower == 'ball bounced twice on court' and receiver_bounce and
+                receiver_bounce['confirmed_frame'] == self.frame_count and
+                receiver_bounce['point_start'] == self.point_start_frame_internal):
+            confirmed_pending_endpoint = receiver_bounce['position']
+            requested_history_end_frame = receiver_bounce['frame']
         if confirmed_pending_endpoint is not None:
             # V15: the rebound frame proves the OUT but is not the bounce location.
             # Preserve V14's original source point instead of letting generic
@@ -29477,7 +29561,8 @@ class InteractiveBallAnalyzer:
                             pending_zone = self._player_point_zone(tracked_position)
                             pending_size = float(getattr(self, 'ball_size', 0.0) or 0.0)
                             compact_pending_ball = (
-                                pending_zone is None and
+                                (pending_zone is None or getattr(self, '_verified_receiver_bounce', None) ==
+                                 {'frame': self.frame_count, 'pos': tuple(tracked_position)}) and
                                 pending_size <= max(600.0, float(min(frame.shape[:2])) * 0.22)
                             )
                             if not compact_pending_ball:

@@ -66,6 +66,24 @@ def test_moving_fragment_with_abrupt_size_collapse_is_not_strong_ball_evidence()
     assert not analyzer._normal_ball_evidence_is_strong(frame, (40, 27), (50, 32), snapshot)
 
 
+@pytest.mark.parametrize('case', ['bounce', 'stale', 'jump', 'no_history', 'static'])
+def test_measured_ground_bounce_can_overlap_shoe_box_without_ai_rollback(case):
+    analyzer, frame, snapshot = flight()
+    analyzer._player_point_zone = lambda point: 'player_shoes'
+    analyzer.ball_size = 34
+    analyzer.last_ground_bounce_frame = 99 if case == 'stale' else 100
+    snapshot.update(ball_size=21, motion_history=[
+        {'frame':97, 'pos':(60,20)}, {'frame':98, 'pos':(55,38)},
+        {'frame':99, 'pos':(50,55)}])
+    if case == 'no_history':
+        snapshot['motion_history'] = []
+    frame[:] = 0
+    if case != 'static':
+        frame[35:45, 43:53] = 240
+    target = (75,40) if case == 'jump' else (48,40)
+    assert analyzer._normal_ball_evidence_is_strong(frame,(50,55),target,snapshot) == (case == 'bounce')
+
+
 def test_size_collapse_near_contact_triggers_ai_without_a_large_turn():
     analyzer, _, snapshot = flight()
     analyzer.ball_size = 16
