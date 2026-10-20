@@ -181,7 +181,7 @@ def _apply_recent_stance(result: Dict, recent: Dict, serve_position, frame_width
     return result
 
 
-def evaluate_serve_stance(analyzer, serve_position, frame) -> Dict:
+def evaluate_serve_stance(analyzer, serve_position, frame, *, verified_toss=False) -> Dict:
     """Return allow/hold/reject/bypass for a potential serve toss.
 
     ``hold`` means player tracking is enabled but no recent reliable server
@@ -240,6 +240,21 @@ def evaluate_serve_stance(analyzer, serve_position, frame) -> Dict:
     result["bbox"] = tuple(track.bbox) if getattr(track, "bbox", None) is not None else None
     result["confidence"] = float(getattr(track, "confidence", 0.0) or 0.0)
 
+    # A HOG box can briefly absorb the net/court below a far server. Such a
+    # sudden scale change is not evidence that the player stepped inside.
+    # Reuse only a very recent legal stance, with the usual toss alignment.
+    if side == 'far' and getattr(analyzer, 'far_serve_image_baseline', False):
+        recent = _recent_valid_stance(analyzer, frame_index, side)
+        if recent is not None and recent.get('bbox') is not None:
+            old_x, old_y, old_w, old_h = recent['bbox']
+            x, y, w, h = result['bbox']
+            age = frame_index - int(recent['frame'])
+            if (0 <= age <= 10 and old_h > 0 and h > old_h * 1.8 and
+                    y + h - (old_y + old_h) > max(50, old_h * .6) and
+                    abs(x + w / 2 - (old_x + old_w / 2)) <= max(60, old_w)):
+                result['fresh'] = False
+                return _apply_recent_stance(result, recent, serve_position, width)
+
     if not bool(getattr(track, "visible", False)):
         recent = _recent_valid_stance(analyzer, frame_index, side)
         if recent is not None:
@@ -286,7 +301,7 @@ def evaluate_serve_stance(analyzer, serve_position, frame) -> Dict:
             return result
         c2, c1, c0 = model['curve']
         baseline_y = c2 * feet[0] ** 2 + c1 * feet[0] + c0
-    elif night and side == 'far':
+    elif (night or getattr(analyzer, 'far_serve_image_baseline', False)) and side == 'far':
         from night_serve_geometry import far_baseline
         cache = getattr(analyzer, '_night_far_serve_baseline', None)
         if cache is None or cache[0] != frame.shape[:2]:
@@ -327,6 +342,18 @@ def evaluate_serve_stance(analyzer, serve_position, frame) -> Dict:
 
     result["delta"] = float(delta)
     if not behind:
+        recent = _recent_valid_stance(analyzer, frame_index, side)
+        if (verified_toss and side == 'far' and
+                getattr(analyzer, 'far_serve_image_baseline', False) and recent and
+                0 <= frame_index - recent['frame'] <= 10 and
+                delta >= -tolerance * 1.25 and
+                abs(feet[0] - recent['feet'][0]) <= max(12, width * .01)):
+            # An established legal toss must survive a small HOG-foot jitter
+            # at contact. Do not refresh the cache from the contradictory box.
+            result = _apply_recent_stance(result, recent, serve_position, width)
+            if result['decision'] == 'allow':
+                result['reason'] = 'verified toss retains recent legal stance through baseline jitter'
+            return result
         # A fresh contradictory detection invalidates any short cached legal
         # stance from earlier frames.
         analyzer._serve_stance_last_valid = None

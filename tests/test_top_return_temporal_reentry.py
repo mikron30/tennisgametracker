@@ -118,3 +118,50 @@ def test_wide_return_guards_do_not_change_other_exit_contexts(mode, anchor, age)
     obj._top_return_anchor = anchor
     obj.frame_count = obj._top_return_origin_frame + age
     assert not obj._delayed_literal_top_return_context()
+
+
+def test_configured_camera_confirms_early_literal_return_using_its_colours():
+    obj=tracker()
+    obj._is_night_session_config=lambda:False
+    obj.far_serve_image_baseline=True
+    obj.tracking_hsv_ranges=[dict(h_min=35,h_max=65,s_min=5,s_max=100,v_min=140,v_max=255)]
+    # The new camera produces pale balls outside the legacy primary filter.
+    pale=cv2.cvtColor(np.array([[[45,40,220]]],np.uint8),cv2.COLOR_HSV2BGR)[0,0]
+    for i,pos in enumerate([(500,12),(496,25),(492,45)]):
+        image=np.zeros((1000,1200,3),np.uint8)
+        cv2.circle(image,pos,6,tuple(map(int,pale)),-1)
+        obj.frame_count=104+i
+        obj._terminal_previous_gray=np.zeros(image.shape[:2],np.uint8)
+        found=obj._recover_wide_top_return_flight(image)
+        if i<2:
+            assert found is None
+        else:
+            assert np.linalg.norm(np.array(found)-pos)<2
+    obj._commit_night_visible_ball_recovery.assert_called_once()
+
+
+def test_configured_literal_return_does_not_accept_stationary_top_speck():
+    obj=tracker();obj.far_serve_image_baseline=True
+    for frame in (104,105,106,107):
+        found,_=observe(obj,frame,(500,12))
+        assert found is None
+    obj._commit_night_visible_ball_recovery.assert_not_called()
+
+
+def test_configured_local_flight_cannot_bypass_literal_exit_confirmation(monkeypatch):
+    obj=tracker();obj.far_serve_image_baseline=True
+    obj.ball_center=(900,2)
+    search=Mock()
+    monkeypatch.setattr('causal_ball_recovery.find_local_ball',search)
+    assert obj._recover_local_ball_flight(np.zeros((1000,1200,3),np.uint8)) is None
+    search.assert_not_called()
+
+
+@pytest.mark.parametrize('mode,y,age,expected', [
+    ('edge',16,3,True),('edge',16,2,False),('edge',80,5,False),
+    ('upper_side',16,5,False),('edge_clip',2,3,True)])
+def test_configured_projected_exit_requires_near_top_evidence(mode,y,age,expected):
+    obj=tracker();obj.far_serve_image_baseline=True
+    obj._top_return_mode=mode;obj._top_return_anchor=(900,y)
+    obj.frame_count=100+age
+    assert obj._delayed_literal_top_return_context() is expected

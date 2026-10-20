@@ -2,6 +2,46 @@
 import math
 
 
+def outgoing_candidate_path(samples, origin=None, radius=180):
+    """Resolve a serve/shirt ambiguity using four fresh, consecutive images."""
+    if len(samples) < 4:
+        return None
+    samples = samples[-4:]
+    if any(b['frame'] - a['frame'] != 1 for a, b in zip(samples, samples[1:])):
+        return None
+    paths = [([candidate], 0.) for candidate in samples[0]['candidates']
+             if origin is None or math.dist(candidate['pos'], origin) <= radius]
+    for sample in samples[1:]:
+        extended = []
+        for path, cost in paths:
+            for candidate in sample['candidates']:
+                dx = candidate['pos'][0] - path[-1]['pos'][0]
+                dy = candidate['pos'][1] - path[-1]['pos'][1]
+                if not (dy >= 10 and 18 <= math.hypot(dx, dy) <= 90):
+                    continue
+                sizes = [item['area'] for item in path] + [candidate['area']]
+                if max(sizes) > min(sizes) * 4:
+                    continue
+                change = 0.
+                if len(path) >= 2:
+                    previous_dx = path[-1]['pos'][0] - path[-2]['pos'][0]
+                    previous_dy = path[-1]['pos'][1] - path[-2]['pos'][1]
+                    change = math.hypot(dx - previous_dx, dy - previous_dy)
+                    if change > 20:
+                        continue
+                extended.append((path + [candidate], cost + change))
+        # Keep a bounded set when a player produces many moving fragments.
+        paths = sorted(extended, key=lambda item: item[1])[:64]
+    valid = [(path, cost) for path, cost in paths
+             if path[-1].get('player_zone') is None and
+             outgoing_flight([c['pos'] for c in path],
+                             [s['frame'] for s in samples], allow_diagonal=True)]
+    if not valid:
+        return None
+    path = min(valid, key=lambda item: item[1])[0]
+    return [dict(candidate, frame=sample['frame']) for candidate, sample in zip(path, samples)]
+
+
 def rising_toss(history, frames, serve_height, current_frame):
     """Find a measured rising segment, ignoring later racket/body fragments."""
     if len(history) < 4 or len(frames) != len(history):
@@ -33,18 +73,28 @@ def rising_toss(history, frames, serve_height, current_frame):
     return min(candidates, key=lambda item: item['apex_pos'][1]) if candidates else None
 
 
-def outgoing_flight(history, frames):
+def outgoing_flight(history, frames, allow_diagonal=False):
     """Require three consecutive fast netward steps, rather than a falling toss."""
     if len(history) < 4 or len(frames) != len(history):
         return False
+    steps = []
     for index in range(len(history) - 3, len(history)):
         dx = history[index][0] - history[index - 1][0]
         dy = history[index][1] - history[index - 1][1]
         if frames[index] - frames[index - 1] != 1:
             return False
-        if dy < 18 or not 20 <= math.hypot(dx, dy) <= 90:
-            return False
-    return True
+        steps.append((dx, dy))
+    if all(dy >= 18 and 20 <= math.hypot(dx, dy) <= 90 for dx, dy in steps):
+        return True
+    if not allow_diagonal:
+        return False
+    # A diagonal serve can have less vertical motion than the old threshold.
+    # Require a sustained lateral departure as well as netward acceleration,
+    # so an ordinary nearly vertical falling toss remains ineligible.
+    lateral = sum(dx for dx, _ in steps)
+    return (all(dy >= 10 and 18 <= math.hypot(dx, dy) <= 90 for dx, dy in steps)
+            and all(dx * lateral > 0 for dx, _ in steps)
+            and abs(lateral) >= max(35, sum(dy for _, dy in steps) * .4))
 
 
 def top_reentry_limit(history, frames, serve_height, current_frame):

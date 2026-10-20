@@ -141,6 +141,23 @@ def near_service_box(frame, net_y):
             a = float(dx) / dy
             central.append({'a': a, 'b': (x1 - a * y1) / scale,
                             'length': abs(dy) / scale})
+    if not horizontal:
+        # Shadows can split the same service stripe into shorter segments.
+        # Join only collinear pieces spanning a substantial part of the court.
+        fragments = []
+        for x1, y1, x2, y2 in lines[:, 0, :]:
+            dx, dy = float(x2-x1), float(y2-y1)
+            if abs(dx) >= 60 and abs(dy) <= abs(dx)*.08:
+                slope = dy/dx
+                fragments.append((slope, y1+slope*(480-x1), (x1,y1), (x2,y2)))
+        for slope, middle, _, _ in fragments:
+            group = [item for item in fragments
+                     if abs(item[0]-slope) <= .025 and abs(item[1]-middle) <= 5]
+            points = np.asarray([point for item in group for point in item[2:]])
+            if len(group) >= 2 and np.ptp(points[:,0]) >= 180:
+                a, b = np.polyfit(points[:,0], points[:,1], 1)
+                horizontal.append({'a':float(a), 'b':float(b/scale),
+                                   'length':float(np.ptp(points[:,0])/scale)})
     if not horizontal or not central:
         return None
     service = max(horizontal, key=lambda line: line['length'])
@@ -148,3 +165,37 @@ def near_service_box(frame, net_y):
     return {'net_y': float(net_y), 'service_line': service,
             'center_line': center, 'service_margin': max(8, width * .003),
             'net_margin': max(24, width * .008)}
+
+
+def local_sideline_x(frame, y, predicted_x, side):
+    """Read nearby sideline paint instead of extrapolating a distant segment."""
+    h,w = frame.shape[:2]
+    rx,ry = max(70,int(w*.025)),max(80,int(h*.06))
+    x1,x2=max(0,int(predicted_x)-rx),min(w,int(predicted_x)+rx+1)
+    y1,y2=max(0,int(y)-ry),min(h,int(y)+ry+1)
+    if x2<=x1 or y2<=y1:
+        return None
+    hsv=cv2.cvtColor(frame[y1:y2,x1:x2],cv2.COLOR_BGR2HSV)
+    mask=cv2.inRange(hsv,np.array([0,0,180]),np.array([179,95,255]))
+    lines=cv2.HoughLinesP(mask,1,np.pi/180,threshold=30,
+        minLineLength=max(45,int(h*.025)),maxLineGap=10)
+    if lines is None:
+        return None
+    candidates=[]
+    for xa,ya,xb,yb in lines[:,0,:]:
+        dy=float(yb-ya)
+        if abs(dy)<40:
+            continue
+        slope=float(xb-xa)/dy
+        if not (.3<=abs(slope)<=1.5 and (slope<0)==(side=='left')):
+            continue
+        if not min(ya,yb)+y1-15<=y<=max(ya,yb)+y1+15:
+            continue
+        value=xa+x1+slope*(y-ya-y1)
+        if abs(value-predicted_x)<=rx:
+            candidates.append(value)
+    if not candidates:
+        return None
+    # When both singles and doubles paint are visible, the inner stripe is
+    # the singles boundary. Restricting the search keeps other courts out.
+    return float(max(candidates) if side=='left' else min(candidates))

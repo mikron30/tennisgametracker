@@ -223,6 +223,19 @@ def test_net_error_after_receiver_return_is_not_a_serve_let():
     assert _serve_net_touch_evidence(state,[]) is None
 
 
+def test_proximity_hint_cannot_become_retrospective_let_evidence():
+    from retro_let_scoring import _serve_net_touch_evidence
+    state = _State()
+    state.point_start_frame_internal = 100
+    state.frame_count = 150
+    state._serve_net_contact_frame = 120
+    state._serve_net_contact_point = (1900,480)
+    state._serve_net_contact_provisional = True
+    assert _serve_net_touch_evidence(state,[]) is None
+    state._serve_net_contact_provisional = False
+    assert _serve_net_touch_evidence(state,[])['frame'] == 120
+
+
 def test_same_side_replay_without_net_touch_cannot_remove_game_point():
     from retro_let_scoring import _evaluate_pending
     state = _State()

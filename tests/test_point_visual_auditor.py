@@ -1,9 +1,34 @@
 import unittest
+import csv
+import tempfile
+from pathlib import Path
+from unittest.mock import patch
 
 from point_visual_auditor import PointVisualAuditAgent, parse_point
 
 
 class PointVisualAuditorTests(unittest.TestCase):
+    def test_game_one_history_is_included_by_default_and_explicit_filter_skips_cleanly(self):
+        with tempfile.TemporaryDirectory() as directory:
+            history = Path(directory) / 'history.csv'
+            with history.open('w', newline='', encoding='utf-8') as handle:
+                writer = csv.DictWriter(handle, fieldnames=[
+                    'current_score', 'point_index', 'serve_start_frame', 'point_end_frame'])
+                writer.writeheader()
+                writer.writerow(dict(current_score='0:0 15:0', point_index=1,
+                                     serve_start_frame=100, point_end_frame=150))
+            agent = PointVisualAuditAgent('video.mp4', history,
+                output_dir=Path(directory) / 'audit', provider='local')
+            self.assertEqual(len(agent._read_rows()), 1)
+            agent.from_game = 2
+            with patch.object(agent, '_decode_frames') as decode:
+                summary = agent.run()
+            decode.assert_not_called()
+            self.assertTrue(summary['skipped'])
+            self.assertEqual(summary['points_checked'], 0)
+            self.assertEqual(summary['needs_review'], 0)
+            self.assertIn('from_game=2', summary['reason'])
+
     def setUp(self):
         self.agent = PointVisualAuditAgent("video.mp4", "history.csv", provider="local")
         self.agent.frame_height = 1080

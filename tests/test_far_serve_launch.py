@@ -31,6 +31,15 @@ def test_outgoing_flight_requires_consecutive_fast_steps():
                                [1, 2, 3, 4])
 
 
+def test_diagonal_departure_with_less_vertical_speed_is_a_strike():
+    assert outgoing_flight([(1900, 120), (1920, 133), (1942, 150), (1965, 172)],
+                           [1, 2, 3, 4], allow_diagonal=True)
+    assert not outgoing_flight([(1900, 120), (1920, 133), (1900, 150), (1923, 172)],
+                               [1, 2, 3, 4], allow_diagonal=True)
+    assert not outgoing_flight([(1900, 120), (1920, 133), (1942, 150), (1965, 172)],
+                               [1, 2, 3, 4])
+
+
 def test_top_exit_wait_accepts_only_top_strip_until_reentry():
     points = [(2000, 114), (2000, 90), (2000, 65), (1998, 29)]
     frames = [10, 11, 12, 13]
@@ -69,3 +78,38 @@ def test_diagonal_outgoing_serve_validates_original_toss_alignment():
     assert flight_stance_anchor((2100,30), points, frames,145,110) == (2100,30)
     assert flight_stance_anchor((1600,210), points, frames,145,110) == (1600,210)
     assert flight_stance_anchor((1870,210), points, frames,145,160) == (1870,210)
+
+
+def test_outgoing_candidates_keep_diagonal_ball_over_slow_shirt_fragment():
+    from far_serve_launch import outgoing_candidate_path
+    samples = []
+    for i, pos in enumerate([(250, 100), (228, 110), (207, 125), (185, 140)]):
+        samples.append(dict(frame=100+i, candidates=[
+            dict(pos=(290-i, 170+i), area=18, player_zone='player_body'),
+            dict(pos=pos, area=24, player_zone=None)]))
+    path = outgoing_candidate_path(samples)
+    assert [c['pos'] for c in path] == [(250, 100), (228, 110), (207, 125), (185, 140)]
+    samples[-1]['frame'] += 1
+    assert outgoing_candidate_path(samples) is None
+
+
+def test_outgoing_candidates_reject_player_motion_jumps_and_slow_falling_toss():
+    from far_serve_launch import outgoing_candidate_path
+    def samples(points, zone=None):
+        return [dict(frame=20+i, candidates=[dict(pos=p, area=24, player_zone=zone)])
+                for i, p in enumerate(points)]
+    flight = [(250, 100), (228, 110), (207, 125), (185, 140)]
+    assert outgoing_candidate_path(samples(flight, 'player_body')) is None
+    assert outgoing_candidate_path(samples([(250,100),(248,110),(247,125),(245,140)])) is None
+    assert outgoing_candidate_path(samples([(250,100),(228,110),(280,150),(185,170)])) is None
+    assert outgoing_candidate_path(samples(flight)[:3]) is None
+    interrupted = samples(flight)
+    interrupted[1]['candidates'] = []
+    assert outgoing_candidate_path(interrupted) is None
+
+def test_outgoing_path_must_start_near_the_verified_toss():
+    from far_serve_launch import outgoing_candidate_path
+    samples = [dict(frame=20+i, candidates=[dict(pos=p, area=24, player_zone=None)])
+        for i, p in enumerate([(250,100),(228,110),(207,125),(185,140)])]
+    assert outgoing_candidate_path(samples, origin=(260,120)) is not None
+    assert outgoing_candidate_path(samples, origin=(600,120)) is None

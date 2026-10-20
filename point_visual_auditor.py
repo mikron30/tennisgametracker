@@ -829,7 +829,13 @@ ul {{ margin: 6px 0 0; padding-left: 20px; }}
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.images_dir.mkdir(parents=True, exist_ok=True)
         if not rows:
-            raise RuntimeError("No point-history rows matched the requested frame/point filters")
+            reason = ("No completed point-history rows match the audit filters "
+                      f"(from_game={self.from_game}, from_frame={self.from_frame}, "
+                      f"to_frame={self.to_frame}, points={sorted(self.point_indices or [])})")
+            print(f"[POINT_AUDIT_SKIPPED] {reason}")
+            return {"provider": "not_run", "points_checked": 0, "needs_review": 0,
+                    "verdict_counts": {}, "decoded_frames": 0, "skipped": True,
+                    "reason": reason}
 
         required_frames = []
         for row in rows:

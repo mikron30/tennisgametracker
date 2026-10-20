@@ -552,3 +552,16 @@ class PlayerRacketTrackerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_expected_server_end_cannot_fall_back_to_receiver():
+    tracker=PlayerRacketTracker(frame_shape=(2160,3840,3),net_y=492,learning_enabled=False)
+    tracker.tracks['near']=PlayerTrack('near',bbox=(1800,900,400,700),center=(2000,1250),visible=True,confidence=.9)
+    tracker.last_detections=[{'bbox':(1800,900,400,700),'score':.9}]
+    result=tracker.serve_context((2000,100),player_name='P1',expected_side='far')
+    assert result['player_side'] is None
+    assert result['player_position'] is None
+    tracker.tracks['far']=PlayerTrack('far',bbox=(1900,160,160,140),center=(1980,230),visible=True,confidence=.9)
+    result=tracker.serve_context((2000,100),player_name='P1',expected_side='far')
+    assert result['player_side']=='far'
+    assert result['player_position']==[1980,230]

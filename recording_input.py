@@ -6,6 +6,18 @@ DEFAULT_VIDEO_DIR = Path(r"C:\Users\Roy\Documents\carmeltennis\downloaded_tennis
 DEFAULT_RECORDING = "court_1_2026-10-03_1100-1200.mp4"
 
 
+def latest_recording(directory):
+    """Select the newest direct MP4 child by last-modified time."""
+    folder = Path(directory).expanduser()
+    if not folder.is_dir():
+        raise ValueError(f"Recording directory does not exist: {folder}")
+    recordings = [path for path in folder.iterdir()
+                  if path.is_file() and path.suffix.lower() == ".mp4"]
+    if not recordings:
+        raise ValueError(f"No MP4 recordings found in: {folder}")
+    return str(max(recordings, key=lambda path: (path.stat().st_mtime_ns, path.name)).resolve())
+
+
 def resolve_recording(directory, filename):
     path = Path(filename).expanduser()
     if not path.is_absolute():

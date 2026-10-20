@@ -185,3 +185,43 @@ def test_ai_miss_preserves_normal_loss_clock_and_rejects_bad_new_anchor():
     assert analyzer.stuck_frame_count == 5
     assert analyzer._normal_fallback_after_ai_miss((50,50), (500,500), before, dict(stuck_frame_count=0)) == (50,50)
     assert analyzer.stuck_frame_count == 2
+
+
+@pytest.mark.parametrize("variant", ["current", "stale", "other_position", "other_previous", "held"])
+def test_measured_causal_observation_only_protects_current_exact_step(variant):
+    analyzer = InteractiveBallAnalyzer.__new__(InteractiveBallAnalyzer)
+    analyzer.frame_count = 100
+    analyzer.ball_size = 10
+    analyzer.stuck_frame_count = int(variant == "held")
+    analyzer._configured_causal_evidence = dict(
+        frame=99 if variant == "stale" else 100,
+        pos=(61, 50) if variant == "other_position" else (60, 50),
+        previous=(49, 50) if variant == "other_previous" else (50, 50))
+    # A size collapse ordinarily requires model confirmation. Only the exact
+    # measured step may bypass that fallback; stale evidence cannot do so.
+    assert analyzer._normal_ball_evidence_is_strong(
+        np.zeros((100, 100, 3), np.uint8), (50, 50), (60, 50),
+        {"ball_size": 100}) == (variant == "current")
+
+
+@pytest.mark.parametrize('case,expected', [('measured',True),('stale',False),('fragment',False),
+    ('jump',False),('static',False),('head',False),('lost',False)])
+def test_coherent_configured_serve_crossing_racket_needs_no_ai(case,expected):
+    import cv2
+    obj=InteractiveBallAnalyzer.__new__(InteractiveBallAnalyzer)
+    obj.frame_count=1001
+    obj.point_start_frame_internal=980 if case=='stale' else 1000
+    obj._active_serve_area_end='far'
+    obj.tracking_hsv_ranges=[{}]
+    obj.stuck_frame_count=int(case=='lost')
+    obj.ball_size=4 if case=='fragment' else 16.5
+    obj._player_point_zone=lambda p:'player_head_hat' if case=='head' else 'racket_fragment'
+    previous=(106,58)
+    current=(20,160) if case=='jump' else (80,92)
+    image=np.zeros((200,200,3),np.uint8)
+    cv2.circle(image,current,3,(20,240,240),-1)
+    obj._terminal_previous_gray=(cv2.cvtColor(image,cv2.COLOR_BGR2GRAY) if case=='static'
+        else np.zeros((200,200),np.uint8))
+    snapshot=dict(ball_size=26,stuck_frame_count=0,ball_velocity_history=[37.6],
+        last_motion={'dx':-23,'dy':30,'distance':37.6})
+    assert obj._normal_ball_evidence_is_strong(image,previous,current,snapshot) is expected

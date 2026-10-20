@@ -202,9 +202,10 @@ class ServeCheck:
 
 
 class ServeSideConsistencyGuard:
-    def __init__(self, min_cluster_separation_px: float = 160.0, min_confidence: float = 0.25):
+    def __init__(self, min_cluster_separation_px: float = 160.0, min_confidence: float = 0.25, far_cluster_separation_px: float = 80.0):
         self.min_cluster_separation_px = float(min_cluster_separation_px)
         self.min_confidence = float(min_confidence)
+        self.far_cluster_separation_px = float(far_cluster_separation_px)
 
     @staticmethod
     def _row_observation(row: dict) -> Tuple[Optional[Point], str]:
@@ -260,13 +261,24 @@ class ServeSideConsistencyGuard:
             if centers is None:
                 continue
             low, high = centers
-            if high - low >= self.min_cluster_separation_px:
+            required_separation = self.far_cluster_separation_px if key[1] == 'far' else self.min_cluster_separation_px
+            if high - low >= required_separation:
                 models[key] = (low, high, (low + high) / 2.0)
+
+        # Court halves share the same image geometry for either player. A
+        # newly serving player can use a model already established on that end.
+        shared_models = {}
+        for physical in ('near', 'far'):
+            xs = [x for (server, end), values in groups.items() if end == physical for x in values]
+            centers = _kmeans_1d(xs)
+            required = self.far_cluster_separation_px if physical == 'far' else self.min_cluster_separation_px
+            if centers is not None and centers[1] - centers[0] >= required:
+                shared_models[physical] = (*centers, sum(centers) / 2)
 
         for row in enriched:
             server = _norm(row.get("server"))
             physical = _norm(row.get("serve_player_side"))
-            model = models.get((server, physical))
+            model = models.get((server, physical)) or shared_models.get(physical)
             obs, conf = self._classify_position(row["_serve_pos"], physical, model)
             row["_observed"] = obs
             row["_confidence"] = conf
@@ -550,7 +562,8 @@ def print_report(checks: Sequence[ServeCheck], only_problems: bool = False) -> i
         f"let_replay_mismatches={let_replay_mismatches} "
         f"tracker_lets={lets} inferred_let_replays={inferred_lets} "
         f"missed_let_candidates={missed_lets} "
-        f"low_confidence={low_confidence} unknown={unknown}"
+        f"low_confidence={low_confidence} unknown={unknown} "
+        f"classified={len(checks)-unknown} audit_complete={'no' if unknown or low_confidence else 'yes'}"
     )
     return problem_serves
 

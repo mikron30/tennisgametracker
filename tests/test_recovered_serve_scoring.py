@@ -573,3 +573,196 @@ def test_verified_receiver_second_bounce_keeps_physical_endpoint(analyzer):
     rows = list(csv.DictReader(open(analyzer.point_history_file, encoding='utf-8-sig')))
     assert rows[-1]['point_end_frame'] == '99'
     assert rows[-1]['end_position'] == '(50,70)'
+
+
+@pytest.mark.parametrize('provisional', [True, False])
+def test_service_landing_requires_confirmed_touch_for_let(analyzer, provisional):
+    start(analyzer,10)
+    analyzer.frame_count = 30
+    analyzer._serve_net_contact_provisional = provisional
+    analyzer._serve_net_touch_active = lambda **kwargs: True
+    analyzer._night_serve_net_bounce_wrong_side_reason = lambda *args: None
+    analyzer._classify_ground_bounce = lambda *args, **kwargs: (True,'IN',(255,0,0))
+    analyzer._record_serve_in = MagicMock()
+    analyzer._handle_ground_bounce_event((1800,350),np.zeros((2160,3840,3),np.uint8))
+    assert (analyzer._pending_rally_end_reason == 'Serve let') is (not provisional)
+    assert analyzer._record_serve_in.call_count == int(provisional)
+
+
+@pytest.mark.parametrize("server", [0, 1])
+@pytest.mark.parametrize("reason", ["Ball bounced out of court (right sideline)", "Ball bounced twice on court"])
+def test_unreturned_in_serve_wins_even_when_second_bounce_is_outside(analyzer, server, reason):
+    start(analyzer, 100)
+    analyzer.frame_count = 130
+    analyzer._current_server_index = lambda: server
+    analyzer._serve_landed_in_current_attempt = True
+    analyzer._last_serve_bounce_was_in = True
+    analyzer._last_serve_bounce_frame = 119
+    analyzer._point_contact_info = lambda **k: (False, None, None, None)
+    analyzer._recent_contact_info = lambda **k: (False, None, None, None)
+    analyzer._player_index_at_point = lambda *args: server
+    outcome = analyzer._infer_point_outcome(reason, (3000, 1200))
+    assert outcome['winner_idx'] == server
+    assert outcome['category'] == 'unreturned'
+
+
+@pytest.mark.parametrize("missing", ["serve_in", "confirmed_bounce", "later_bounce", "untouched"])
+def test_unreturned_serve_award_requires_prior_confirmed_in_and_no_return(analyzer, missing):
+    start(analyzer, 100)
+    analyzer.frame_count = 130
+    analyzer._current_server_index = lambda: 0
+    analyzer._serve_landed_in_current_attempt = missing != "serve_in"
+    analyzer._last_serve_bounce_was_in = missing != "confirmed_bounce"
+    analyzer._last_serve_bounce_frame = 129 if missing == "later_bounce" else 119
+    analyzer._point_contact_info = lambda **k: (missing == "untouched", 0, 125, None)
+    analyzer._recent_contact_info = lambda **k: (False, None, None, None)
+    analyzer._player_index_at_point = lambda *args: 0
+    analyzer._is_lower_right_exit_score_context = lambda *args: False
+    outcome = analyzer._infer_point_outcome("Ball bounced out of court (right sideline)", (3000, 1200))
+    assert outcome['winner_idx'] == 1
+    assert outcome['category'] == 'out_error'
+
+
+def test_measured_boundary_rebound_keeps_physical_landing_in_history(analyzer):
+    start(analyzer, 10)
+    analyzer.frame_count = 100
+    analyzer._serve_phase_active = analyzer._awaiting_serve_bounce = False
+    reason = 'Ball bounce outside singles court (left sideline)'
+    analyzer._causal_boundary_terminal = dict(confirmed_frame=100, frame=99,
+        position=(50,70), point_start=10, reason=reason)
+    analyzer._terminal_player_overlap_position = MagicMock(
+        side_effect=AssertionError('Measured bounce cannot be replaced with a player blob'))
+    analyzer._record_point_result(reason, end_position=(48,60))
+    analyzer._terminal_player_overlap_position.assert_not_called()
+    rows = list(csv.DictReader(open(analyzer.point_history_file, encoding='utf-8-sig')))
+    assert rows[-1]['point_end_frame'] == '99'
+    assert rows[-1]['end_position'] == '(50,70)'
+
+
+@pytest.mark.parametrize('outside', [True, False])
+@pytest.mark.parametrize('offset', [0, 10000])
+def test_measured_boundary_check_precedes_predicted_bounce_context(analyzer, outside, offset):
+    analyzer.frame_count = 250 + offset
+    analyzer.point_start_frame_internal = 100 + offset
+    analyzer.ball_center = (100, 100)
+    analyzer.ball_size = 24
+    analyzer.last_motion = {'dx': -5, 'dy': 5, 'distance': 7.1, 'direction_deg': 135}
+    analyzer._get_ground_bounce_context = lambda *a, **k: {'origin': (100,100)}
+    analyzer._serve_bounce_context_live = lambda: False
+    analyzer._player_point_zone = lambda p: None
+    analyzer._last_racket_contact_frame = 200 + offset
+    reason = 'Ball bounce outside singles court (left sideline)'
+    analyzer._confirmed_boundary_reversal_out_candidate = MagicMock(return_value=(outside, reason if outside else None))
+    analyzer._register_ground_bounce_from_context = MagicMock()
+    candidate = dict(pos=(98,83), area=17, hsv=np.array([30,100,200],np.uint8),
+        motion_mean=12, motion_max=80)
+    analyzer._commit_local_ball_flight(candidate, np.zeros((240,320,3),np.uint8))
+    analyzer._confirmed_boundary_reversal_out_candidate.assert_called_once()
+    if outside:
+        analyzer._register_ground_bounce_from_context.assert_not_called()
+        assert analyzer._pending_rally_end_reason == reason
+        assert analyzer._causal_boundary_terminal['position'] == (100,100)
+        assert analyzer._causal_boundary_terminal['frame'] == 249 + offset
+    else:
+        analyzer._register_ground_bounce_from_context.assert_called_once()
+        assert analyzer._pending_rally_end_reason is None
+
+
+@pytest.mark.parametrize('paint',[True,False])
+def test_measured_rebound_can_use_local_paint_when_cached_line_misses_curvature(analyzer,paint):
+    analyzer.frame_count=150
+    analyzer.point_start_frame_internal=100
+    analyzer.far_serve_image_baseline=True
+    analyzer._serve_phase_active=analyzer._awaiting_serve_bounce=False
+    analyzer._last_direction_change_frame=150
+    analyzer._last_direction_change_vertical_reversal=True
+    analyzer._last_direction_change_point=(494,359)
+    analyzer.ball_size=16
+    analyzer.prev_motion={'dx':-5,'dy':5,'distance':7.1}
+    analyzer.last_motion={'dx':-2,'dy':-17,'distance':17.1}
+    analyzer._last_racket_contact_frame=125
+    analyzer._point_outside_singles_court=lambda *a:(False,None,500,2500,None,None)
+    analyzer._point_outside_singles_sidelines=lambda *a:(False,None,500,2500)
+    frame=np.zeros((2160,3840,3),np.uint8)
+    if paint:
+        import cv2
+        cv2.line(frame,(600,250),(390,550),(255,255,255),5)
+    ended,reason=analyzer._confirmed_boundary_reversal_out_candidate((492,342),frame)
+    assert ended is paint
+    if paint:
+        assert reason=='Ball bounce outside singles court (left sideline)'
+
+
+def test_serve_history_keeps_initial_server_while_receiver_refreshes(analyzer):
+    analyzer.player_tracker=object()
+    initial={'player_side':'far','player_position':[1900,220], 'server_source':'verified_serve_stance',
+        'serve_x':1850,'serve_y':120,'receiver_position':[2200,1400]}
+    analyzer._point_history_current={'serve_context':initial.copy()}
+    analyzer._player_serve_context=lambda p: {'player_side':'near','player_position':[2000,1000],
+        'server_source':'serve_detection_below_ball','receiver_position':[1950,250]}
+    analyzer._refresh_player_serve_context()
+    result=analyzer._point_history_current['serve_context']
+    assert result['player_side']=='far'
+    assert result['player_position']==[1900,220]
+    assert result['server_source']=='verified_serve_stance'
+    assert result['receiver_position']==[1950,250]
+
+
+@pytest.mark.parametrize('side,age,stuck,gap,scale', [
+    ('far',3,1,2,2),('far',12,5,10,3),('near',3,1,2,1),
+    ('far',20,1,2,1),('far',3,0,2,1)])
+def test_missed_serve_handoff_projects_only_bounded_recent_far_flight(analyzer,monkeypatch,side,age,stuck,gap,scale):
+    analyzer.frame_count=200
+    analyzer.point_start_frame_internal=200-age
+    analyzer._active_serve_area_end=side
+    analyzer.ball_center=(100,100)
+    analyzer.ball_size=24
+    analyzer.last_motion={'dx':2,'dy':20,'distance':20.1}
+    analyzer.stuck_frame_count=stuck
+    analyzer.motion_history=[{'frame':200-gap,'pos':(100,100)}]
+    analyzer._player_point_zone=lambda point: 'player_body'
+    analyzer.tracking_hsv_ranges=[dict(h_min=20,h_max=110,s_min=5,s_max=100,v_min=150,v_max=255)]
+    seen=[]
+    def search(frame,previous,position,motion,area,filters,**kwargs):
+        seen.append(motion)
+    monkeypatch.setattr('causal_ball_recovery.find_local_ball',search)
+    assert analyzer._recover_local_ball_flight(np.zeros((600,800,3),np.uint8)) is None
+    assert seen[0]['dx']==2*scale
+    assert seen[0]['dy']==20*scale
+
+
+@pytest.mark.parametrize('case,expected', [('contact_step',True),('gap',False),('no_incoming',False),('player',False)])
+def test_boundary_rebound_accepts_slow_contact_step_only_after_measured_arrival(analyzer,case,expected):
+    analyzer.frame_count=150
+    analyzer.point_start_frame_internal=100
+    analyzer._serve_phase_active=analyzer._awaiting_serve_bounce=False
+    analyzer._last_direction_change_frame=150
+    analyzer._last_direction_change_vertical_reversal=True
+    analyzer._last_direction_change_point=(600,353)
+    analyzer._last_racket_contact_frame=100
+    analyzer.ball_size=22
+    analyzer.prev_motion={'dx':0,'dy':3,'distance':3}
+    analyzer.last_motion={'dx':0,'dy':-23,'distance':23}
+    analyzer.motion_history=[{'frame':147 if case=='gap' else 148,'pos':(600,350),
+        'prev_pos':(600,355 if case=='no_incoming' else 325),'distance':25}]
+    analyzer._player_point_zone=lambda p:'player_body' if case=='player' else None
+    analyzer._point_outside_singles_court=lambda *a:(True,'right sideline',100,500,None,None)
+    analyzer._classify_ground_bounce=lambda *a:(False,'Ball bounce outside singles court (right sideline)',None)
+    result,_=analyzer._confirmed_boundary_reversal_out_candidate((600,330),np.zeros((1000,1200,3),np.uint8))
+    assert result is expected
+
+def test_measured_mesh_collision_assigns_net_error_to_verified_hitter():
+    obj=InteractiveBallAnalyzer.__new__(InteractiveBallAnalyzer)
+    obj.frame_count=150
+    obj.point_start_frame_internal=100
+    obj.ball_center=(230,160)
+    obj._current_server_index=lambda:1
+    obj._recent_contact_info=lambda **kw:(True,0,130,(100,500))
+    obj._point_contact_info=lambda **kw:(True,0,130,(100,500))
+    # The projected landing is closer to the far player. Contact ownership
+    # must still decide who hit the net when a collision was measured.
+    obj._player_index_at_point=lambda *a:1
+    obj._causal_boundary_terminal=dict(point_start=100,confirmed_frame=150,reason='Ball hit the net')
+    result=obj._infer_point_outcome('Ball hit the net')
+    assert result['winner_idx']==1 and result['category']=='net_error'
+    assert result['loser_idx']==0

@@ -78,3 +78,35 @@ def test_audit_file_accepts_analyzer_string_history_path(tmp_path):
     )
 
     assert audit_file(str(history), only_problems=True) == 0
+
+
+def test_far_camera_service_sides_can_be_closer_than_near_threshold():
+    rows=[_row('0:0 15:0',1,1900),_row('0:0 15:15',2,2020),
+          _row('0:0 30:15',3,1905),_row('0:0 30:30',4,2025)]
+    for r in rows:
+        r['serve_player_side']='far'
+    checks=ServeSideConsistencyGuard().audit_rows(rows)
+    assert [c.observed for c in checks]==['right','left','right','left']
+    assert all(c.status=='OK' for c in checks)
+    for r in rows:
+        r['serve_player_side']='near'
+    assert all(c.status=='UNKNOWN' for c in ServeSideConsistencyGuard().audit_rows(rows))
+
+
+def test_incomplete_side_audit_is_not_reported_as_complete(capsys):
+    from serve_side_consistency import print_report
+    checks=ServeSideConsistencyGuard().audit_rows([_row('0:0 0:0',1,1900)])
+    print_report(checks,only_problems=True)
+    output=capsys.readouterr().out
+    assert 'unknown=1' in output
+    assert 'classified=0 audit_complete=no' in output
+
+
+def test_new_server_can_share_existing_physical_court_model():
+    rows=[_row('0:0 15:0',1,1900),_row('0:0 15:15',2,2020),
+        _row('0:0 30:15',3,1905),_row('0:0 30:30',4,2025),
+        _row('1:0 15:0',5,1900)]
+    for r in rows:
+        r['serve_player_side']='far'
+    rows[-1]['server']='P2'
+    assert ServeSideConsistencyGuard().audit_rows(rows)[-1].observed=='right'

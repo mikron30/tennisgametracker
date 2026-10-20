@@ -267,6 +267,8 @@ def _let_window_open(obj, rally_shots, server_idx, events=None):
 
 def _serve_net_touch_evidence(obj, events):
     """A replayed service side cannot substitute for a measured serve net touch."""
+    if getattr(obj, '_serve_net_contact_provisional', False):
+        return None
     start = _safe_int(getattr(obj, 'point_start_frame_internal', None), -1)
     contact = _safe_int(getattr(obj, '_serve_net_contact_frame', None), -1)
     position = getattr(obj, '_serve_net_contact_point', None)

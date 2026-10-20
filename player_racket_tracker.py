@@ -579,13 +579,15 @@ class PlayerRacketTracker:
                 self.save_profile()
         return event
 
-    def _server_track_for_ball(self, point: Optional[Point]) -> Optional[PlayerTrack]:
+    def _server_track_for_ball(self, point: Optional[Point], expected_side=None) -> Optional[PlayerTrack]:
         """Choose the server whose body is below the serve-ball position."""
         if point is None:
             return None
         px, py = point
         choices = []
         for track in self.tracks.values():
+            if expected_side is not None and track.side != expected_side:
+                continue
             if track.bbox is None or track.center is None:
                 continue
             x, y, w, h = track.bbox
@@ -611,7 +613,7 @@ class PlayerRacketTracker:
             return None
         return min(choices, key=lambda item: item[0])[1]
 
-    def _server_detection_for_ball(self, point: Optional[Point]) -> Optional[Dict]:
+    def _server_detection_for_ball(self, point: Optional[Point], expected_side=None) -> Optional[Dict]:
         """Find a raw player box below the serve ball, before track assignment."""
         if point is None:
             return None
@@ -632,7 +634,7 @@ class PlayerRacketTracker:
             if horizontal_gap > max(180.0, w * 1.60):
                 continue
             side = self._side_for_box(box, self.frame_shape[0] if self.frame_shape else int(py * 2))
-            if side is None:
+            if side is None or (expected_side is not None and side != expected_side):
                 continue
             score = (
                 horizontal_gap / max(float(w), 1.0) +
@@ -750,9 +752,9 @@ class PlayerRacketTracker:
         vertical = "near" if self.net_y is not None and center[1] >= self.net_y else "far"
         return f"{horizontal}_{vertical}"
 
-    def serve_context(self, point: Optional[Point], player_name: str = "") -> Dict:
-        track = self._server_track_for_ball(point)
-        detection = self._server_detection_for_ball(point)
+    def serve_context(self, point: Optional[Point], player_name: str = "", expected_side=None) -> Dict:
+        track = self._server_track_for_ball(point, expected_side)
+        detection = self._server_detection_for_ball(point, expected_side)
         if detection is not None:
             # Raw geometry is more reliable during the serve than a stale
             # near/far track that may have followed an adjacent object.
