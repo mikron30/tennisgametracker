@@ -5,7 +5,7 @@ import cv2
 import numpy as np
 
 
-def changes_trajectory(path, incoming):
+def changes_trajectory(path, incoming, *, racket_contact=False):
     """Clearing a player's image is not itself evidence of a racket hit."""
     if len(path) < 2 or not incoming:
         return False
@@ -16,8 +16,11 @@ def changes_trajectory(path, incoming):
     dx=(path[-1]['pos'][0]-path[0]['pos'][0])/elapsed
     dy=(path[-1]['pos'][1]-path[0]['pos'][1])/elapsed
     before,after=math.hypot(mx,my),math.hypot(dx,dy)
+    lateral_racket_turn = bool(racket_contact and len(path)>=4 and
+        abs(mx)>=2 and abs(dx)>=5 and mx*dx<0 and
+        all(mx*(b['pos'][0]-a['pos'][0])<0 for a,b in zip(path,path[1:])))
     return bool(before >= 5 and after >= 5 and
-                (mx*dx+my*dy < before*after*math.cos(math.radians(50)) or
+                (mx*dx+my*dy < before*after*math.cos(math.radians(50)) or lateral_racket_turn or
                  after >= max(20,before*1.8)))
 
 

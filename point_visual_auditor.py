@@ -203,7 +203,16 @@ class PointVisualAuditAgent:
         largest_dimension = max(self.frame_width, self.frame_height, 1)
         self.frame_scale = min(1.0, float(self.max_cached_dimension) / float(largest_dimension))
         self.fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+        fourcc = int(cap.get(cv2.CAP_PROP_FOURCC) or 0)
+        codec = ''.join(chr((fourcc >> (8*index)) & 255) for index in range(4)).lower()
+        sequential_decode = codec in ('hevc', 'hvc1', 'hev1')
         cap.release()
+
+        if sequential_decode:
+            # Arbitrary HEVC seeks can return partially reconstructed grey
+            # frames while still reporting success. Preserve decoder reference
+            # pictures from the beginning and retrieve only requested images.
+            windows = [required]
 
         for window in windows:
             first_frame = window[0]
@@ -212,11 +221,17 @@ class PointVisualAuditAgent:
             cap = cv2.VideoCapture(str(self.video_path))
             if not cap.isOpened():
                 continue
-            cap.set(cv2.CAP_PROP_POS_FRAMES, first_frame)
-            frame_index = first_frame
+            # Tracker frame N is source image N-1: process_video increments
+            # its counter after reading. Keep dictionary keys in tracker units
+            # so image metrics and markers describe the same observation.
+            frame_index = 1 if sequential_decode else max(1, first_frame)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index-1)
             consecutive_failures = 0
-            while frame_index <= last_frame:
-                ok, frame = cap.read()
+            while frame_index <= max(1, last_frame):
+                wanted = frame_index in required_set or (frame_index == 1 and 0 in required_set)
+                ok = cap.grab()
+                if ok and wanted:
+                    ok, frame = cap.retrieve()
                 if not ok:
                     consecutive_failures += 1
                     if consecutive_failures >= 12:
@@ -224,7 +239,7 @@ class PointVisualAuditAgent:
                     frame_index += 1
                     continue
                 consecutive_failures = 0
-                if frame_index in required_set:
+                if wanted:
                     if self.frame_scale < 1.0:
                         frame = cv2.resize(
                             frame,
@@ -233,7 +248,10 @@ class PointVisualAuditAgent:
                             fy=self.frame_scale,
                             interpolation=cv2.INTER_AREA,
                         )
-                    self.frames[frame_index] = frame.copy()
+                    if frame_index in required_set:
+                        self.frames[frame_index] = frame.copy()
+                    if frame_index == 1 and 0 in required_set:
+                        self.frames[0] = frame.copy()
                 frame_index += 1
             cap.release()
 
@@ -470,6 +488,45 @@ class PointVisualAuditAgent:
         })
         return metrics
 
+    def _verified_serve_departure(self, row, start_point):
+        """Allow a small post-hit departure only with measured outgoing flight."""
+        side = row.get("serve_player_side")
+        if (row.get("serve_player_source") != "verified_serve_stance" or
+                side not in ("near", "far") or start_point is None):
+            return False
+        key = "far_serve_area_points" if side == "far" else "serve_area_points"
+        values = self.config.get(key)
+        if not isinstance(values, list) or len(values) < 3:
+            return False
+        distance = cv2.pointPolygonTest(np.asarray(values, dtype=np.float32),
+                                       tuple(map(float, start_point)), True)
+        if distance < -max(40.0, self.frame_height * .02):
+            return False
+        trace = self.tracking_traces.get(parse_int(row.get("point_index"), 0), {})
+        start = parse_int(row.get("serve_start_frame"), -1)
+        first = min((number for number in trace if start <= number <= start+4), default=start)
+        samples = [trace.get(first + offset) for offset in range(4)]
+        if any(sample is None or sample.get("stuck", 0) for sample in samples):
+            return False
+        direction = 1 if side == "far" else -1
+        initial = np.subtract(samples[0]['pos'], start_point)
+        if first == start:
+            if np.linalg.norm(initial) > 12:
+                return False
+        else:
+            # Serve confirmation can create the point context a few images
+            # after its recorded launch. Use the first actual observations;
+            # never synthesize the missing prefix into tracking evidence.
+            velocity = np.subtract(samples[-1]['pos'], samples[0]['pos']) / 3.
+            initial = initial / (first-start)
+            speed, launch_speed = np.linalg.norm(velocity), np.linalg.norm(initial)
+            if (launch_speed < max(3., speed*.15) or launch_speed > max(40., speed*1.8) or
+                    direction*initial[1] < 3 or
+                    np.dot(initial, velocity) < launch_speed*speed*.6):
+                return False
+        return all(direction * (b["pos"][1] - a["pos"][1]) >= 5
+                   for a, b in zip(samples, samples[1:]))
+
     def _local_review(self, row, start_metrics, end_metrics, handoff_metrics=None):
         flags = []
         start_point = parse_point(row.get("start_position"))
@@ -491,8 +548,19 @@ class PointVisualAuditAgent:
 
         serve_in_near = self._point_in_polygon(start_point, "serve_area_points")
         serve_in_far = self._point_in_polygon(start_point, "far_serve_area_points")
-        if serve_in_near is False and serve_in_far is False:
+        if (serve_in_near is False and serve_in_far is False and
+                not self._verified_serve_departure(row, start_point)):
             flags.append("reported start is outside both configured serve areas")
+
+        trace = self.tracking_traces.get(parse_int(row.get("point_index"), 0), {})
+        terminal_sample = trace.get(parse_int(row.get("point_end_frame"), -1))
+        if terminal_sample is not None and end_point is not None:
+            displacement = float(np.linalg.norm(np.subtract(terminal_sample["pos"], end_point)))
+            if displacement > max(85.0, self.frame_height * .05):
+                flags.append(f"reported end marker differs from tracked ball by {displacement:.0f}px; "
+                             "terminal position repair needs verification")
+        if str(row.get("category") or "").lower() == "tracking_uncertain":
+            flags.append("tracking uncertainty remains unresolved; score is provisional")
 
         # A serve that clips the net can legitimately end within a handful of
         # frames.  Short duration is useful as a review hint for unknown/rally

@@ -70,29 +70,43 @@ def far_baseline(frame):
     return {'a': a, 'b': b / scale, 'source': 'night image far baseline'}
 
 
-def far_service_box(frame, net_y):
+def far_service_box(frame, net_y, *, shadow=False):
     """Read the far service line without mistaking the net tape for it."""
     height, width = frame.shape[:2]
     scale = 960.0 / width
     small = cv2.resize(frame, (960, int(round(height * scale))))
     hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
-    white = cv2.inRange(hsv, np.array([0, 0, 160]), np.array([179, 90, 255]))
+    if shadow:
+        gray=cv2.cvtColor(small,cv2.COLOR_BGR2GRAY)
+        contrast=cv2.subtract(gray,cv2.medianBlur(gray,15))
+        white=((contrast>=12)&(hsv[:,:,1]<=90)&(hsv[:,:,2]>=100)).astype(np.uint8)*255
+    else:
+        white = cv2.inRange(hsv, np.array([0, 0, 160]), np.array([179, 90, 255]))
+    def missing():
+        # Read dim paint by local contrast in the same calibrated court band;
+        # never fall back to an unrelated horizontal net-tape line.
+        return None if shadow else far_service_box(frame,net_y,shadow=True)
     mask = white.copy()
     mask[:int(height*.14*scale)] = 0
     mask[int(height*.18*scale):] = 0
     mask[:, :int(960*.25)] = 0
     mask[:, int(960*.75):] = 0
-    lines = cv2.HoughLinesP(mask, 1, np.pi/180, 20, minLineLength=100, maxLineGap=12)
     horizontal = []
-    if lines is None:
-        return None
-    for x1, y1, x2, y2 in lines[:, 0, :]:
-        dx, dy = float(x2-x1), float(y2-y1)
-        if abs(dx) >= 120 and abs(dy) <= abs(dx)*.08:
-            a = dy/dx
-            horizontal.append({'a': a, 'b': (y1-a*x1)/scale, 'length': abs(dx)/scale})
+    for minimum in (100,60):
+        # Prefer the original long support. Under occlusion, a shorter clear
+        # stripe is sufficient only together with the centre marking below.
+        lines=cv2.HoughLinesP(mask,1,np.pi/180,20,minLineLength=minimum,maxLineGap=12)
+        if lines is not None:
+            for x1,y1,x2,y2 in lines[:,0,:]:
+                dx,dy=float(x2-x1),float(y2-y1)
+                if abs(dx)>=minimum and abs(dy)<=abs(dx)*.08:
+                    slope=dy/dx
+                    horizontal.append({'a':slope,'b':(y1-slope*x1)/scale,
+                                       'length':abs(dx)/scale})
+        if horizontal:
+            break
     if not horizontal:
-        return None
+        return missing()
     service = min(horizontal, key=lambda line: line['a']*(width*.5)+line['b'])
     service_y = service['a']*(width*.5)+service['b']
     points = []
@@ -103,12 +117,13 @@ def far_service_box(frame, net_y):
             x = left+xs[np.argmin(abs(left+xs-480))]
             points.append((y/scale, x/scale))
     if len(points) < 6:
-        return None
+        return missing()
     a, b = np.polyfit(*np.asarray(points).T, 1)
     if abs(a) > .15:
         a, b = 0.0, float(np.median(np.asarray(points)[:, 1]))
     return {'net_y': float(net_y), 'service_line': service,
             'center_line': {'a': float(a), 'b': float(b)},
+            'center_margin': max(4, width*.004),
             'service_margin': max(8, width*.003), 'net_margin': max(24, width*.008)}
 
 

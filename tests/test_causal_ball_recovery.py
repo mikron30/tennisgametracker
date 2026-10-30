@@ -6,6 +6,63 @@ import math
 from causal_ball_recovery import find_local_ball
 
 
+@pytest.mark.parametrize('invalid',[None,'disabled','tiny','pale','static','head'])
+def test_partial_serve_departure_needs_fresh_ball_colour_and_full_next_flight(invalid):
+    before=np.full((900,900,3),30,np.uint8)
+    after=before.copy()
+    cv2.circle(after,(334,480),5 if invalid=='tiny' else 8,
+               (220,230,235) if invalid=='pale' else (0,220,240),-1)
+    previous=cv2.cvtColor(after if invalid=='static' else before,cv2.COLOR_BGR2GRAY)
+    filters=[(np.array([15,0,130],np.uint8),np.array([100,255,255],np.uint8))]
+    candidate=find_local_ball(after,previous,(300,500),dict(dx=1,dy=60),480,filters,
+        maximum_speed=400,contact_window=True,flexible_contact=True,
+        serve_contact_search=invalid!='disabled',
+        player_zone=lambda p:'player_head_hat' if invalid=='head' else None)
+    if invalid is not None:
+        assert candidate is None
+        return
+    assert candidate and candidate['verified_contact_departure']
+    assert math.dist(candidate['pos'],(334,480))<=2
+    outgoing=before.copy();cv2.circle(outgoing,(415,355),10,(0,220,240),-1)
+    result=find_local_ball(outgoing,cv2.cvtColor(after,cv2.COLOR_BGR2GRAY),candidate['pos'],
+        dict(dx=34,dy=-20),candidate['area'],filters,maximum_speed=400,
+        outgoing_handoff=True,handoff_reference_speed=60)
+    assert result and math.dist(result['pos'],(415,355))<=2
+
+
+def test_partial_rally_strike_keeps_precontact_size_for_next_clear_departure():
+    before=np.full((900,900,3),30,np.uint8)
+    after=before.copy()
+    cv2.circle(after,(325,605),8,(0,240,240),-1)
+    kwargs=dict(maximum_speed=400,contact_window=True,flexible_contact=True,contact_radius_limit=300)
+    partial=find_local_ball(after,cv2.cvtColor(before,cv2.COLOR_BGR2GRAY),(300,600),
+        dict(dx=20,dy=60),420,FILTERS,partial_contact_search=True,**kwargs)
+    assert partial and partial['partial_return_contact'] and not partial['verified_contact_departure']
+    outgoing=before.copy()
+    cv2.circle(outgoing,(315,450),10,(0,240,240),-1)
+    result=find_local_ball(outgoing,cv2.cvtColor(after,cv2.COLOR_BGR2GRAY),partial['pos'],
+        dict(dx=20,dy=60),420,FILTERS,rising_contact=True,**kwargs)
+    assert result and math.dist(result['pos'],(315,450))<=2 and result['verified_contact_departure']
+
+
+@pytest.mark.parametrize('kind',['ball','slow_ball','disabled','body','static','side_jump','tiny'])
+def test_measured_perspective_rebound_retains_yellow_ball_in_approach_lane(kind):
+    before=np.full((900,900,3),30,np.uint8)
+    cv2.circle(before,(300,500),8,(0,240,240),-1)
+    after=np.full_like(before,30)
+    target=(390,515) if kind=='side_jump' else (320,513) if kind=='slow_ball' else (330,515)
+    cv2.circle(after,target,3 if kind=='tiny' else 8,(0,240,240),-1)
+    previous=cv2.cvtColor(after if kind=='static' else before,cv2.COLOR_BGR2GRAY)
+    found=find_local_ball(after,previous,(300,500),dict(dx=30,dy=120),180,FILTERS,
+        maximum_speed=400,contact_window=True,flexible_contact=True,contact_radius_limit=300,
+        perspective_rebound_search=kind!='disabled',player_zone=lambda p:'player_body' if kind=='body' else None)
+    if kind in ('ball','slow_ball'):
+        assert found is not None and math.dist(found['pos'],target)<=2
+        assert not found['verified_contact_departure']
+    else:
+        assert found is None
+
+
 def test_verified_contact_window_finds_outgoing_ball_over_tiny_racket_fragment():
     before = np.zeros((600, 1000, 3), np.uint8)
     after = before.copy()
@@ -320,3 +377,33 @@ def test_outgoing_handoff_rejects_backward_and_player_fragments():
     assert find_local_ball(*args,maximum_speed=400,outgoing_handoff=True,player_zone=zone) is None
     assert find_local_ball(after,args[1],args[2],{'dx':88,'dy':55},290,FILTERS,
                           maximum_speed=400,outgoing_handoff=True) is None
+
+
+@pytest.mark.parametrize('enabled,static',[(True,False),(False,False),(True,True)])
+def test_distant_serve_joins_only_fresh_small_paint_fragments(enabled,static):
+    before=np.full((120,120,3),30,np.uint8)
+    after=before.copy()
+    cv2.rectangle(after,(48,47),(50,48),(240,240,240),-1)
+    cv2.rectangle(after,(48,51),(50,52),(240,240,240),-1)
+    previous=cv2.cvtColor(after if static else before,cv2.COLOR_BGR2GRAY)
+    filters=[(np.array([0,0,140],np.uint8),np.array([179,45,255],np.uint8))]
+    result=find_local_ball(after,previous,(60,50),dict(dx=-7,dy=-1),8,filters,
+        minimum_speed=2,minimum_saturation=0,serve_rebound_search=enabled)
+    if enabled and not static:
+        assert result and math.dist(result['pos'],(49,49))<=2
+    else:
+        assert result is None
+
+
+@pytest.mark.parametrize('invalid',[None,'disabled','player','static','pale'])
+def test_fast_measured_return_keeps_a_short_clear_ground_rebound(invalid):
+    before=np.full((500,500,3),30,np.uint8)
+    after=before.copy()
+    cv2.circle(after,(270,270),11,(220,230,235) if invalid=='pale' else (0,220,240),-1)
+    filters=[(np.array([0,0,100],np.uint8),np.array([179,255,255],np.uint8))]
+    result=find_local_ball(after,cv2.cvtColor(after if invalid=='static' else before,cv2.COLOR_BGR2GRAY),
+        (250,300),dict(dx=6,dy=155),364,filters,maximum_speed=400,
+        perspective_rebound_search=invalid!='disabled',minimum_saturation=0,
+        player_zone=lambda p:'player_body' if invalid=='player' else None)
+    assert (result is not None)==(invalid is None)
+    if result:assert not result['verified_contact_departure']

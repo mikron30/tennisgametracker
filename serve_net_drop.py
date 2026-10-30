@@ -66,7 +66,8 @@ def net_drop_bounce(samples, polygon, contact, frame_height):
     points = [sample['pos'] for sample in samples]
     steps = [(b[0] - a[0], b[1] - a[1]) for a, b in zip(points, points[1:])]
     if not (all(dy >= 1 for _, dy in steps[:2]) and
-            all(dy <= -3 for _, dy in steps[2:]) and
+            all(dy <= -2 for _, dy in steps[2:]) and
+            points[2][1] - points[-1][1] >= 5 and
             points[2][1] - points[0][1] >= 10 and
             all(math.hypot(dx, dy) <= 35 for dx, dy in steps) and
             max(p[0] for p in points) - min(p[0] for p in points) <= 35):

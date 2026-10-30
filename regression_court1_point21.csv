@@ -1,0 +1,3 @@
+point_index,serve_start_frame,point_end_frame,server,serve_attempt,category,winner,point_awarded,current_score,next_server,next_serve,serve_player_side,receive_player_side
+21,43581,43618,P1,1st,first_serve_fault,,no,2:0 15:15,P1,2nd,near,far
+22,43741,43951,P1,2nd,out_error,P2,yes,2:0 15:30,P1,1st,near,far

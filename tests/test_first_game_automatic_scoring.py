@@ -62,6 +62,23 @@ def test_fault_sequence_then_rallies_complete_first_game(tracker,offset):
     assert rows[2]['category']=='double_fault'
 
 
+def test_relocated_service_landing_cannot_keep_let_classification(tracker):
+    tracker.far_serve_image_baseline = True
+    tracker.frame_count = 100
+    tracker.point_start_frame_internal = 100
+    tracker._start_point_context((1970, 141), serve_start_frame=100)
+    tracker.current_serve_attempt = 2
+    tracker.frame_count = 145
+    tracker._terminal_player_overlap_position = lambda *args, **kwargs: (3257, 1898)
+    tracker._record_point_result('Serve let', (1864, 499))
+    with open(tracker.point_history_file, newline='') as handle:
+        rows = list(csv.DictReader(handle))
+    assert rows[-1]['category'] == 'tracking_uncertain'
+    assert rows[-1]['point_awarded'] == 'no'
+    assert tracker._score_summary() == '0:0 0:0'
+    assert tracker.current_serve_attempt == 2
+
+
 def test_local_recovery_runs_in_tracking_before_alternate_search(tracker):
     frame=np.zeros((240,320,3),np.uint8)
     tracker.tracking=True
@@ -73,6 +90,24 @@ def test_local_recovery_runs_in_tracking_before_alternate_search(tracker):
     tracker._commit_local_ball_flight=lambda candidate,image:(calls.append(candidate) or candidate['pos'])
     assert tracker.track_ball_in_frame(frame)==(112,116)
     assert calls==[{'pos':(112,116)}]
+
+
+def test_confirmed_serve_net_drop_uses_local_search_before_hsv_highlights(tracker):
+    tracker.tracking = True
+    tracker.hsv_lower = np.array([20, 50, 130], np.uint8)
+    tracker.frame_count = 110
+    tracker.point_start_frame_internal = 100
+    tracker.ball_center = (400, 450)
+    tracker.tracking_hsv_ranges = [{'h_min': 20, 'h_max': 85}]
+    tracker._awaiting_serve_bounce = True
+    tracker._slow_serve_net_drop_active = lambda: True
+    tracker._recover_far_serve_occlusion = lambda frame: None
+    tracker._recover_extended_near_contact = lambda frame: None
+    tracker._recover_far_player_contact = lambda frame: None
+    tracker._recover_local_ball_flight = MagicMock(return_value={'pos': (399, 466)})
+    tracker._commit_local_ball_flight = lambda candidate, frame: candidate['pos']
+    assert tracker.track_ball_in_frame(np.zeros((800, 640, 3), np.uint8)) == (399, 466)
+    tracker._recover_local_ball_flight.assert_called_once()
 
 
 def test_expired_serve_flag_cannot_hide_far_baseline_bounce(tracker):
@@ -124,14 +159,19 @@ def test_normal_tracking_between_recoveries_preserves_measured_speed(tracker):
 
 
 @pytest.mark.parametrize('strong_motion',[False,True])
-def test_visible_lower_contact_flight_arms_far_exit_without_ai(tracker,strong_motion):
+@pytest.mark.parametrize('elapsed',[1,3])
+def test_visible_lower_contact_flight_arms_far_exit_without_ai(tracker,strong_motion,elapsed):
     tracker.frame_count=250
     tracker.ball_center=(1500,1500)
     tracker._player_reacq_protect_until_frame=300
     tracker._player_point_zone=lambda point:'player_body' if point==(1500,1500) else None
     tracker._last_racket_contact_frame=100
     tracker._last_racket_contact_player=1
+    tracker.max_ball_speed=400
+    tracker.motion_history=[dict(frame=250-elapsed,pos=(1500,1500))]
     candidate={'pos':(1600,350),'area':300,'hsv':np.array([30,180,210],np.uint8),
                'motion_mean':60 if strong_motion else 2,'motion_max':150 if strong_motion else 8}
     tracker._commit_night_visible_ball_recovery(candidate,np.zeros((2160,3840,3),np.uint8))
-    assert (tracker._contact_visible_recovery_exit is not None)==strong_motion
+    assert (tracker._contact_visible_recovery_exit is not None)==(strong_motion and elapsed==3)
+    if elapsed==1:
+        assert tracker.ball_center==(1500,1500)

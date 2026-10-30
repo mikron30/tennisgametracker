@@ -255,7 +255,20 @@ def evaluate_serve_stance(analyzer, serve_position, frame, *, verified_toss=Fals
                 result['fresh'] = False
                 return _apply_recent_stance(result, recent, serve_position, width)
 
-    if not bool(getattr(track, "visible", False)):
+    recent_near_detection = False
+    if side == 'near' and getattr(analyzer, 'far_serve_image_baseline', False):
+        recent = _recent_valid_stance(analyzer, frame_index, side)
+        if result['confidence'] < .45:
+            # An empty-court HOG box must not erase a strong baseline server
+            # just as the toss starts. Reuse only recent aligned legal evidence.
+            if (recent is not None and float(recent.get('confidence') or 0) >= .65 and
+                    0 <= frame_index-recent['frame'] <= 10):
+                return _apply_recent_stance(result, recent, serve_position, width)
+            result.update(decision='hold',reason='weak near detection cannot certify serving stance')
+            return result
+        recent_near_detection = (result['confidence'] >= .65 and
+            0 <= frame_index-int(getattr(track,'last_frame',-1000000)) <= 5)
+    if not bool(getattr(track, "visible", False)) and not recent_near_detection:
         recent = _recent_valid_stance(analyzer, frame_index, side)
         if recent is not None:
             return _apply_recent_stance(result, recent, serve_position, width)

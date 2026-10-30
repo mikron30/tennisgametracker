@@ -19,7 +19,7 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
-tests/
+/tests/
 
 # Virtual Environment
 venv/
@@ -71,3 +71,6 @@ metadata/ball_dataset/
 
 # Backup directories
 session2_changes/
+
+# Local OAuth credentials
+/319754315071-c95cv1uohllh8sim8bdepkp8pu5.txt

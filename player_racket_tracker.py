@@ -67,6 +67,7 @@ class PlayerRacketTracker:
         self.net_y = float(net_y) if net_y is not None else None
         self.court_x_range = tuple(court_x_range) if court_x_range is not None else None
         self.court_region = None
+        self.full_court_hog_enabled = False
         self.detection_interval = max(1, int(detection_interval))
         self.profile_path = profile_path
         self.learning_enabled = bool(learning_enabled)
@@ -218,13 +219,16 @@ class PlayerRacketTracker:
             x, y, w, h = [int(round(float(v) / scale)) for v in box]
             if h < max(70, int(height * 0.055)) or w < 20:
                 continue
-            if self.court_x_range is not None:
+            # The active serve rectangle can be much narrower than the court
+            # (especially for a far-side server). Use the fitted sidelines at
+            # the person's depth; retain the x-range only as a fallback.
+            if self.full_court_hog_enabled:
+                if not self._center_is_in_court((x+w*.5, y+h*.5), frame_width=width):
+                    continue
+            elif self.court_x_range is not None:
                 left, right = self.court_x_range
-                # Keep HOG false positives on fences/walls outside the court
-                # from becoming a slowly drifting player track.
-                margin = max(80.0, width * 0.02)
-                center_x = x + w * 0.5
-                if not (left - margin <= center_x <= right + margin):
+                margin = max(80.0, width*.02)
+                if not left-margin <= x+w*.5 <= right+margin:
                     continue
             result.append({"bbox": self._clip_box((x, y, w, h), frame.shape),
                            "score": float(np.asarray(weight).reshape(-1)[0]) if np.asarray(weight).size else 0.0,
@@ -339,12 +343,16 @@ class PlayerRacketTracker:
         x, y, w, h = [int(v) for v in box]
         if h < int(height * 0.18) or h / max(float(w), 1.0) < 1.15:
             return False
-        # Do not relock on an upper-court/fence object for a near track (or
-        # vice versa).  The small overlap around the net is intentionally
-        # excluded because it is where HOG produces the most false boxes.
+        # Keep reacquisition on the player's side of the net. A near player
+        # can advance to volley; fixed lower-screen fractions lose that player
+        # even while HOG keeps detecting the full person.
+        front_court = False
         if side == "near":
             if cy < height * 0.62 or y + h < height * 0.82:
-                return False
+                net_y = float(self.net_y) if self.net_y is not None else height * .5
+                if cy < net_y + h * .15 or y + h < net_y + h * .6:
+                    return False
+                front_court = True
         elif side == "far":
             if cy > height * 0.42 or y > height * 0.25:
                 return False
@@ -357,6 +365,10 @@ class PlayerRacketTracker:
             return False
         source = str(candidate.get("source", "")).lower()
         detection_score = float(candidate.get("score", 0.0))
+        if front_court:
+            # Near the net require a strong full-person HOG detection, rather
+            # than granting a distant motion contour permission to relock.
+            return source == "hog" and detection_score >= .5
         if source == "hog" and detection_score >= -0.85:
             return True
         if source == "motion":

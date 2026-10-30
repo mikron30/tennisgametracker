@@ -160,7 +160,7 @@ class PlayerRacketTrackerTests(unittest.TestCase):
             {'frame': 19, 'pos': (130, 130), 'distance': 1.0},
         ]
         analyzer.player_tracker = PlayerRacketTracker(
-            frame_shape=(1080, 3840), learning_enabled=False
+            frame_shape=(300, 400), net_y=80, learning_enabled=False
         )
         analyzer.player_tracker.tracks['near'] = PlayerTrack(
             'near', bbox=(90, 90, 80, 120), center=(130, 150),
@@ -179,7 +179,7 @@ class PlayerRacketTrackerTests(unittest.TestCase):
             {'frame': 19, 'pos': (130, 130), 'distance': 1.0},
         ]
         analyzer.player_tracker = PlayerRacketTracker(
-            frame_shape=(1080, 3840), learning_enabled=False
+            frame_shape=(300, 400), net_y=80, learning_enabled=False
         )
         analyzer.player_tracker.tracks['near'] = PlayerTrack(
             'near', bbox=(90, 90, 80, 120), center=(130, 150),
@@ -541,12 +541,12 @@ class PlayerRacketTrackerTests(unittest.TestCase):
         )
         tracker.last_detections = [
             {"bbox": (2081, 1033, 464, 929), "score": 0.227, "source": "hog"},
-            {"bbox": (1194, 0, 321, 635), "score": -0.035, "source": "hog"},
+            {"bbox": (1194, 0, 321, 500), "score": -0.035, "source": "hog"},
         ]
         context = tracker.serve_context((2350, 1023), player_name="P1")
         self.assertEqual(context["player_side"], "near")
         self.assertEqual(context["receiver_side"], "far")
-        self.assertEqual(context["receiver_position"], [1354, 318])
+        self.assertEqual(context["receiver_position"], [1354, 250])
         self.assertEqual(context["receiver_area"], "left_far")
 
 

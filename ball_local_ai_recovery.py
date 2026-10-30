@@ -275,12 +275,14 @@ class LocalBallAIRecovery:
             candidate_path.unlink(missing_ok=True)
             self._record_inference(source_frame, 'single', len(candidates), started)
 
-    def _score_batch(self, samples: list[tuple[np.ndarray, int, list[dict]]]) -> list[list[dict]]:
+    def _score_batch(self, samples: list[tuple[np.ndarray, int, list[dict]]], *, inference_budget=None) -> list[list[dict]]:
         """Score a short temporal window with one model/runtime startup."""
         if not samples:
             return []
         frame_index = max(int(sample[1]) for sample in samples)
-        if not self._begin_inference(frame_index):
+        permitted=(self._begin_inference(frame_index) if inference_budget is None else
+                   inference_budget.reserve(frame_index))
+        if not permitted:
             return [[] for _ in samples]
         started = time.perf_counter()
         self._sequence += 1
@@ -314,7 +316,8 @@ class LocalBallAIRecovery:
             request_path.unlink(missing_ok=True)
             for image_path in image_paths:
                 image_path.unlink(missing_ok=True)
-            self._record_inference(frame_index, 'batch', sum(len(sample[2]) for sample in samples), started)
+            self._record_inference(frame_index, 'rewind_batch' if inference_budget is not None else 'batch',
+                                   sum(len(sample[2]) for sample in samples), started)
 
     def rank_local_roi_candidates(
         self,
