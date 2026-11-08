@@ -401,7 +401,7 @@ class PlayerRacketTracker:
         body_cx = x + w * 0.5
         hand_y_min = y + h * 0.25
         hand_y_max = y + h * 0.78
-        for line in lines[:, 0, :]:
+        for line in np.asarray(lines).reshape(-1, 4):
             lx1, ly1, lx2, ly2 = [int(v) for v in line]
             gx1, gy1, gx2, gy2 = lx1 + rx1, ly1 + ry1, lx2 + rx1, ly2 + ry1
             length = math.hypot(gx2 - gx1, gy2 - gy1)

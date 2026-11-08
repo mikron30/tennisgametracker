@@ -51,7 +51,7 @@ def far_baseline(frame):
                            threshold=20, minLineLength=int(sw * .06), maxLineGap=20)
     candidates = []
     if lines is not None:
-        for x1, y1, x2, y2 in lines[:, 0, :]:
+        for x1, y1, x2, y2 in np.asarray(lines).reshape(-1, 4):
             if abs(x2 - x1) < sw * .06 or abs(y2 - y1) > abs(x2 - x1) * .10:
                 continue
             candidates.extend([(x1 + left, y1 + top), (x2 + left, y2 + top)])
@@ -97,7 +97,7 @@ def far_service_box(frame, net_y, *, shadow=False):
         # stripe is sufficient only together with the centre marking below.
         lines=cv2.HoughLinesP(mask,1,np.pi/180,20,minLineLength=minimum,maxLineGap=12)
         if lines is not None:
-            for x1,y1,x2,y2 in lines[:,0,:]:
+            for x1,y1,x2,y2 in np.asarray(lines).reshape(-1, 4):
                 dx,dy=float(x2-x1),float(y2-y1)
                 if abs(dx)>=minimum and abs(dy)<=abs(dx)*.08:
                     slope=dy/dx
@@ -145,7 +145,7 @@ def near_service_box(frame, net_y):
     horizontal, central = [], []
     if lines is None:
         return None
-    for x1, y1, x2, y2 in lines[:, 0, :]:
+    for x1, y1, x2, y2 in np.asarray(lines).reshape(-1, 4):
         dx, dy = x2 - x1, y2 - y1
         if abs(dx) >= 180 and abs(dy) <= abs(dx) * .08:
             a = float(dy) / dx
@@ -160,7 +160,7 @@ def near_service_box(frame, net_y):
         # Shadows can split the same service stripe into shorter segments.
         # Join only collinear pieces spanning a substantial part of the court.
         fragments = []
-        for x1, y1, x2, y2 in lines[:, 0, :]:
+        for x1, y1, x2, y2 in np.asarray(lines).reshape(-1, 4):
             dx, dy = float(x2-x1), float(y2-y1)
             if abs(dx) >= 60 and abs(dy) <= abs(dx)*.08:
                 slope = dy/dx
@@ -197,7 +197,7 @@ def local_sideline_x(frame, y, predicted_x, side):
     if lines is None:
         return None
     candidates=[]
-    for xa,ya,xb,yb in lines[:,0,:]:
+    for xa,ya,xb,yb in np.asarray(lines).reshape(-1, 4):
         dy=float(yb-ya)
         if abs(dy)<40:
             continue
