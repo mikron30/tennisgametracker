@@ -158,8 +158,13 @@ def best_path(groups, anchor_frame, anchor, velocity, minimum_score=.985, *, occ
             allowed_gap=3+min(4,sum(n in occlusion_frames for n in range(last_frame+1,frame+1)))
             if gap <= 0 or gap > allowed_gap:
                 continue
-            # At most two genuinely unobserved images, never invented positions.
-            if gap < allowed_gap:
+            # Preserve the last verified observation through the complete
+            # bounded gap.  No position is invented; acceptance below still
+            # requires consecutive, clear terminal observations after the
+            # ball emerges.  The previous strict '<' allowed only two missing
+            # images even though allowed_gap is three (or longer for a
+            # measured player occlusion).
+            if gap <= allowed_gap:
                 expanded.append((path, cost+4, last_frame, last_pos, last_velocity))
             for candidate in candidates:
                 if float(candidate.get('ai_score', 0)) < minimum_score:
@@ -181,7 +186,15 @@ def best_path(groups, anchor_frame, anchor, velocity, minimum_score=.985, *, occ
                 if candidate.get('motion_mean', 0) < 4 or candidate.get('motion_max', 0) < 35:
                     continue
                 change = math.hypot(dx-last_velocity[0], dy-last_velocity[1])
-                if change > max(120, previous_speed*2.5):
+                # Across a multi-frame visibility gap the hidden event may be
+                # a racket contact.  Permit a reversal there; single-frame
+                # transitions retain the strict acceleration bound.
+                change_cap = (
+                    max(400, previous_speed * 4.0)
+                    if gap >= 2
+                    else max(120, previous_speed * 2.5)
+                )
+                if change > change_cap:
                     continue
                 if path:
                     ratio = candidate['area']/max(1, path[-1]['area'])
@@ -193,14 +206,26 @@ def best_path(groups, anchor_frame, anchor, velocity, minimum_score=.985, *, occ
                                  frame, pos, (dx, dy)))
         beams = sorted(expanded, key=lambda p:p[1])[:32]
         if not beams:
+            scores = [float(c.get('ai_score', 0)) for c in candidates]
+            print(
+                f'[SHORT_REWIND_PATH_GAP] f{frame}: candidates={len(candidates)} '
+                f'above={sum(score >= minimum_score for score in scores)} '
+                f'best={max(scores, default=0.0):.6f} threshold={minimum_score:.3f}'
+            )
             return None
     end_frame = groups[-1][0] if groups else anchor_frame
-    paths = [p for p in beams if len(p[0]) >= 4 and p[2] == end_frame and
+    paths = [p for p in beams if len(p[0]) >= 4 and p[2] >= end_frame - 1 and
              all(p[0][i+1]['frame']-p[0][i]['frame'] == 1 for i in range(len(p[0])-3, len(p[0])-1)) and
              all(c.get('player_zone') is None for c in p[0][-2:]) and
              all(not c.get('trusted_prefix',False) for c in p[0][-3:]) and
              math.dist(p[0][-1]['pos'], anchor) >= 12]
-    return min(paths, key=lambda p:p[1])[0] if paths else None
+    if not paths:
+        print(
+            f'[SHORT_REWIND_PATH_INCOMPLETE] end=f{end_frame}: '
+            f'beams={len(beams)} longest={max((len(p[0]) for p in beams), default=0)}'
+        )
+        return None
+    return min(paths, key=lambda p:p[1])[0]
 
 
 @dataclass
@@ -432,12 +457,24 @@ class ShortBallRewind:
         return None
 
     def choose(self, current):
-        width = self.window if self.attempts == 0 else self.maximum_window
+        override = getattr(self, 'maximum_window_override', None)
+        override_until = int(getattr(self, 'maximum_window_override_until', -1))
+        maximum_window = (
+            max(self.maximum_window, int(override))
+            if override is not None and current <= override_until
+            else self.maximum_window
+        )
+        width = self.window if self.attempts == 0 else maximum_window
+        # A proven player-lock means the immediately preceding provisional
+        # path is untrusted.  Start from the wider, pre-occlusion history on
+        # the first corrected attempt instead of retrying that bad path.
+        if override is not None and current <= override_until:
+            width = maximum_window
         available = [c for c in self.checkpoints if c.point == self.point and
                      current-width <= c.frame <= current-3]
-        if not available and width < self.maximum_window:
+        if not available and width < maximum_window:
             available=[c for c in self.checkpoints if c.point == self.point and
-                       current-self.maximum_window <= c.frame <= current-3]
+                       current-maximum_window <= c.frame <= current-3]
         return available[0] if available else None
 
     def try_recover(self, owner, frame, reason, source):
@@ -480,8 +517,24 @@ class ShortBallRewind:
         ledger[current] = dict(frame=current, source=int(source), pos=owner.ball_center,
             tracks=copy.deepcopy(owner.player_tracker.tracks) if owner.player_tracker is not None else None)
         labels = list(range(checkpoint.frame+1, current+1))
-        if any(n not in ledger for n in labels):
-            return self.reject(current,'noncontiguous-history')
+        missing_labels = [n for n in labels if n not in ledger]
+        for n in missing_labels:
+            # The source video is authoritative and decoded independently
+            # below.  A missing live observation must not prevent a later,
+            # better-informed rewind; retain no invented ball/player evidence
+            # for that frame and require the scored image path to prove it.
+            ledger[n] = dict(
+                frame=n,
+                source=int(checkpoint.source + (n - checkpoint.frame)),
+                pos=checkpoint.position,
+                tracks=None,
+                trusted=False,
+            )
+        if missing_labels:
+            print(
+                f'[SHORT_REWIND_HISTORY_GAP] f{current}: '
+                f'decoding {len(missing_labels)} missing raw frame(s) without trusted metadata'
+            )
         images, pools, previous = [], [], cv2.cvtColor(anchor_image, cv2.COLOR_BGR2GRAY)
         occluded=set()
         expected_source = checkpoint.source+1
@@ -542,8 +595,21 @@ class ShortBallRewind:
                 for candidate in group:
                     candidate.update({k:v for k,v in by_pos.get((candidate['x'],candidate['y']),{}).items()
                                       if k not in candidate})
+            # A frame-wise production threshold is intentionally very strict,
+            # but requiring it at every observation of a replayed flight makes
+            # a small/blurred ball impossible to recover after player
+            # occlusion.  The replay already requires a multi-frame coherent
+            # path, fresh motion, bounded acceleration, and clear-of-player
+            # terminal observations, so it can safely admit weaker appearance
+            # evidence for these two loss modes.  Other rewind reasons retain
+            # the configured threshold.
+            path_score = (
+                min(float(recovery.minimum_score), 0.50)
+                if reason in ('player-lock', 'ball-miss', 'static-jump')
+                else float(recovery.minimum_score)
+            )
             path = best_path(list(zip(labels, scored)), checkpoint.frame, checkpoint.position,
-                             checkpoint.velocity, recovery.minimum_score,occlusion_frames=occluded)
+                             checkpoint.velocity, path_score,occlusion_frames=occluded)
             if path is None:
                 raise ReplayRejected('no-coherent-ai-path')
             return self.apply(owner, checkpoint, path, images, labels, ledger, anchor_image)
@@ -596,6 +662,23 @@ class ShortBallRewind:
                     hitter_before=getattr(owner,'_last_racket_contact_player',None)
                     opponent_frames=getattr(owner,'_side_recross_opponent_frames',0)
                     owner._commit_local_ball_flight(committed, image)
+                    if (
+                            int(getattr(
+                                owner,
+                                '_recovery_boundary_deferred_frame',
+                                -1000000,
+                            )) == int(n) and
+                            float(candidate.get('area', 0.0) or 0.0) <= 5.0 and
+                            candidate['pos'][1] > int(getattr(
+                                owner, 'net_area_y_max', 0
+                            ))
+                    ):
+                        # The analyzer explicitly classified this near-side
+                        # boundary reversal as a tiny provisional artifact.
+                        # A rewind must not nevertheless install that artifact
+                        # as authoritative history; keep the live anchor and
+                        # wait for measurable post-contact continuation.
+                        raise ReplayRejected('provisional-tiny-boundary-artifact')
                     if (old_motion.get('dy',0) >= 4 and dy <= -4 and
                             getattr(owner,'_last_racket_contact_frame',-1000000) == contact_before and
                             getattr(owner,'ground_bounce_count',0) == bounces_before and
@@ -621,6 +704,29 @@ class ShortBallRewind:
                 else:
                     owner.stuck_frame_count += 1
                 previous_gray = owner._terminal_current_gray
+            replay_contact_frame = int(getattr(
+                owner, '_last_racket_contact_frame', -1000000
+            ))
+            replay_contact_end = owner._court_end_for_point(getattr(
+                owner, '_last_racket_contact_point', None
+            ))
+            samples_after_contact = [
+                candidate['pos'] for candidate in path
+                if int(candidate.get('frame', -1000000)) > replay_contact_frame
+            ]
+            if (
+                    replay_contact_frame > checkpoint.frame and
+                    str(getattr(owner, '_last_racket_contact_label', '') or '') ==
+                    'verified outgoing contact flight' and
+                    replay_contact_end in ('near', 'far') and
+                    len(samples_after_contact) >= 5 and
+                    all(owner._court_end_for_point(position) == replay_contact_end
+                        for position in samples_after_contact)):
+                # A replay may mistake a moving shirt/racket fragment for a
+                # contact and then continue following that same player.  A
+                # verified outgoing flight must actually leave the hitter's
+                # court end before the replay is allowed to replace history.
+                raise ReplayRejected('contact-flight-never-left-player-end')
             if tuple(owner.ball_center) != tuple(path[-1]['pos']):
                 raise ReplayRejected('final-position-mismatch')
             if tracker is not None:
@@ -632,6 +738,17 @@ class ShortBallRewind:
             owner._short_rewind_accepted_pos = tuple(owner.ball_center)
             owner._last_motion_reacq_frame = final_frame
             owner._last_motion_reacq_pos = tuple(owner.ball_center)
+            if (
+                    replay_contact_frame > checkpoint.frame and
+                    replay_contact_frame <= final_frame and
+                    len(samples_after_contact) >= 2):
+                # The replay has reconstructed a multi-frame outgoing path.
+                # For the first live frames after handoff, keep its measured
+                # vector authoritative over a contradictory player/body
+                # contour.  The analyzer's causal projection is bounded and
+                # yields as soon as coherent live ball evidence resumes.
+                owner._causal_projection_start_frame = final_frame + 1
+                owner._causal_projection_until_frame = final_frame + 6
             hsv_toss_observations=sum(c.get('replay_evidence')=='prestrike-hsv-motion' for c in path)
             if hsv_toss_observations:
                 owner._prestrike_toss_replay_count=int(getattr(owner,'_prestrike_toss_replay_count',0))+1

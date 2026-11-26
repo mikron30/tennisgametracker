@@ -1,38 +1,38 @@
 {
   "net_contacts": {
-    "P1": 0,
+    "P1": 1,
     "P2": 0
   },
   "racket_sides": {
     "P1": {
-      "left": 127,
-      "right": 115
+      "left": 757,
+      "right": 814
     },
     "P2": {
-      "left": 210,
-      "right": 109
+      "left": 1907,
+      "right": 612
     }
   },
   "serve_sides": {
     "P1": {
-      "left": 12426,
-      "right": 7341
+      "left": 64283,
+      "right": 39900
     },
     "P2": {
-      "left": 8113,
-      "right": 7803
+      "left": 39484,
+      "right": 45466
     }
   },
   "shots": {
     "P1": {
-      "backhand": 108,
-      "forehand": 134,
-      "unknown": 137
+      "backhand": 803,
+      "forehand": 768,
+      "unknown": 1543
     },
     "P2": {
-      "backhand": 130,
-      "forehand": 189,
-      "unknown": 121
+      "backhand": 838,
+      "forehand": 1681,
+      "unknown": 940
     }
   },
   "version": 1

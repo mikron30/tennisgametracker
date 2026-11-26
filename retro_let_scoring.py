@@ -634,7 +634,11 @@ def _patch_tracker_class(cls):
         # legal landing or a positively identified receiver return before a
         # later same-side serve may roll back this point as a let.
         positive_serve_in = serve_stat_counted or (short and rally_shots == 1)
+        semantic_rally_terminal = (
+            'rejected repeated contact' in str(reason or '').lower()
+        )
         if (awarded and nonfault and short and positive_serve_in and
+                not semantic_rally_terminal and
                 net_touch_evidence is not None and isinstance(observation, dict)):
             if rally_shots >= 1:
                 in_evidence = "receiver-returned-serve"

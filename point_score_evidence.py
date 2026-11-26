@@ -2,6 +2,14 @@
 
 
 def unresolved_end_requires_review(owner, reason, measured_terminal=False):
+    if ('opponent return not observed after rejected repeated contact'
+            in (reason or '').lower()):
+        # This terminal is not inferred from the corrupted endpoint.  It is
+        # established by rally ownership: the same player appeared to strike
+        # again after a long stalled track, without an intervening opponent
+        # contact.  Keeping the earlier measured departure therefore gives a
+        # definite winner even when the ball pixels themselves need review.
+        return False
     if (getattr(owner,'far_serve_image_baseline',False) and
             getattr(owner,'_active_serve_area_end',None)=='near' and
             'hit the net' in (reason or '').lower() and

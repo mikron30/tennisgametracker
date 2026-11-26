@@ -6,7 +6,13 @@ import numpy as np
 
 
 def shallow_rebound(history, contact_frame, player_corridor):
-    """A measured shallow rebound needs descent followed by two flat samples."""
+    """A measured shallow rebound needs descent followed by two coherent samples.
+
+    On the near half of a perspective view a real rebound can keep moving
+    downward in image coordinates.  In that case the measurable signature is
+    a sharp loss of vertical speed while lateral motion stays continuous, not
+    a literal upward reversal.
+    """
     entries=history[-3:]
     if len(entries)!=3 or entries[0].get('prev_pos') is None:
         return None
@@ -18,13 +24,25 @@ def shallow_rebound(history, contact_frame, player_corridor):
     dx=a['pos'][0]-a['prev_pos'][0];dy=a['pos'][1]-a['prev_pos'][1]
     vx=b['pos'][0]-a['pos'][0];vy=b['pos'][1]-a['pos'][1]
     wx=c['pos'][0]-b['pos'][0];wy=c['pos'][1]-b['pos'][1]
-    if not (dy>=18 and abs(dx)>=8 and dy>=abs(dx)*.6 and
-            -4<vy<=0 and -4<wy<=4 and
-            dx*vx>0 and vx*wx>0 and
-            .45<=abs(vx/dx)<=1.1 and .7<=abs(wx/vx)<=1.3):
+    flat_rebound = (
+        dy>=18 and abs(dx)>=8 and dy>=abs(dx)*.6 and
+        -4<vy<=0 and -4<wy<=4 and
+        dx*vx>0 and vx*wx>0 and
+        .45<=abs(vx/dx)<=1.1 and .7<=abs(wx/vx)<=1.3
+    )
+    perspective_rebound = (
+        dy >= 55 and abs(dx) >= 15 and dy >= abs(dx) * 1.5 and
+        4 <= vy <= dy * .32 and
+        max(4, vy * .65) <= wy <= min(dy * .45, vy * 1.65 + 3) and
+        dx * vx > 0 and vx * wx > 0 and
+        .65 <= abs(vx / dx) <= 1.35 and
+        .70 <= abs(wx / vx) <= 1.35
+    )
+    if not (flat_rebound or perspective_rebound):
         return None
     return dict(frame=a['frame'],origin=tuple(a['pos']),incoming_dx=dx,incoming_dy=dy,
-                incoming_dist=math.hypot(dx,dy),expected=tuple(c['pos']))
+                incoming_dist=math.hypot(dx,dy),expected=tuple(c['pos']),
+                perspective=bool(perspective_rebound))
 
 
 def matches_ground_rebound(position, motion, candidate, expected):

@@ -61,9 +61,25 @@ def collect_candidates(image: np.ndarray, config: dict, *, modes=DEFAULT_MODES,
                 candidate["x"] - around[0], candidate["y"] - around[1]) > radius:
             continue
         dedup_radius = max(0.0, float(dedup_distance))
-        if dedup_radius > 0.0 and any(
-                math.hypot(candidate["x"] - kept["x"], candidate["y"] - kept["y"]) < dedup_radius
-                for kept in deduplicated):
+        duplicate = False
+        if dedup_radius > 0.0:
+            try:
+                candidate_x = float(candidate["x"])
+                candidate_y = float(candidate["y"])
+            except (KeyError, TypeError, ValueError):
+                # A malformed contour must never abort live recovery. It has
+                # no usable image coordinate, so it cannot be scored safely.
+                continue
+            for kept in deduplicated:
+                try:
+                    kept_x = float(kept["x"])
+                    kept_y = float(kept["y"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if math.hypot(candidate_x - kept_x, candidate_y - kept_y) < dedup_radius:
+                    duplicate = True
+                    break
+        if duplicate:
             continue
         deduplicated.append(candidate)
     return deduplicated

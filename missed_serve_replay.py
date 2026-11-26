@@ -70,6 +70,18 @@ class MissedServeReplay:
         if not (all(x>60 for x in offsets) or all(x < -60 for x in offsets)): return None
         observed='right' if offsets[-1]>0 else 'left'
         if observed==expected: return None
+        reconcile = getattr(
+            owner, '_maybe_reconcile_pending_line_call_from_service_side', None
+        )
+        if callable(reconcile) and reconcile(observed):
+            corrected_expected = 'right' if sum(owner.score_points)%2==0 else 'left'
+            if corrected_expected == observed:
+                print(
+                    f'[MISSED_SERVE_REPLAY_CANCELLED] f{owner.frame_count}: '
+                    f'line-call reconciliation changed expected side '
+                    f'{expected}->{corrected_expected}; observed={observed}'
+                )
+                return None
         until=owner.frame_count; self.attempted.add(saved['index'])
         resume=owner.cap.get(cv2.CAP_PROP_POS_FRAMES)
         live=snapshot(owner)
