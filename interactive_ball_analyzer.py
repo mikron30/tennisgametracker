@@ -8396,6 +8396,10 @@ class InteractiveBallAnalyzer:
             pool = [p for p in pool if math.dist(p['pos'], (tx, ty)) <= 15
                     and .5 <= p['area'] / last['area'] <= 2]
             if not pool:
+                if vy >= 35 and self._point_in_near_player_contact_corridor(last['pos']):
+                    # The measured descending leg disappeared within racket
+                    # reach. Start collecting departure images immediately.
+                    self.stuck_frame_count = max(1, self.stuck_frame_count)
                 return None
             prior, ball = last, min(pool, key=lambda p: math.dist(p['pos'], (tx, ty)))
         else:
